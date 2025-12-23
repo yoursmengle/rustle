@@ -26,3 +26,4 @@
 ## 开发环境
 
 - Rust 1.70+
+- vc_redist.x64.exe (Windows 平台)
