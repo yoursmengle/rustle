@@ -1,0 +1,12 @@
+[build]
+# Use GNU target by default only if you want mingw builds. Leave unset otherwise.
+# target = "x86_64-pc-windows-gnu"
+
+[net]
+git-fetch-with-cli = true
+
+[source.crates-io]
+replace-with = "ustc"
+
+[source.ustc]
+registry = "https://mirrors.ustc.edu.cn/crates.io-index"
