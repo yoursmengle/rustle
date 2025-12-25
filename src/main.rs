@@ -437,6 +437,20 @@ impl RustleApp {
             });
     }
 
+    fn clear_history(&self, peer_id: &str) {
+        let path = data_path(HISTORY_FILE);
+        let Ok(content) = fs::read_to_string(&path) else { return; };
+        let mut new_lines = Vec::new();
+        for line in content.lines() {
+            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+                if entry.get("peer_id").and_then(|v| v.as_str()) != Some(peer_id) {
+                    new_lines.push(line);
+                }
+            }
+        }
+        let _ = fs::write(&path, new_lines.join("\n") + "\n");
+    }
+
     fn load_recent_history(&mut self) {
         let path = data_path(HISTORY_FILE);
         let file = match std::fs::File::open(&path) {
@@ -1201,6 +1215,16 @@ impl eframe::App for RustleApp {
                 self.users.remove(index);
                 self.messages.remove(&id_to_delete);
                 self.offline_msgs.remove(&id_to_delete);
+                self.pending_acks.remove(&id_to_delete);
+                self.peers.remove(&id_to_delete);
+                
+                // 清除相关的辅助状态
+                self.logged_incoming_files.retain(|(pid, _)| pid != &id_to_delete);
+                self.message_visible_since.retain(|(pid, _), _| pid != &id_to_delete);
+
+                // 清除磁盘上的历史记录文件
+                self.clear_history(&id_to_delete);
+
                 self.known_dirty = true;
                 if self.selected_user_id.as_deref() == Some(&id_to_delete) {
                     self.selected_user_id = None;
