@@ -1134,11 +1134,12 @@ impl eframe::App for RustleApp {
 
                             // 右键菜单
                             resp.context_menu(|ui| {
-                                if ui.button("显示 IP").clicked() {
-                                    let ip_info = format!("IP: {}\nPort: {}\nTCP Port: {}", 
+                                if ui.button("用户信息").clicked() {
+                                    let ip_info = format!("IP: {}\nPort: {}\nTCP Port: {}\nID: {}", 
                                         user.ip.as_deref().unwrap_or("未知"),
                                         user.port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string()),
-                                        user.tcp_port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string())
+                                        user.tcp_port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string()),
+                                        user.id
                                     );
                                     self.show_ip_dialog = Some((user.name.clone(), ip_info));
                                     ui.close_menu();
