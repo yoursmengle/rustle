@@ -55,7 +55,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Rustle - 如梭")
+        .with_title("Rustle")
         .with_inner_size([1200.0, 800.0]);
     
     if let Some(icon) = icon_data {
@@ -356,6 +356,26 @@ impl RustleApp {
         lp[0] == cp[0] && lp[1] == cp[1] && lp[2] == cp[2]
     }
 
+    fn find_interface_for_target(target_ip_str: &str) -> Option<String> {
+        let target_ip: Ipv4Addr = target_ip_str.parse().ok()?;
+        if let Ok(ifaces) = get_if_addrs() {
+            for iface in ifaces {
+                if let get_if_addrs::IfAddr::V4(v4) = iface.addr {
+                    if v4.ip.is_loopback() {
+                        continue;
+                    }
+                    let local_u32 = u32::from(v4.ip);
+                    let mask_u32 = u32::from(v4.netmask);
+                    let target_u32 = u32::from(target_ip);
+                    if (local_u32 & mask_u32) == (target_u32 & mask_u32) {
+                        return Some(v4.ip.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     #[allow(dead_code)]
     fn prefer_ip(&self, current: Option<String>, candidate: &str) -> String {
         let cand_priv = Self::is_private_ipv4(candidate);
@@ -485,8 +505,13 @@ impl RustleApp {
             let drained: Vec<QueuedMsg> = queue.drain(..).collect();
             let mut remain = Vec::new();
             // 查找用户最优接口（能接收 ACK 的接口）
-            let via = self.users.iter().find(|u| &u.id == peer_id)
+            let mut via = self.users.iter().find(|u| &u.id == peer_id)
                 .and_then(|u| u.best_interface.clone().or_else(|| u.bound_interface.clone()));
+
+            if let Some(best_via) = Self::find_interface_for_target(ip) {
+                via = Some(best_via);
+            }
+
             let tcp_port = self.users.iter().find(|u| &u.id == peer_id).and_then(|u| u.tcp_port);
 
             for mut msg in drained {
@@ -621,7 +646,15 @@ impl RustleApp {
         let online = u.online;
         let ip = u.ip.clone();
         let port = u.port;
-        let via = u.best_interface.clone().or_else(|| u.bound_interface.clone());  // 优先使用 best_interface
+        let mut via = u.best_interface.clone().or_else(|| u.bound_interface.clone()); // 优先使用 best_interface
+
+        // 尝试寻找更匹配的本地接口
+        if let Some(target_ip) = &ip {
+            if let Some(best_via) = Self::find_interface_for_target(target_ip) {
+                via = Some(best_via);
+            }
+        }
+
         let has_addr = ip.is_some() && port.is_some();
 
         if online {
@@ -675,10 +708,17 @@ impl RustleApp {
     fn append_file_message(&mut self, path: &PathBuf, is_dir: bool) {
         if let Some(id) = self.selected_user_id.clone() {
             self.scroll_to_bottom = true;
-            let (ip, tcp_port, via) = {
+            let (ip, tcp_port, mut via) = {
                 let Some(user) = self.users.iter().find(|u| u.id == id) else { return; };
                 (user.ip.clone(), user.tcp_port, user.bound_interface.clone())
             };
+
+            // 强制寻找与目标 IP 同网段的本地接口
+            if let Some(target_ip) = &ip {
+                if let Some(best_via) = Self::find_interface_for_target(target_ip) {
+                    via = Some(best_via);
+                }
+            }
 
             let icon = if is_dir { "📁" } else { "📄" };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
@@ -772,7 +812,7 @@ impl eframe::App for RustleApp {
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Rustle - 如梭");
+                ui.heading("如梭");
                 ui.separator();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let addr = match (self.local_ip.as_deref(), self.local_port) {
@@ -1321,12 +1361,14 @@ impl eframe::App for RustleApp {
                     // 顶部行：文件/文件夹按钮（左对齐） + 发送按钮（右对齐）
                     ui.horizontal(|ui| {
                         ui.horizontal(|ui| {
-                            if ui.button("📁 文件").clicked() {
+                            if ui.add_sized([100.0, 36.0], egui::Button::new(egui::RichText::new("📁 文件").size(16.0))).clicked() {
                                 self.pick_and_send(false);
                             }
-                            if ui.button("📂 文件夹").clicked() {
+                            ui.add_space(4.0);
+                            if ui.add_sized([120.0, 36.0], egui::Button::new(egui::RichText::new("📂 文件夹").size(16.0))).clicked() {
                                 self.pick_and_send(true);
                             }
+                            ui.add_space(8.0);
                             ui.label(egui::RichText::new("支持拖放文件/文件夹到窗口").weak().small());
                         });
 
@@ -1335,7 +1377,7 @@ impl eframe::App for RustleApp {
                         ui.add_space(8.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(8.0); // 距离右边缘留出间距
-                            if ui.add_sized([80.0, 28.0], egui::Button::new("发送")).clicked()
+                            if ui.add_sized([100.0, 36.0], egui::Button::new(egui::RichText::new("🚀 发送").size(16.0))).clicked()
                                 || ctx.input(|i| i.key_pressed(egui::Key::Enter))
                             {
                                 self.send_current();
