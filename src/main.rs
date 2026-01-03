@@ -2473,6 +2473,8 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                             }
                                             "chat" => {
                                                 if let Ok(c) = serde_json::from_value::<ChatPayload>(v) {
+                                                    // 屏蔽自身广播回环
+                                                    if c.from_id == my_id { continue; }
                                                     eprintln!("Received chat from {}: {:?}", src, c);
                                                     // 回复 ACK（仅 1 次，超时重传由发送端处理）
                                                     let ack = AckPayload { msg_type: "ack".to_string(), msg_id: c.msg_id.clone(), from_id: my_id.clone() };
@@ -2495,6 +2497,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                             }
                                             "ack" => {
                                                 if let Ok(a) = serde_json::from_value::<AckPayload>(v) {
+                                                    if a.from_id == my_id { continue; }
                                                     eprintln!("Received ACK for msg_id={} from {}", a.msg_id, src);
                                                     let _ = peer_tx.send(PeerEvent::ChatAck { from_id: a.from_id, msg_id: a.msg_id });
                                                 }
