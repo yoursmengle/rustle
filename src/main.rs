@@ -2252,6 +2252,14 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             }
         }
 
+        // 汇总日志，便于排查为何看不到节点
+        if bound_sockets.is_empty() {
+            eprintln!("Net discovery: no UDP sockets bound; discovery will not work");
+        } else {
+            let summary: Vec<String> = bound_sockets.iter().map(|(_, ip, port)| format!("{}:{}", ip, port)).collect();
+            eprintln!("Net discovery: active UDP sockets -> {}", summary.join(", "));
+        }
+
         let mut our_name = initial_name.unwrap_or_default();
 
         // 发送 hello 的函数（包含 our id）
@@ -2265,7 +2273,11 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                 version: "0.1".to_string(),
             };
             if let Ok(payload) = serde_json::to_vec(&msg) {
-                let _ = sock.send_to(&payload, target);
+                if let Err(e) = sock.send_to(&payload, target) {
+                    eprintln!("Net discovery: failed send hello from {}:{} to {} ({})", sock.local_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), port, target, e);
+                } else {
+                    eprintln!("Net discovery: sent hello from {}:{} to {}", sock.local_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), port, target);
+                }
             }
         };
 
@@ -2321,8 +2333,22 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
         base_targets.sort_by_key(|a| (a.ip().to_string(), a.port()));
         base_targets.dedup();
 
+        if base_targets.is_empty() {
+            eprintln!("Net discovery: no broadcast targets computed");
+        } else {
+            let targets: Vec<String> = base_targets.iter().map(|t| t.to_string()).collect();
+            eprintln!("Net discovery: broadcast targets -> {}", targets.join(", "));
+        }
+
         // 频繁度控制：3 秒广播一次
         let mut last_broadcast = Instant::now() - Duration::from_secs(3);
+
+        // 启动时立即发送一轮 hello，提高首次发现速度
+        for (sock, _ip, port) in &bound_sockets {
+            for addr in &base_targets {
+                send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port);
+            }
+        }
 
         let mut buf = [0u8; 2048];
 
@@ -2392,7 +2418,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                     if _ip.to_string() != *v { continue; }
                                 }
                                 let _ = sock.send_to(&data, target);
-                                eprintln!("Sent chat from {}:{}", _ip, _port);
+                                    eprintln!("Net discovery: sent chat from {}:{} to {} ({} bytes)", _ip, _port, target, data.len());
                             }
                         }
                     }
@@ -2414,6 +2440,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                 loop {
                     match sock.recv_from(&mut buf) {
                         Ok((n, src)) => {
+                            eprintln!("Net discovery: recv {} bytes on {}:{} from {}", n, _ip, _port, src);
                             if let Ok(text) = std::str::from_utf8(&buf[..n]) {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
                                     if let Some(mt) = v.get("msg_type").and_then(|m| m.as_str()) {
