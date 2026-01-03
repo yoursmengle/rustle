@@ -813,10 +813,6 @@ impl RustleApp {
             self.append_file_message(&path, is_dir);
         }
 
-        // 如果我们刚保存了用户名，通知网络线程更新广播（非阻塞）
-        if let Some(tx) = &self.net_cmd_tx {
-            let _ = tx.send(NetCmd::SendHello);
-        }
     }
 
     fn handle_dropped_files(&mut self, dropped: Vec<egui::DroppedFile>) {
@@ -1599,10 +1595,6 @@ impl eframe::App for RustleApp {
         // 将已知联系人持久化（仅当有更新时才写文件）
         self.persist_known_peers();
 
-        // 如果我们刚刚保存了用户名，通知网络线程发送一次 hello
-        if let Some(tx) = &self.net_cmd_tx {
-            let _ = tx.send(NetCmd::SendHello);
-        }
     }
 }
 
@@ -2451,8 +2443,13 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                             "hello" => {
                                                 if let Ok(h) = serde_json::from_value::<HelloMsg>(v) {
                                                     if h.id != my_id {
+                                                        let pid = if h.id.is_empty() {
+                                                            src.ip().to_string()
+                                                        } else {
+                                                            h.id.clone()
+                                                        };
                                                         let peer = DiscoveredPeer {
-                                                            id: h.id.clone(),
+                                                            id: pid,
                                                             ip: src.ip().to_string(),
                                                             port: h.port,
                                                             tcp_port: h.tcp_port,
