@@ -2215,6 +2215,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                             let _ = sock.set_broadcast(true);
                             let _ = sock.set_nonblocking(true);
                             bound_sockets.push((sock, ipv4, UDP_PORT));
+                            eprintln!("Net discovery: bound interface {ipv4}:{UDP_PORT}");
                             // 报告回 UI 我们在该接口上绑定了端口
                             let _ = peer_tx.send(PeerEvent::LocalBound { ip: ipv4.to_string(), port: UDP_PORT });
                             // 保存首选端口（覆盖 last_port.txt）
@@ -2240,9 +2241,9 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                     let _ = sock.set_broadcast(true);
                     let _ = sock.set_nonblocking(true);
                     bound_sockets.push((sock, Ipv4Addr::UNSPECIFIED, UDP_PORT));
+                    eprintln!("Net discovery: bound fallback 0.0.0.0:{UDP_PORT}");
                     let _ = peer_tx.send(PeerEvent::LocalBound { ip: Ipv4Addr::UNSPECIFIED.to_string(), port: UDP_PORT });
                     let _ = fs::write(&last_port_path, UDP_PORT.to_string());
-                    eprintln!("Net discovery: bound fallback 0.0.0.0:{UDP_PORT}");
                 }
                 Err(e) => {
                     eprintln!("Net discovery: 未找到任何可用接口且兜底 0.0.0.0:{UDP_PORT} 绑定失败 - {e}");
