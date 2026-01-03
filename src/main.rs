@@ -871,14 +871,7 @@ impl eframe::App for RustleApp {
                     PeerEvent::Discovered(peer, local_ip) => {
                         // 更新 UI 中保存的本地端口（若尚未设置）
                         if self.local_port.is_none() {
-                            // worker 写入 last_port.txt（用户数据目录），尽量读取
-                            if let Ok(s) = fs::read_to_string(data_path("last_port.txt")) {
-                                if let Ok(p) = s.trim().parse::<u16>() {
-                                    if (59000..=59100).contains(&p) {
-                                        self.local_port = Some(p);
-                                    }
-                                }
-                            }
+                            self.local_port = Some(UDP_PORT);
                         }
 
                         // 使用 peer.id 作为唯一键，避免创建重复联系人（多网卡场景）
@@ -2253,13 +2246,10 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
         };
 
         // 构建目标地址列表：对每个有效接口计算定向广播地址并发送到该地址
-        // 广播目标列表：仅全局广播（不使用 loopback）
-        let mut base_targets: Vec<SocketAddr> = Vec::new();
-
-        for p in 59000..=59100 {
-            // 仅保留全局广播，不使用 loopback
-            base_targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255,255,255,255)), p));
-        }
+        // 广播目标列表：仅全局广播（不使用 loopback），固定 UDP_PORT
+        let mut base_targets: Vec<SocketAddr> = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), UDP_PORT),
+        ];
 
         // 针对每个接口计算定向广播地址（根据 netmask），过滤 loopback/link-local
         if let Ok(ifaces) = get_if_addrs() {
@@ -2292,9 +2282,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
 
                     let bcast_ip = heuristic_broadcast(ipv4);
 
-                    for p in 59000..=59100 {
-                        base_targets.push(SocketAddr::new(IpAddr::V4(bcast_ip), p));
-                    }
+                    base_targets.push(SocketAddr::new(IpAddr::V4(bcast_ip), UDP_PORT));
                 }
             }
         }
