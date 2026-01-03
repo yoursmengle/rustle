@@ -22,6 +22,7 @@ use sysinfo::{System, SystemExt, NetworkExt};
 
 const KNOWN_PEERS_FILE: &str = "known_peers.json";
 const HISTORY_FILE: &str = "history.jsonl";
+const UDP_PORT: u16 = 59000;
 
 fn data_dir() -> PathBuf {
     let mut dir = env::var_os("LOCALAPPDATA")
@@ -170,15 +171,9 @@ fn main() -> eframe::Result<()> {
                 app.local_ip = chosen.or_else(|| Some("127.0.0.1".to_string()));
             }
 
-            // 尝试读取 last_port.txt（worker 也会写入），放在用户数据目录
+            // 固定使用 UDP_PORT
             if app.local_port.is_none() {
-                if let Ok(s) = fs::read_to_string(data_path("last_port.txt")) {
-                    if let Ok(p) = s.trim().parse::<u16>() {
-                        if (59000..=59100).contains(&p) {
-                            app.local_port = Some(p);
-                        }
-                    }
-                }
+                app.local_port = Some(UDP_PORT);
             }
 
             // 启动网络发现后台线程（使用 channel 向 UI 发送发现事件）
@@ -266,6 +261,15 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+fn format_speed(bytes: u64, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return "0.00 MB/s".to_string();
+    }
+    let mb_per_sec = bytes as f64 / secs / (1024.0 * 1024.0);
+    format!("{:.2} MB/s", mb_per_sec)
 }
 
 #[derive(Clone, Debug)]
@@ -374,6 +378,18 @@ impl RustleApp {
             }
         }
         None
+    }
+
+    fn maybe_switch_primary_interface(&mut self, local_ip: &str, peer_ip: &str) {
+        // 若当前主接口不在同网段，而本次通讯接口在同网段，则切换主接口
+        match &self.local_ip {
+            None => self.local_ip = Some(local_ip.to_string()),
+            Some(cur) => {
+                if !Self::same_lan(cur, peer_ip) && Self::same_lan(local_ip, peer_ip) {
+                    self.local_ip = Some(local_ip.to_string());
+                }
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -888,6 +904,7 @@ impl eframe::App for RustleApp {
                         
                         // 标记为在线并添加/更新联系人（以 peer.id 为 id）
                         let (ip_clone, port_clone) = (preferred_ip.clone(), peer.port);
+                        self.maybe_switch_primary_interface(&local_ip, &peer.ip);
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == key) {
                             u.online = true;
                             u.name = name.clone();
@@ -964,6 +981,7 @@ impl eframe::App for RustleApp {
                         // 确保 contact 存在，并强制更新为当前收信路径
                         // 收到消息意味着该路径当前是通畅的，应立即更新
                         let (ip_clone, port_clone) = (from_ip.clone(), from_port);
+                        self.maybe_switch_primary_interface(&local_ip, &from_ip);
                         
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == key) {
                             if self.selected_user_id.as_deref() != Some(&key) {
@@ -1679,6 +1697,7 @@ enum FileCmd {
 }
 
 async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: Sender<PeerEvent>) {
+    let _ = socket.set_nodelay(true);
     let mut type_buf = [0u8; 1];
     if socket.read_exact(&mut type_buf).await.is_err() {
         eprintln!("[rx] failed to read type from {addr}");
@@ -1750,11 +1769,13 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
     let mut success = false;
     let mut last_progress = 0.0f32;
     let mut final_received: u64 = 0;
+    let mut last_report_instant = Instant::now();
+    let mut last_report_bytes: u64 = 0;
 
     if is_dir {
         let tar_path = save_path.with_extension("tar");
         if let Ok(mut file) = tokio::fs::File::create(&tar_path).await {
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; 256 * 1024];
             let mut received: u64 = 0;
             loop {
                 match socket.read(&mut buf).await {
@@ -1764,8 +1785,14 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
                         received += n as u64;
                         if total_size > 0 {
                             let progress = (received as f32 / total_size as f32).min(1.0);
-                            if progress - last_progress >= 0.05 {
-                                let status = format!("正在接收 {:.0}% / {}", progress * 100.0, human_size(total_size));
+                            if progress - last_progress >= 0.05 || last_report_bytes == 0 {
+                                let now = Instant::now();
+                                let status = format!(
+                                    "正在接收 {:.0}% / {} ({})",
+                                    progress * 100.0,
+                                    human_size(total_size),
+                                    format_speed(received - last_report_bytes, now.duration_since(last_report_instant)),
+                                );
                                 let _ = peer_tx.send(PeerEvent::FileProgress {
                                     peer_id: Some(sender_id.clone()),
                                     file_name: filename.clone(),
@@ -1776,6 +1803,8 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
                                     local_path: None,
                                 });
                                 last_progress = progress;
+                                last_report_instant = now;
+                                last_report_bytes = received;
                             }
                             if received >= total_size {
                                 eprintln!("[rx] dir reached declared size {received}/{total_size}");
@@ -1810,7 +1839,7 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
         }
     } else {
         if let Ok(mut file) = tokio::fs::File::create(&save_path).await {
-            let mut buf = [0u8; 64 * 1024];
+            let mut buf = [0u8; 512 * 1024];
             let mut received: u64 = 0;
             loop {
                 match socket.read(&mut buf).await {
@@ -1820,8 +1849,14 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
                         received += n as u64;
                         if total_size > 0 {
                             let progress = (received as f32 / total_size as f32).min(1.0);
-                            if progress - last_progress >= 0.05 {
-                                let status = format!("正在接收 {:.0}% / {}", progress * 100.0, human_size(total_size));
+                            if progress - last_progress >= 0.05 || last_report_bytes == 0 {
+                                let now = Instant::now();
+                                let status = format!(
+                                    "正在接收 {:.0}% / {} ({})",
+                                    progress * 100.0,
+                                    human_size(total_size),
+                                    format_speed(received - last_report_bytes, now.duration_since(last_report_instant)),
+                                );
                                 let _ = peer_tx.send(PeerEvent::FileProgress {
                                     peer_id: Some(sender_id.clone()),
                                     file_name: filename.clone(),
@@ -1832,6 +1867,8 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
                                     local_path: None,
                                 });
                                 last_progress = progress;
+                                last_report_instant = now;
+                                last_report_bytes = received;
                             }
                             if received >= total_size {
                                 eprintln!("[rx] file reached declared size {received}/{total_size}");
@@ -1949,6 +1986,7 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
     }
 
     if let Ok(mut socket) = socket {
+        let _ = socket.set_nodelay(true);
         let _ = peer_tx.send(PeerEvent::FileProgress {
             peer_id: Some(peer_id.clone()),
             file_name: filename.clone(),
@@ -1977,32 +2015,107 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
         if socket.write_all(&header).await.is_ok() {
             match tokio::fs::File::open(&send_path).await {
                 Ok(mut file) => {
-                    match tokio::io::copy(&mut file, &mut socket).await {
-                        Ok(sent) => eprintln!("[tx] sent {sent} bytes to {addr_str} for {filename}"),
-                        Err(e) => eprintln!("[tx] copy error to {addr_str}: {e}"),
+                    let mut buf = [0u8; 512 * 1024];
+                    let mut sent_total: u64 = 0;
+                    let mut last_progress = 0.0f32;
+                    let mut last_report_instant = Instant::now();
+                    let mut last_report_bytes: u64 = 0;
+                    let mut send_ok = true;
+
+                    loop {
+                        match file.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if socket.write_all(&buf[..n]).await.is_err() {
+                                    eprintln!("[tx] write error to {addr_str}");
+                                    send_ok = false;
+                                    break;
+                                }
+                                sent_total += n as u64;
+
+                                if declared_size > 0 {
+                                    let progress = (sent_total as f32 / declared_size as f32).min(1.0);
+                                    let now = Instant::now();
+                                    let elapsed = now.duration_since(last_report_instant);
+                                    if progress - last_progress >= 0.05 || elapsed.as_secs_f64() >= 1.0 || last_report_bytes == 0 {
+                                        let status = format!(
+                                            "发送中 {:.0}% / {} ({})",
+                                            progress * 100.0,
+                                            human_size(declared_size),
+                                            format_speed(sent_total - last_report_bytes, elapsed),
+                                        );
+                                        let _ = peer_tx.send(PeerEvent::FileProgress {
+                                            peer_id: Some(peer_id.clone()),
+                                            file_name: filename.clone(),
+                                            progress,
+                                            status,
+                                            is_incoming: false,
+                                            is_dir,
+                                            local_path: Some(path.to_string_lossy().to_string()),
+                                        });
+                                        last_progress = progress;
+                                        last_report_instant = now;
+                                        last_report_bytes = sent_total;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[tx] read error from {:?}: {e}", send_path);
+                                send_ok = false;
+                                break;
+                            }
+                        }
                     }
+
+                    let _ = socket.shutdown().await;
+                    eprintln!("[tx] shutdown write half to {addr_str}");
+
+                    if let Some(p) = cleanup_path.as_ref() {
+                        let _ = tokio::fs::remove_file(p).await;
+                    }
+
+                    let final_progress = if declared_size > 0 {
+                        (sent_total as f32 / declared_size as f32).min(1.0)
+                    } else if send_ok {
+                        1.0
+                    } else {
+                        0.0
+                    };
+
+                    let status_text = if send_ok && (declared_size == 0 || sent_total >= declared_size) {
+                        "发送完成".to_string()
+                    } else {
+                        "发送失败".to_string()
+                    };
+
+                    let _ = peer_tx.send(PeerEvent::FileProgress {
+                        peer_id: Some(peer_id),
+                        file_name: filename,
+                        progress: final_progress,
+                        status: status_text,
+                        is_incoming: false,
+                        is_dir,
+                        local_path: Some(path.to_string_lossy().to_string()),
+                    });
                 }
-                Err(e) => eprintln!("[tx] open send_path {:?} failed: {e}", send_path),
+                Err(e) => {
+                    eprintln!("[tx] open send_path {:?} failed: {e}", send_path);
+                    if let Some(p) = cleanup_path.as_ref() {
+                        let _ = tokio::fs::remove_file(p).await;
+                    }
+                    let _ = peer_tx.send(PeerEvent::FileProgress {
+                        peer_id: Some(peer_id),
+                        file_name: filename,
+                        progress: 0.0,
+                        status: "发送失败".to_string(),
+                        is_incoming: false,
+                        is_dir,
+                        local_path: Some(path.to_string_lossy().to_string()),
+                    });
+                }
             }
-            
-            let _ = socket.shutdown().await;
-            eprintln!("[tx] shutdown write half to {addr_str}");
-
-            if let Some(p) = cleanup_path {
-                let _ = tokio::fs::remove_file(p).await;
-            }
-
-            let _ = peer_tx.send(PeerEvent::FileProgress {
-                peer_id: Some(peer_id),
-                file_name: filename,
-                progress: 1.0,
-                status: "发送完成".to_string(),
-                is_incoming: false,
-                is_dir,
-                local_path: Some(path.to_string_lossy().to_string()),
-            });
         } else {
-             if let Some(p) = cleanup_path {
+             if let Some(p) = cleanup_path.as_ref() {
                  let _ = tokio::fs::remove_file(p).await;
              }
              let _ = peer_tx.send(PeerEvent::FileProgress {
@@ -2080,7 +2193,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             }
         });
 
-        // 端口选择并在每个 IPv4 接口上绑定一个 socket
+        // 端口选择并在每个 IPv4 接口上绑定一个 socket（固定 UDP_PORT）
         let last_port_path = data_path("last_port.txt");
         let mut bound_sockets: Vec<(UdpSocket, Ipv4Addr, u16)> = Vec::new();
 
@@ -2088,9 +2201,6 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             let o = ip.octets();
             (o[0] == 10) || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
         };
-
-        // 读取期望端口（如果存在）
-        let preferred_port = fs::read_to_string(&last_port_path).ok().and_then(|s| s.trim().parse::<u16>().ok()).filter(|p| (59000..=59100).contains(p));
 
         if let Ok(ifaces) = get_if_addrs() {
             for iface in ifaces {
@@ -2101,34 +2211,18 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                     if !is_private(&ipv4) {
                         continue; // 只绑定私网接口
                     }
-                    // 尝试优先使用 preferred_port，否则找到一个可用端口
-                    let mut chosen: Option<u16> = None;
-                    if let Some(p) = preferred_port {
-                        if UdpSocket::bind((ipv4, p)).is_ok() {
-                            chosen = Some(p);
+                    match UdpSocket::bind((ipv4, UDP_PORT)) {
+                        Ok(sock) => {
+                            let _ = sock.set_broadcast(true);
+                            let _ = sock.set_nonblocking(true);
+                            bound_sockets.push((sock, ipv4, UDP_PORT));
+                            // 报告回 UI 我们在该接口上绑定了端口
+                            let _ = peer_tx.send(PeerEvent::LocalBound { ip: ipv4.to_string(), port: UDP_PORT });
+                            // 保存首选端口（覆盖 last_port.txt）
+                            let _ = fs::write(&last_port_path, UDP_PORT.to_string());
                         }
-                    }
-                    if chosen.is_none() {
-                        for p in 59000..=59100 {
-                            if let Ok(s) = UdpSocket::bind((ipv4, p)) {
-                                chosen = Some(p);
-                                drop(s);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(port) = chosen {
-                        match UdpSocket::bind((ipv4, port)) {
-                            Ok(sock) => {
-                                let _ = sock.set_broadcast(true);
-                                let _ = sock.set_nonblocking(true);
-                                bound_sockets.push((sock, ipv4, port));
-                                // 报告回 UI 我们在该接口上绑定了端口
-                                let _ = peer_tx.send(PeerEvent::LocalBound { ip: ipv4.to_string(), port });
-                                // 保存首选端口（覆盖 last_port.txt）
-                                let _ = fs::write(&last_port_path, port.to_string());
-                            }
-                            Err(_) => {}
+                        Err(e) => {
+                            eprintln!("Net discovery: failed to bind {ipv4}:{UDP_PORT} - {e}");
                         }
                     }
                 }
@@ -2137,7 +2231,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
 
         // 如果没有找到任何私网接口绑定，无法继续（不使用 loopback）
         if bound_sockets.is_empty() {
-            eprintln!("Net discovery: 未找到任何私网接口，无法启动（不支持 loopback 模式）");
+            eprintln!("Net discovery: 未找到任何私网接口或端口 {UDP_PORT} 被占用，无法启动（不支持 loopback 模式）");
             return;
         }
 
