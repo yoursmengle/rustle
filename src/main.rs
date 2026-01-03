@@ -2192,10 +2192,19 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
 
         if let Ok(ifaces) = get_if_addrs() {
             for iface in ifaces {
-                if let IpAddr::V4(ipv4) = iface.ip() {
-                    if ipv4.is_loopback() {
-                        continue; // 跳过 loopback 接口
+                if let get_if_addrs::IfAddr::V4(v4) = iface.addr {
+                    let ipv4 = v4.ip;
+                    if ipv4.is_loopback() || ipv4.is_link_local() {
+                        continue; // 跳过 loopback 与 link-local 接口
                     }
+
+                    // 跳过 /32 或无广播的点对点接口，避免 Windows 返回 10049
+                    let nm = v4.netmask.octets();
+                    let is_host_mask = nm == [255, 255, 255, 255];
+                    if is_host_mask || v4.broadcast.is_none() {
+                        continue;
+                    }
+
                     match UdpSocket::bind((ipv4, UDP_PORT)) {
                         Ok(sock) => {
                             let _ = sock.set_broadcast(true);
@@ -2207,17 +2216,34 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                             let _ = fs::write(&last_port_path, UDP_PORT.to_string());
                         }
                         Err(e) => {
-                            eprintln!("Net discovery: failed to bind {ipv4}:{UDP_PORT} - {e}");
+                            // 常见 10049（WSAEADDRNOTAVAIL）直接跳过，其他错误提示
+                            if e.raw_os_error() == Some(10049) {
+                                eprintln!("Net discovery: skip unusable iface {ipv4} (os error 10049)");
+                            } else {
+                                eprintln!("Net discovery: failed to bind {ipv4}:{UDP_PORT} - {e}");
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 如果没有找到任何接口绑定，无法继续（不使用 loopback）
+        // 如果没有找到任何接口绑定，尝试兜底绑定 0.0.0.0，避免因单个异常地址导致完全不可用
         if bound_sockets.is_empty() {
-            eprintln!("Net discovery: 未找到任何可用接口或端口 {UDP_PORT} 被占用，无法启动（不支持 loopback 模式）");
-            return;
+            match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, UDP_PORT)) {
+                Ok(sock) => {
+                    let _ = sock.set_broadcast(true);
+                    let _ = sock.set_nonblocking(true);
+                    bound_sockets.push((sock, Ipv4Addr::UNSPECIFIED, UDP_PORT));
+                    let _ = peer_tx.send(PeerEvent::LocalBound { ip: Ipv4Addr::UNSPECIFIED.to_string(), port: UDP_PORT });
+                    let _ = fs::write(&last_port_path, UDP_PORT.to_string());
+                    eprintln!("Net discovery: bound fallback 0.0.0.0:{UDP_PORT}");
+                }
+                Err(e) => {
+                    eprintln!("Net discovery: 未找到任何可用接口且兜底 0.0.0.0:{UDP_PORT} 绑定失败 - {e}");
+                    return;
+                }
+            }
         }
 
         let mut our_name = initial_name.unwrap_or_default();
@@ -2243,12 +2269,18 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), UDP_PORT),
         ];
 
-        // 针对每个接口计算定向广播地址（根据 netmask），过滤 loopback/link-local
+        // 针对每个接口计算定向广播地址（根据 netmask），过滤 loopback/link-local/无广播接口
         if let Ok(ifaces) = get_if_addrs() {
             for iface in ifaces {
-                if let IpAddr::V4(ipv4) = iface.ip() {
-                    if ipv4.is_loopback() || ipv4.octets()[0] == 169 { // skip link-local 169.254.x.x
+                if let get_if_addrs::IfAddr::V4(v4) = iface.addr {
+                    let ipv4 = v4.ip;
+                    if ipv4.is_loopback() || ipv4.octets()[0] == 169 {
                         continue;
+                    }
+                    let nm = v4.netmask.octets();
+                    let is_host_mask = nm == [255, 255, 255, 255];
+                    if is_host_mask || v4.broadcast.is_none() {
+                        continue; // 点对点或无广播接口
                     }
 
                     // 计算接口的广播地址：优先使用常见私网掩码规则，如果有特殊子网需改进可再接入系统 netmask
