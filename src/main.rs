@@ -2186,23 +2186,15 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             }
         });
 
-        // 端口选择并在每个 IPv4 接口上绑定一个 socket（固定 UDP_PORT）
+        // 在每个非 loopback IPv4 接口上绑定一个 socket（固定 UDP_PORT）
         let last_port_path = data_path("last_port.txt");
         let mut bound_sockets: Vec<(UdpSocket, Ipv4Addr, u16)> = Vec::new();
-
-        let is_private = |ip: &Ipv4Addr| {
-            let o = ip.octets();
-            (o[0] == 10) || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
-        };
 
         if let Ok(ifaces) = get_if_addrs() {
             for iface in ifaces {
                 if let IpAddr::V4(ipv4) = iface.ip() {
                     if ipv4.is_loopback() {
                         continue; // 跳过 loopback 接口
-                    }
-                    if !is_private(&ipv4) {
-                        continue; // 只绑定私网接口
                     }
                     match UdpSocket::bind((ipv4, UDP_PORT)) {
                         Ok(sock) => {
@@ -2222,9 +2214,9 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             }
         }
 
-        // 如果没有找到任何私网接口绑定，无法继续（不使用 loopback）
+        // 如果没有找到任何接口绑定，无法继续（不使用 loopback）
         if bound_sockets.is_empty() {
-            eprintln!("Net discovery: 未找到任何私网接口或端口 {UDP_PORT} 被占用，无法启动（不支持 loopback 模式）");
+            eprintln!("Net discovery: 未找到任何可用接口或端口 {UDP_PORT} 被占用，无法启动（不支持 loopback 模式）");
             return;
         }
 
