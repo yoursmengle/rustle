@@ -313,6 +313,8 @@ struct RustleApp {
     // 本机绑定信息（UI 使用）
     local_ip: Option<String>,
     local_port: Option<u16>,
+    // 已成功绑定的接口列表（用于验证显示的本地地址是否可用）
+    bound_interfaces: HashSet<String>,
 
     // 已接收消息 ID 缓存（用于去重）
     received_msg_ids: HashSet<String>,
@@ -1029,11 +1031,14 @@ impl eframe::App for RustleApp {
                         }
                     }
                     PeerEvent::LocalBound { ip, port } => {
+                        // 记录可用的绑定接口
+                        self.bound_interfaces.insert(ip.clone());
                         // 首次设置本机显示端口与 ip（优先选用已选择的本地 ip）
                         if self.local_port.is_none() {
                             self.local_port = Some(port);
                         }
-                        if self.local_ip.is_none() {
+                        // 如果当前显示的 ip 不在可用绑定列表，使用本次可用 ip 纠正
+                        if self.local_ip.is_none() || !self.local_ip.as_ref().map(|cur| self.bound_interfaces.contains(cur)).unwrap_or(false) {
                             self.local_ip = Some(ip);
                         }
                     }
