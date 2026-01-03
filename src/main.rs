@@ -3,99 +3,69 @@
 use eframe::egui;
 use rfd::FileDialog;
 use std::path::PathBuf;
-                            if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-                                    if let Some(mt) = v.get("msg_type").and_then(|m| m.as_str()) {
-                                        match mt {
-                                            "hello" => {
-                                                match serde_json::from_value::<HelloMsg>(v) {
-                                                    Ok(h) => {
-                                                        if h.id == my_id {
-                                                            // 本机广播 loopback，忽略但不噪声
-                                                            continue;
-                                                        }
-                                                        if h.id.is_empty() {
-                                                            eprintln!("Net discovery: skip hello with empty id from {}", src);
-                                                            continue;
-                                                        }
-                                                        eprintln!("Net discovery: hello from {} (id={}, name={:?}, port={}, tcp_port={:?})", src, h.id, h.name, h.port, h.tcp_port);
-                                                        let peer = DiscoveredPeer {
-                                                            id: h.id.clone(),
-                                                            ip: src.ip().to_string(),
-                                                            port: h.port,
-                                                            tcp_port: h.tcp_port,
-                                                            name: h.name.clone(),
-                                                        };
-                                                        let _ = peer_tx.send(PeerEvent::Discovered(peer, _ip.to_string()));
+use std::env;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use chrono::{DateTime, Local, Duration as ChronoDuration};
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
+use serde::{Serialize, Deserialize};
+use serde_json;
+use uuid::Uuid;
+use std::net::{SocketAddr, UdpSocket, Ipv4Addr, IpAddr};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use get_if_addrs::get_if_addrs;
+use sysinfo::{System, SystemExt, NetworkExt};
 
-                                                        // 回复到对方报告的端口（包含我们的 id）
-                                                        let target = SocketAddr::new(src.ip(), h.port);
-                                                        let reply = HelloMsg {
-                                                            msg_type: "hello".to_string(),
-                                                            id: my_id.clone(),
-                                                            name: if our_name.is_empty() { None } else { Some(our_name.clone()) },
-                                                            port: *_port,
-                                                            tcp_port: Some(tcp_port),
-                                                            version: "0.1".to_string(),
-                                                        };
-                                                        if let Ok(resp) = serde_json::to_vec(&reply) {
-                                                            let _ = sock.send_to(&resp, target);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("Net discovery: failed to parse hello from {}: {}", src, e);
-                                                    }
-                                                }
-                                            }
-                                            "chat" => {
-                                                match serde_json::from_value::<ChatPayload>(v) {
-                                                    Ok(c) => {
-                                                        eprintln!("Received chat from {}: {:?}", src, c);
-                                                        // 回复 ACK（仅 1 次，超时重传由发送端处理）
-                                                        let ack = AckPayload { msg_type: "ack".to_string(), msg_id: c.msg_id.clone(), from_id: my_id.clone() };
-                                                        if let Ok(ack_data) = serde_json::to_vec(&ack) {
-                                                            eprintln!("Sending ACK for msg_id={} to {}", c.msg_id, src);
-                                                            let _ = sock.send_to(&ack_data, src);
-                                                        }
+const KNOWN_PEERS_FILE: &str = "known_peers.json";
+const HISTORY_FILE: &str = "history.jsonl";
+const UDP_PORT: u16 = 59000;
 
-                                                        let _ = peer_tx.send(PeerEvent::ChatReceived {
-                                                            from_id: c.from_id.clone(),
-                                                            from_ip: src.ip().to_string(),
-                                                            from_port: src.port(),
-                                                            text: c.text.clone(),
-                                                            send_ts: c.timestamp.clone(),
-                                                            recv_ts: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                                                            msg_id: c.msg_id.clone(),
-                                                            local_ip: _ip.to_string(),
-                                                        });
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("Net discovery: failed to parse chat from {}: {}", src, e);
-                                                    }
-                                                }
-                                            }
-                                            "ack" => {
-                                                match serde_json::from_value::<AckPayload>(v) {
-                                                    Ok(a) => {
-                                                        eprintln!("Received ACK for msg_id={} from {}", a.msg_id, src);
-                                                        let _ = peer_tx.send(PeerEvent::ChatAck { from_id: a.from_id, msg_id: a.msg_id });
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("Net discovery: failed to parse ack from {}: {}", src, e);
-                                                    }
-                                                }
-                                            }
-                                            other => {
-                                                eprintln!("Net discovery: unknown msg_type '{}' from {}", other, src);
-                                            }
-                                        }
-                                    } else {
-                                        eprintln!("Net discovery: missing msg_type from {}", src);
-                                    }
-                                } else {
-                                    eprintln!("Net discovery: invalid UTF-8/JSON from {}", src);
-                                }
-                            }
+fn data_dir() -> PathBuf {
+    let mut dir = env::var_os("LOCALAPPDATA")
+        .or_else(|| env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::temp_dir());
+    dir.push("Rustle");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn data_path(name: &str) -> PathBuf {
+    let mut p = data_dir();
+    p.push(name);
+    p
+}
+
+fn main() -> eframe::Result<()> {
+    // 加载图标
+    let icon_data = match image::load_from_memory(include_bytes!("../rustle.ico")) {
+        Ok(image) => {
+            let image = image.to_rgba8();
+            let (width, height) = image.dimensions();
+            Some(egui::IconData {
+                rgba: image.into_raw(),
+                width,
+                height,
+            })
+        }
+        Err(_) => None,
+    };
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Rustle")
+        .with_inner_size([1200.0, 800.0]);
+
+    if let Some(icon) = icon_data {
+        viewport = viewport.with_icon(icon);
+    }
+
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
     };
 
     eframe::run_native(
@@ -104,28 +74,28 @@ use std::path::PathBuf;
         Box::new(|cc| {
             // 加载中文字体
             let mut fonts = egui::FontDefinitions::default();
-            
+
             // 添加中文字体（使用 Windows 系统自带的微软雅黑）
             fonts.font_data.insert(
                 "msyh".to_owned(),
                 egui::FontData::from_static(include_bytes!("C:\\Windows\\Fonts\\msyh.ttc")),
             );
-            
+
             // 将中文字体设为最高优先级
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
                 .or_default()
                 .insert(0, "msyh".to_owned());
-            
+
             fonts
                 .families
                 .entry(egui::FontFamily::Monospace)
                 .or_default()
                 .insert(0, "msyh".to_owned());
-            
+
             cc.egui_ctx.set_fonts(fonts);
-            
+
             // 在启动时检查用户数据目录下的 me.txt
             let mut app = RustleApp::default();
             match fs::read_to_string(data_path("me.txt")) {
@@ -2470,6 +2440,9 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                 loop {
                     match sock.recv_from(&mut buf) {
                         Ok((n, src)) => {
+                            if src.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) || src.ip().to_string() == _ip.to_string() {
+                                continue;
+                            }
                             eprintln!("Net discovery: recv {} bytes on {}:{} from {}", n, _ip, _port, src);
                             if let Ok(text) = std::str::from_utf8(&buf[..n]) {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
