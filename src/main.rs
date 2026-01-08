@@ -2334,6 +2334,8 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
         }
 
         let mut our_name = initial_name.unwrap_or_default();
+        // 记录近期已在线的节点，避免对已知在线用户的广播重复应答
+        let mut known_online: HashMap<String, Instant> = HashMap::new();
 
         // 发送 hello 的函数（包含 our id）
         let send_hello = |sock: &UdpSocket, target: SocketAddr, name: &str, port: u16, my_id: &str, tcp_port: u16| {
@@ -2523,6 +2525,12 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                         } else {
                                                             h.id.clone()
                                                         };
+                                                        let now = Instant::now();
+                                                        let recently_seen = known_online
+                                                            .get(&pid)
+                                                            .map(|ts| now.duration_since(*ts) < Duration::from_secs(30))
+                                                            .unwrap_or(false);
+                                                        known_online.insert(pid.clone(), now);
                                                         let peer = DiscoveredPeer {
                                                             id: pid,
                                                             ip: src.ip().to_string(),
@@ -2532,8 +2540,8 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                         };
                                                         let _ = peer_tx.send(PeerEvent::Discovered(peer, _ip.to_string()));
 
-                                                        // 仅对非回复的 hello 进行回复，避免无限循环
-                                                        if !h.is_reply {
+                                                        // 仅对非回复的 hello 进行回复，且若对方已在近期在线列表中则不再应答
+                                                        if !h.is_reply && !recently_seen {
                                                             let target = SocketAddr::new(src.ip(), h.port);
                                                             let reply = HelloMsg {
                                                                 msg_type: "hello".to_string(),
