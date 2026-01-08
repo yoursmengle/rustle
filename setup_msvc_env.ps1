@@ -52,7 +52,9 @@ function Get-BuildToolsInstance([string]$vswherePath) {
     # If array, pick an instance that actually has VC tools installed on disk
     $instances = @($json)
     foreach ($inst in $instances) {
-      $root = ($inst.installationPath ?? '').Trim()
+      $root = $inst.installationPath
+      if (-not $root) { $root = '' }
+      $root = $root.Trim()
       if ($root -and (Test-Path (Join-Path $root 'VC\Tools\MSVC'))) {
         return $inst
       }
@@ -187,8 +189,9 @@ $instance = Get-BuildToolsInstance $vswhere
 if (-not $instance) {
   throw "No Visual Studio/Build Tools instance found. Install Visual Studio Build Tools 2022, then rerun."
 }
-
-$vsInstall = ($instance.installationPath ?? '').Trim()
+$vsInstall = $instance.installationPath
+if (-not $vsInstall) { $vsInstall = '' }
+$vsInstall = $vsInstall.Trim()
 if (-not $vsInstall) {
   throw "vswhere returned an instance without an installationPath."
 }
