@@ -2,7 +2,8 @@
 
 use eframe::egui;
 use rfd::FileDialog;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::env;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -38,6 +39,79 @@ fn data_path(name: &str) -> PathBuf {
     let mut p = data_dir();
     p.push(name);
     p
+}
+
+fn read_machine_uuid() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        fn extract_uuid(bytes: &[u8]) -> Option<String> {
+            let text = String::from_utf8_lossy(bytes);
+            text.lines()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_graphic()))
+                .map(|s| s.to_string())
+        }
+
+        if let Ok(output) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "(Get-CimInstance Win32_ComputerSystemProduct).UUID"])
+            .output()
+        {
+            if output.status.success() {
+                if let Some(uuid) = extract_uuid(&output.stdout) {
+                    return Some(uuid);
+                }
+            }
+        }
+
+        if let Ok(output) = Command::new("wmic")
+            .args(["csproduct", "get", "UUID"])
+            .output()
+        {
+            if output.status.success() {
+                if let Some(uuid) = extract_uuid(&output.stdout) {
+                    return Some(uuid);
+                }
+            }
+        }
+
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+fn load_or_init_node_id() -> String {
+    let persistent_path = data_path("node_id.txt");
+    let legacy_path = PathBuf::from("node_id.txt");
+
+    let read_id = |path: &Path| -> Option<String> {
+        fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    if let Some(id) = read_id(&persistent_path) {
+        return id;
+    }
+
+    if let Some(id) = read_id(&legacy_path) {
+        let _ = fs::write(&persistent_path, &id);
+        return id;
+    }
+
+    if let Some(hw_uuid) = read_machine_uuid() {
+        let _ = fs::write(&persistent_path, &hw_uuid);
+        let _ = fs::write(&legacy_path, &hw_uuid);
+        return hw_uuid;
+    }
+
+    let fallback = Uuid::new_v4().to_string();
+    let _ = fs::write(&persistent_path, &fallback);
+    let _ = fs::write(&legacy_path, &fallback);
+    fallback
 }
 
 fn main() -> eframe::Result<()> {
@@ -645,7 +719,41 @@ impl RustleApp {
             let _ = fs::write(data_path(KNOWN_PEERS_FILE), text);
         }
         self.known_dirty = false;
-    }    fn selected_user_name(&self) -> String {
+    }
+
+    fn merge_users_by_id(&mut self) {
+        let before = self.users.len();
+        let mut first: HashMap<String, usize> = HashMap::new();
+        let mut i = 0;
+        while i < self.users.len() {
+            let id = self.users[i].id.clone();
+            if let Some(&keep_idx) = first.get(&id) {
+                let dup = self.users.remove(i);
+                let primary = &mut self.users[keep_idx];
+                primary.online |= dup.online;
+                if primary.ip.is_none() { primary.ip = dup.ip.clone(); }
+                if primary.port.is_none() { primary.port = dup.port; }
+                if primary.tcp_port.is_none() { primary.tcp_port = dup.tcp_port; }
+                if primary.bound_interface.is_none() { primary.bound_interface = dup.bound_interface.clone(); }
+                if primary.best_interface.is_none() { primary.best_interface = dup.best_interface.clone(); }
+                primary.has_unread |= dup.has_unread;
+                if primary.name.trim().is_empty() || primary.name == primary.id {
+                    if !dup.name.trim().is_empty() {
+                        primary.name = dup.name;
+                    }
+                }
+                continue;
+            } else {
+                first.insert(id, i);
+                i += 1;
+            }
+        }
+        if before != self.users.len() {
+            self.known_dirty = true;
+        }
+    }
+
+    fn selected_user_name(&self) -> String {
         let Some(id) = &self.selected_user_id else {
             return "选择联系人".to_string();
         };
@@ -1124,6 +1232,7 @@ impl eframe::App for RustleApp {
                     }
                 }
             }
+            self.merge_users_by_id();
         }
 
         egui::SidePanel::left("contacts")
@@ -2137,16 +2246,8 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
 // spawn worker implementation will persist/read a node id in node_id.txt
 fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, initial_name: Option<String>) {
     thread::spawn(move || {
-        // ensure we have a stable node id persisted across runs
-        let id_path = "node_id.txt";
-        let my_id = match fs::read_to_string(id_path) {
-            Ok(s) => s.trim().to_string(),
-            Err(_) => {
-                let new_id = Uuid::new_v4().to_string();
-                let _ = fs::write(id_path, &new_id);
-                new_id
-            }
-        };
+        // Stable node id: prefer motherboard UUID, persisted under data_dir/node_id.txt (with legacy fallback)
+        let my_id = load_or_init_node_id();
         let my_id_clone = my_id.clone();
 
         // Initialize Tokio runtime
