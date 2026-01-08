@@ -1742,6 +1742,8 @@ struct HelloMsg {
     version: String,
     #[serde(default)]
     is_reply: bool,
+    #[serde(default)]
+    is_probe: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -2334,11 +2336,13 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
         }
 
         let mut our_name = initial_name.unwrap_or_default();
-        // 记录近期已在线的节点，避免对已知在线用户的广播重复应答
-        let mut known_online: HashMap<String, Instant> = HashMap::new();
+        // 记录最近收到消息/hello 的时间，用于判定在线与节流查询
+        let mut last_from_peer: HashMap<String, Instant> = HashMap::new();
+        // 记录最近见过的 peers 的地址
+        let mut peers_seen: HashMap<String, (IpAddr, u16)> = HashMap::new();
 
         // 发送 hello 的函数（包含 our id）
-        let send_hello = |sock: &UdpSocket, target: SocketAddr, name: &str, port: u16, my_id: &str, tcp_port: u16| {
+        let send_hello = |sock: &UdpSocket, target: SocketAddr, name: &str, port: u16, my_id: &str, tcp_port: u16, is_probe: bool| {
             let msg = HelloMsg {
                 msg_type: "hello".to_string(),
                 id: my_id.to_string(),
@@ -2347,6 +2351,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                 tcp_port: Some(tcp_port),
                 version: "0.1".to_string(),
                 is_reply: false,
+                is_probe,
             };
             if let Ok(payload) = serde_json::to_vec(&msg) {
                 if let Err(e) = sock.send_to(&payload, target) {
@@ -2416,13 +2421,14 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             eprintln!("Net discovery: broadcast targets -> {}", targets.join(", "));
         }
 
-        // 频繁度控制：3 秒广播一次
-        let mut last_broadcast = Instant::now() - Duration::from_secs(3);
+        // 广播间隔：60 秒；定向查询间隔：5 秒
+        let mut last_broadcast = Instant::now();
+        let mut last_direct_probe = Instant::now();
 
-        // 启动时立即发送一轮 hello，提高首次发现速度
+        // 启动时立即发送一轮广播 hello，提高首次发现速度
         for (sock, _ip, port) in &bound_sockets {
             for addr in &base_targets {
-                send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port);
+                send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port, true);
             }
         }
 
@@ -2437,7 +2443,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                         // 立刻广播（从每个 socket 发出）
                         for (sock, _ip, port) in &bound_sockets {
                             for addr in &base_targets {
-                                send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port);
+                                send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port, true);
                             }
                         }
                     }
@@ -2461,7 +2467,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                 if let Some(v) = &via {
                                     if _ip.to_string() != *v { continue; }
                                 }
-                                send_hello(sock, target, &our_name, *p, &my_id, tcp_port);
+                                send_hello(sock, target, &our_name, *p, &my_id, tcp_port, false);
                             }
                         }
                     }
@@ -2494,14 +2500,46 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                 }
             }
 
-            // 周期性广播（3s）
-            if last_broadcast.elapsed() > Duration::from_secs(3) {
+            // 周期性广播（60s）
+            if last_broadcast.elapsed() > Duration::from_secs(60) {
                 for (sock, _ip, port) in &bound_sockets {
                     for addr in &base_targets {
-                        send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port);
+                        send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port, true);
                     }
                 }
                 last_broadcast = Instant::now();
+            }
+
+            // 周期性定向查询（5s）：对已知节点单播 hello；若 5 秒内收过对方消息则跳过
+            if last_direct_probe.elapsed() > Duration::from_secs(5) {
+                let now = Instant::now();
+                for (pid, (ip, port)) in peers_seen.iter() {
+                    if let Some(last_seen) = last_from_peer.get(pid) {
+                        if now.duration_since(*last_seen) <= Duration::from_secs(5) {
+                            continue; // 5 秒内收过消息，不查询
+                        }
+                        if now.duration_since(*last_seen) > Duration::from_secs(120) {
+                            continue; // 太久未见，暂不骚扰
+                        }
+                    }
+                    let target = SocketAddr::new(*ip, *port);
+                    for (sock, _ip, p) in &bound_sockets {
+                        let msg = HelloMsg {
+                            msg_type: "hello".to_string(),
+                            id: my_id.clone(),
+                            name: if our_name.is_empty() { None } else { Some(our_name.clone()) },
+                            port: *p,
+                            tcp_port: Some(tcp_port),
+                            version: "0.1".to_string(),
+                            is_reply: false,
+                            is_probe: false,
+                        };
+                        if let Ok(payload) = serde_json::to_vec(&msg) {
+                            let _ = sock.send_to(&payload, target);
+                        }
+                    }
+                }
+                last_direct_probe = Instant::now();
             }
 
             // 接收来自所有 sockets（非阻塞）
@@ -2526,13 +2564,11 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                             h.id.clone()
                                                         };
                                                         let now = Instant::now();
-                                                        let recently_seen = known_online
-                                                            .get(&pid)
-                                                            .map(|ts| now.duration_since(*ts) < Duration::from_secs(30))
-                                                            .unwrap_or(false);
-                                                        known_online.insert(pid.clone(), now);
+                                                        last_from_peer.insert(pid.clone(), now);
+                                                        peers_seen.insert(pid.clone(), (src.ip(), h.port));
+
                                                         let peer = DiscoveredPeer {
-                                                            id: pid,
+                                                            id: pid.clone(),
                                                             ip: src.ip().to_string(),
                                                             port: h.port,
                                                             tcp_port: h.tcp_port,
@@ -2540,8 +2576,16 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                         };
                                                         let _ = peer_tx.send(PeerEvent::Discovered(peer, _ip.to_string()));
 
-                                                        // 仅对非回复的 hello 进行回复，且若对方已在近期在线列表中则不再应答
-                                                        if !h.is_reply && !recently_seen {
+                                                        // 回复策略：
+                                                        // - 来自在线用户的广播查询（is_probe=true 且最近 15s 内有活动）不回复
+                                                        // - 其他情况回复（包含定向查询）
+                                                        let recently_active = last_from_peer
+                                                            .get(&pid)
+                                                            .map(|ts| now.duration_since(*ts) < Duration::from_secs(15))
+                                                            .unwrap_or(false);
+
+                                                        let should_reply = !h.is_reply && (!h.is_probe || !recently_active);
+                                                        if should_reply {
                                                             let target = SocketAddr::new(src.ip(), h.port);
                                                             let reply = HelloMsg {
                                                                 msg_type: "hello".to_string(),
@@ -2551,6 +2595,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                                 tcp_port: Some(tcp_port),
                                                                 version: "0.1".to_string(),
                                                                 is_reply: true,
+                                                                is_probe: false,
                                                             };
                                                             let _ = sock.send_to(&serde_json::to_vec(&reply).unwrap(), target);
                                                         }
@@ -2561,6 +2606,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                 if let Ok(c) = serde_json::from_value::<ChatPayload>(v) {
                                                     // 屏蔽自身广播回环
                                                     if c.from_id == my_id { continue; }
+                                                    last_from_peer.insert(c.from_id.clone(), Instant::now());
                                                     eprintln!("Received chat from {}: {:?}", src, c);
                                                     // 回复 ACK 到发送端的监听端口（使用 UDP_PORT 而非 src.port()，因为发送端可能使用临时端口发送）
                                                     let ack = AckPayload { msg_type: "ack".to_string(), msg_id: c.msg_id.clone(), from_id: my_id.clone() };
@@ -2589,6 +2635,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                             "ack" => {
                                                 if let Ok(a) = serde_json::from_value::<AckPayload>(v) {
                                                     if a.from_id == my_id { continue; }
+                                                    last_from_peer.insert(a.from_id.clone(), Instant::now());
                                                     eprintln!("Received ACK for msg_id={} from {}", a.msg_id, src);
                                                     let _ = peer_tx.send(PeerEvent::ChatAck { from_id: a.from_id, msg_id: a.msg_id });
                                                 }
