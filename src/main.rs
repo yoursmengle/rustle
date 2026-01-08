@@ -392,6 +392,15 @@ struct RustleApp {
     // 右键菜单状态
     context_menu_user_id: Option<String>,
     show_ip_dialog: Option<(String, String)>, // (name, ip_info)
+
+    // 菜单状态
+    show_usage_window: bool,
+    show_update_dialog: bool,
+
+    // 升级检查
+    update_check_rx: Option<Receiver<Result<(String, String), String>>>, // Ok((version, url))
+    is_checking_update: bool,
+    new_version_info: Option<(String, String)>,
 }
 
 impl RustleApp {
@@ -915,18 +924,171 @@ impl RustleApp {
     }
 }
 
+fn spawn_check_update(tx: Sender<Result<(String, String), String>>) {
+    thread::spawn(move || {
+        let cmd = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    $r = Invoke-RestMethod -Uri "https://api.github.com/repos/yoursmengle/rustle/releases/latest" -TimeoutSec 10
+    if ($r) {
+        $r | Select-Object tag_name, html_url | ConvertTo-Json -Compress
+    }
+} catch {
+    if ($_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+        Write-Output '{"tag_name": "none", "html_url": ""}'
+        exit 0
+    }
+    Write-Error $_
+}
+"#;
+        #[cfg(target_os = "windows")]
+        use std::os::windows::process::CommandExt;
+
+        #[cfg(target_os = "windows")]
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command", cmd])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output();
+        
+        #[cfg(not(target_os = "windows"))]
+        let output: std::io::Result<std::process::Output> = Err(std::io::Error::new(std::io::ErrorKind::Other, "Not supported"));
+
+        match output {
+            Ok(out) => {
+                if out.status.success() {
+                     let stdout = String::from_utf8_lossy(&out.stdout);
+                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                        let tag = val["tag_name"].as_str().unwrap_or("").to_string();
+                        let url = val["html_url"].as_str().unwrap_or("").to_string();
+                        
+                        if tag == "none" {
+                            let _ = tx.send(Err("暂无发布版本".to_string()));
+                            return;
+                        }
+
+                        if !tag.is_empty() && !url.is_empty() {
+                            let _ = tx.send(Ok((tag, url)));
+                            return;
+                        }
+                     }
+                     let _ = tx.send(Err("Failed to parse update info".to_string()));
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    // Simplify the error message for display if possible, or just pass it
+                    let _ = tx.send(Err(stderr.to_string()));
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+            }
+        }
+    });
+}
+
 impl eframe::App for RustleApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 强制每 100ms 刷新一次，确保消息及时显示
         ctx.request_repaint_after(Duration::from_millis(100));
 
         self.ensure_seed_data();
+
+        // 检查升级结果
+        if let Some(rx) = &self.update_check_rx {
+             if let Ok(res) = rx.try_recv() {
+                 self.is_checking_update = false;
+                 match res {
+                     Ok((ver, url)) => {
+                         self.new_version_info = Some((ver, url));
+                     },
+                     Err(e) => {
+                         eprintln!("Update check failed: {}", e);
+                     }
+                 }
+                 self.update_check_rx = None; 
+             }
+        }
+
+        // 使用说明窗口
+        let mut show_usage = self.show_usage_window;
+        if show_usage {
+             egui::Window::new("使用说明")
+                .open(&mut show_usage)
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new("Rustle (如梭) 使用说明").heading());
+                    ui.add_space(10.0);
+                    ui.label("1. 节点发现：\n   软件启动会自动发现局域网内的其他 Rustle 节点。无需配置。");
+                    ui.add_space(5.0);
+                    ui.label("2. 发送消息：\n   点击左侧列表中的用户，在右侧输入框输入文字并回车即可发送。");
+                    ui.add_space(5.0);
+                    ui.label("3. 文件传输：\n   直接将文件或文件夹拖入聊天窗口即可发送给当前选中的用户。");
+                    ui.add_space(5.0);
+                });
+             self.show_usage_window = show_usage;
+        }
+
+        // 升级窗口
+        let mut show_update = self.show_update_dialog;
+        if show_update {
+            egui::Window::new("软件升级")
+                .open(&mut show_update)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    if self.is_checking_update {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("正在检查新版本...");
+                        });
+                    } else if let Some((ver, url)) = &self.new_version_info {
+                        let current = env!("CARGO_PKG_VERSION");
+                        let ver_clean = ver.trim_start_matches('v');
+                        
+                        if ver_clean != current {
+                            ui.label(format!("发现新版本: {}", ver));
+                            ui.label(format!("当前版本: {}", current));
+                            ui.add_space(10.0);
+                            if ui.button("前往下载更新").clicked() {
+                                let _ = open::that(url);
+                            }
+                        } else {
+                             ui.label("当前已是最新版本。");
+                             ui.label(format!("版本: {}", current));
+                        }
+                    } else {
+                         if ui.button("检查更新").clicked() {
+                            let (tx, rx) = mpsc::channel();
+                            self.update_check_rx = Some(rx);
+                            self.is_checking_update = true;
+                            self.new_version_info = None;
+                            spawn_check_update(tx);
+                         }
+                    }
+                });
+            self.show_update_dialog = show_update;
+        }
+
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            egui::menu::bar(ui, |ui| {
                 ui.heading("如梭");
                 ui.separator();
+
+                ui.menu_button("帮助", |ui| {
+                    if ui.button("使用说明").clicked() {
+                         self.show_usage_window = true;
+                         ui.close_menu();
+                    }
+                    if ui.button("软件升级").clicked() {
+                         self.show_update_dialog = true;
+                         let (tx, rx) = mpsc::channel();
+                         self.update_check_rx = Some(rx);
+                         self.is_checking_update = true;
+                         self.new_version_info = None;
+                         spawn_check_update(tx);
+                         ui.close_menu();
+                    }
+                });
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let addr = match (self.local_ip.as_deref(), self.local_port) {
                         (Some(ip), Some(p)) => format!("{}:{}", ip, p),
