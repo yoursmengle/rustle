@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use rfd::FileDialog;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use std::process::Command;
 use std::env;
 use std::collections::{HashMap, HashSet};
@@ -83,35 +83,12 @@ fn read_machine_uuid() -> Option<String> {
 }
 
 fn load_or_init_node_id() -> String {
-    let persistent_path = data_path("node_id.txt");
-    let legacy_path = PathBuf::from("node_id.txt");
-
-    let read_id = |path: &Path| -> Option<String> {
-        fs::read_to_string(path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-
-    if let Some(id) = read_id(&persistent_path) {
-        return id;
-    }
-
-    if let Some(id) = read_id(&legacy_path) {
-        let _ = fs::write(&persistent_path, &id);
-        return id;
-    }
-
+    // 仅在内存中生成 ID：优先硬件 UUID，失败则随机 UUID；不再读写 node_id.txt
     if let Some(hw_uuid) = read_machine_uuid() {
-        let _ = fs::write(&persistent_path, &hw_uuid);
-        let _ = fs::write(&legacy_path, &hw_uuid);
-        return hw_uuid;
+        hw_uuid
+    } else {
+        Uuid::new_v4().to_string()
     }
-
-    let fallback = Uuid::new_v4().to_string();
-    let _ = fs::write(&persistent_path, &fallback);
-    let _ = fs::write(&legacy_path, &fallback);
-    fallback
 }
 
 fn main() -> eframe::Result<()> {
@@ -1721,7 +1698,6 @@ struct DiscoveredPeer {
 #[derive(Debug)]
 enum NetCmd {
     ChangeName(String),
-    SendHello,
     SendChat { ip: String, port: u16, text: String, ts: String, via: Option<String>, msg_id: String },
     ProbePeer { ip: String, port: u16, via: Option<String> },
     SendFile { peer_id: String, ip: String, tcp_port: u16, path: PathBuf, is_dir: bool, via: Option<String> },
@@ -1764,6 +1740,8 @@ struct HelloMsg {
     port: u16,
     tcp_port: Option<u16>,
     version: String,
+    #[serde(default)]
+    is_reply: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1874,7 +1852,7 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
     if is_dir {
         let tar_path = save_path.with_extension("tar");
         if let Ok(mut file) = tokio::fs::File::create(&tar_path).await {
-            let mut buf = [0u8; 256 * 1024];
+            let mut buf = vec![0u8; 64 * 1024];
             let mut received: u64 = 0;
             loop {
                 match socket.read(&mut buf).await {
@@ -1884,8 +1862,9 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
                         received += n as u64;
                         if total_size > 0 {
                             let progress = (received as f32 / total_size as f32).min(1.0);
-                            if progress - last_progress >= 0.05 || last_report_bytes == 0 {
-                                let now = Instant::now();
+                            let now = Instant::now();
+                            let elapsed_ms = now.duration_since(last_report_instant).as_millis();
+                            if (progress - last_progress >= 0.05 && elapsed_ms >= 200) || last_report_bytes == 0 {
                                 let status = format!(
                                     "正在接收 {:.0}% / {} ({})",
                                     progress * 100.0,
@@ -1938,7 +1917,7 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
         }
     } else {
         if let Ok(mut file) = tokio::fs::File::create(&save_path).await {
-            let mut buf = [0u8; 512 * 1024];
+            let mut buf = vec![0u8; 64 * 1024];
             let mut received: u64 = 0;
             loop {
                 match socket.read(&mut buf).await {
@@ -1948,8 +1927,9 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
                         received += n as u64;
                         if total_size > 0 {
                             let progress = (received as f32 / total_size as f32).min(1.0);
-                            if progress - last_progress >= 0.05 || last_report_bytes == 0 {
-                                let now = Instant::now();
+                            let now = Instant::now();
+                            let elapsed_ms = now.duration_since(last_report_instant).as_millis();
+                            if (progress - last_progress >= 0.05 && elapsed_ms >= 200) || last_report_bytes == 0 {
                                 let status = format!(
                                     "正在接收 {:.0}% / {} ({})",
                                     progress * 100.0,
@@ -2114,7 +2094,7 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
         if socket.write_all(&header).await.is_ok() {
             match tokio::fs::File::open(&send_path).await {
                 Ok(mut file) => {
-                    let mut buf = [0u8; 512 * 1024];
+                    let mut buf = vec![0u8; 64 * 1024];
                     let mut sent_total: u64 = 0;
                     let mut last_progress = 0.0f32;
                     let mut last_report_instant = Instant::now();
@@ -2136,7 +2116,8 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
                                     let progress = (sent_total as f32 / declared_size as f32).min(1.0);
                                     let now = Instant::now();
                                     let elapsed = now.duration_since(last_report_instant);
-                                    if progress - last_progress >= 0.05 || elapsed.as_secs_f64() >= 1.0 || last_report_bytes == 0 {
+                                    let elapsed_ms = elapsed.as_millis();
+                                    if (progress - last_progress >= 0.05 && elapsed_ms >= 200) || last_report_bytes == 0 {
                                         let status = format!(
                                             "发送中 {:.0}% / {} ({})",
                                             progress * 100.0,
@@ -2243,10 +2224,9 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
     }
 }
 
-// spawn worker implementation will persist/read a node id in node_id.txt
 fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, initial_name: Option<String>) {
     thread::spawn(move || {
-        // Stable node id: prefer motherboard UUID, persisted under data_dir/node_id.txt (with legacy fallback)
+        // Stable node id: prefer motherboard UUID; fallback to random UUID (no file persistence)
         let my_id = load_or_init_node_id();
         let my_id_clone = my_id.clone();
 
@@ -2364,6 +2344,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                 port,
                 tcp_port: Some(tcp_port),
                 version: "0.1".to_string(),
+                is_reply: false,
             };
             if let Ok(payload) = serde_json::to_vec(&msg) {
                 if let Err(e) = sock.send_to(&payload, target) {
@@ -2452,13 +2433,6 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                     NetCmd::ChangeName(new_name) => {
                         our_name = new_name;
                         // 立刻广播（从每个 socket 发出）
-                        for (sock, _ip, port) in &bound_sockets {
-                            for addr in &base_targets {
-                                send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port);
-                            }
-                        }
-                    }
-                    NetCmd::SendHello => {
                         for (sock, _ip, port) in &bound_sockets {
                             for addr in &base_targets {
                                 send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port);
@@ -2558,17 +2532,20 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                         };
                                                         let _ = peer_tx.send(PeerEvent::Discovered(peer, _ip.to_string()));
 
-                                                        // 回复到对方报告的端口（包含我们的 id）
-                                                        let target = SocketAddr::new(src.ip(), h.port);
-                                                        let reply = HelloMsg {
-                                                            msg_type: "hello".to_string(),
-                                                            id: my_id.clone(),
-                                                            name: if our_name.is_empty() { None } else { Some(our_name.clone()) },
-                                                            port: *_port,
-                                                            tcp_port: Some(tcp_port),
-                                                            version: "0.1".to_string(),
-                                                        };
-                                                        let _ = sock.send_to(&serde_json::to_vec(&reply).unwrap(), target);
+                                                        // 仅对非回复的 hello 进行回复，避免无限循环
+                                                        if !h.is_reply {
+                                                            let target = SocketAddr::new(src.ip(), h.port);
+                                                            let reply = HelloMsg {
+                                                                msg_type: "hello".to_string(),
+                                                                id: my_id.clone(),
+                                                                name: if our_name.is_empty() { None } else { Some(our_name.clone()) },
+                                                                port: *_port,
+                                                                tcp_port: Some(tcp_port),
+                                                                version: "0.1".to_string(),
+                                                                is_reply: true,
+                                                            };
+                                                            let _ = sock.send_to(&serde_json::to_vec(&reply).unwrap(), target);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2577,11 +2554,16 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                     // 屏蔽自身广播回环
                                                     if c.from_id == my_id { continue; }
                                                     eprintln!("Received chat from {}: {:?}", src, c);
-                                                    // 回复 ACK（仅 1 次，超时重传由发送端处理）
+                                                    // 回复 ACK 到发送端的监听端口（使用 UDP_PORT 而非 src.port()，因为发送端可能使用临时端口发送）
                                                     let ack = AckPayload { msg_type: "ack".to_string(), msg_id: c.msg_id.clone(), from_id: my_id.clone() };
                                                     if let Ok(ack_data) = serde_json::to_vec(&ack) {
-                                                        eprintln!("Sending ACK for msg_id={} to {}", c.msg_id, src);
+                                                        // 同时发送到源端口和标准端口，确保 ACK 能被接收
+                                                        let ack_target_std = SocketAddr::new(src.ip(), UDP_PORT);
+                                                        eprintln!("Sending ACK for msg_id={} to {} and {}", c.msg_id, src, ack_target_std);
                                                         let _ = sock.send_to(&ack_data, src);
+                                                        if src.port() != UDP_PORT {
+                                                            let _ = sock.send_to(&ack_data, ack_target_std);
+                                                        }
                                                     }
 
                                                     let _ = peer_tx.send(PeerEvent::ChatReceived {
