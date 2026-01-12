@@ -107,7 +107,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Rustle")
+        .with_title("Rustle v0.1.0")
         .with_inner_size([1200.0, 800.0]);
 
     if let Some(icon) = icon_data {
