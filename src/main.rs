@@ -442,6 +442,40 @@ impl RustleApp {
         None
     }
 
+    // 统一接口选择逻辑 - 修复消息发送问题
+    fn get_best_interface_for_peer(&self, peer_ip: &str) -> Option<String> {
+        // 优先选择能直接路由到目标的接口
+        if let Some(direct_interface) = Self::find_interface_for_target(peer_ip) {
+            // 验证该接口是否在我们的绑定列表中
+            if self.bound_interfaces.contains(&direct_interface) {
+                return Some(direct_interface);
+            }
+        }
+        
+        // 其次选择用户记录的最优接口
+        if let Some(user) = self.users.iter().find(|u| u.ip.as_deref() == Some(peer_ip)) {
+            if let Some(best) = &user.best_interface {
+                if self.bound_interfaces.contains(best) {
+                    return Some(best.clone());
+                }
+            }
+            if let Some(bound) = &user.bound_interface {
+                if self.bound_interfaces.contains(bound) {
+                    return Some(bound.clone());
+                }
+            }
+        }
+        
+        // 最后选择任意同网段的绑定接口
+        for bound_ip in &self.bound_interfaces {
+            if Self::same_lan(bound_ip, peer_ip) {
+                return Some(bound_ip.clone());
+            }
+        }
+        
+        None
+    }
+
     fn maybe_switch_primary_interface(&mut self, local_ip: &str, peer_ip: &str) {
         // 若当前主接口不在同网段，而本次通讯接口在同网段，则切换主接口
         match &self.local_ip {
@@ -596,13 +630,9 @@ impl RustleApp {
             }
             let drained: Vec<QueuedMsg> = queue.drain(..).collect();
             let mut remain = Vec::new();
-            // 查找用户最优接口（能接收 ACK 的接口）
-            let mut via = self.users.iter().find(|u| &u.id == peer_id)
-                .and_then(|u| u.best_interface.clone().or_else(|| u.bound_interface.clone()));
-
-            if let Some(best_via) = Self::find_interface_for_target(ip) {
-                via = Some(best_via);
-            }
+            
+            // 使用统一的接口选择逻辑
+            let via = self.get_best_interface_for_peer(ip);
 
             let tcp_port = self.users.iter().find(|u| &u.id == peer_id).and_then(|u| u.tcp_port);
 
@@ -625,13 +655,9 @@ impl RustleApp {
                 } else {
                     let mid = msg.msg_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
                     self.update_outgoing_msg_id(peer_id, &mid, &msg.text);
-                    if tx.send(NetCmd::SendChat { ip: ip.to_string(), port, text: msg.text.clone(), ts: msg.send_ts.clone(), via: via.clone(), msg_id: mid.clone() }).is_err() {
-                        msg.msg_id = Some(mid);
-                        remain.push(msg);
-                    } else {
-                        let deadline = Instant::now() + Duration::from_secs(3);
-                        self.pending_acks.entry(peer_id.to_string()).or_default().push((mid, deadline));
-                    }
+                    
+                    // 使用重试机制发送消息
+                    self.try_send_message_with_retry(peer_id, ip, port, &msg.text, &msg.send_ts, &mid, via.clone());
                 }
             }
             if !remain.is_empty() {
@@ -761,7 +787,7 @@ impl RustleApp {
                     send_ts: ts.clone(),
                     recv_ts: None,
                     file_path: None,
-                    transfer_status: None,
+                    transfer_status: Some("发送中...".to_string()),
                     msg_id: Some(msg_id.clone()),
                     is_read: true,
         });
@@ -772,51 +798,100 @@ impl RustleApp {
         let online = u.online;
         let ip = u.ip.clone();
         let port = u.port;
-        let mut via = u.best_interface.clone().or_else(|| u.bound_interface.clone()); // 优先使用 best_interface
 
-        // 尝试寻找更匹配的本地接口
-        if let Some(target_ip) = &ip {
-            if let Some(best_via) = Self::find_interface_for_target(target_ip) {
-                via = Some(best_via);
-            }
-        }
+        // 使用统一的接口选择逻辑
+        let via = if let Some(target_ip) = &ip {
+            self.get_best_interface_for_peer(target_ip)
+        } else {
+            None
+        };
 
         let has_addr = ip.is_some() && port.is_some();
 
-        if online {
+        if online && has_addr {
             if let (Some(ip), Some(port)) = (ip.as_deref(), port) {
-                if let Some(tx) = &self.net_cmd_tx {
-                    if tx.send(NetCmd::SendChat { ip: ip.to_string(), port, text: text.to_string(), ts: ts.clone(), via: via.clone(), msg_id: msg_id.clone() }).is_err() {
-                        self.mark_offline(id);
-                    }
-                }
+                self.try_send_message_with_retry(id, &ip, port, &text, &ts, &msg_id, via);
             }
         } else {
             // 离线：排队，并且如果已有地址尝试一次乐观发送
-                self.offline_msgs.entry(id.to_string()).or_default().push(QueuedMsg { 
-                    text: text.to_string(), 
-                    send_ts: ts.clone(), 
-                    msg_id: Some(msg_id.clone()),
-                    file_path: None,
-                    is_dir: false,
-                });
+            self.offline_msgs.entry(id.to_string()).or_default().push(QueuedMsg { 
+                text: text.to_string(), 
+                send_ts: ts.clone(), 
+                msg_id: Some(msg_id.clone()),
+                file_path: None,
+                is_dir: false,
+            });
+            
             if has_addr {
                 if let (Some(ip), Some(port)) = (ip.as_deref(), port) {
                     if let Some(local) = self.local_ip.as_deref() {
-                        if !Self::same_lan(local, ip) { return; }
-                    }
-                    if let Some(tx) = &self.net_cmd_tx {
-                        if tx.send(NetCmd::SendChat { ip: ip.to_string(), port, text: text.to_string(), ts: ts.clone(), via: via.clone(), msg_id: msg_id.clone() }).is_err() {
-                            self.mark_offline(id);
+                        if Self::same_lan(local, ip) {
+                            self.try_send_message_with_retry(id, &ip, port, &text, &ts, &msg_id, via);
                         }
+                    }
+                }
+            } else {
+                // 没有地址信息，直接标记为等待上线
+                if let Some(msgs) = self.messages.get_mut(id) {
+                    if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(&msg_id)) {
+                        m.transfer_status = Some("等待对方上线...".to_string());
                     }
                 }
             }
         }
+    }
 
-        // 添加待确认列表，5 秒超时
-        let deadline = Instant::now() + Duration::from_secs(3);
-        self.pending_acks.entry(id.to_string()).or_default().push((msg_id, deadline));
+    fn try_send_message_with_retry(&mut self, peer_id: &str, ip: &str, port: u16, text: &str, ts: &str, msg_id: &str, preferred_via: Option<String>) {
+        let Some(tx) = &self.net_cmd_tx else { return; };
+        
+        // 首先尝试使用首选接口发送
+        if let Some(via) = preferred_via {
+            if tx.send(NetCmd::SendChat { 
+                ip: ip.to_string(), 
+                port, 
+                text: text.to_string(), 
+                ts: ts.to_string(), 
+                via: Some(via), 
+                msg_id: msg_id.to_string() 
+            }).is_ok() {
+                // 添加到待确认列表，延长超时时间到5秒
+                let deadline = Instant::now() + Duration::from_secs(5);
+                self.pending_acks.entry(peer_id.to_string()).or_default().push((msg_id.to_string(), deadline));
+                return;
+            }
+        }
+        
+        // 如果首选接口失败，尝试所有可用接口
+        let mut sent = false;
+        for bound_ip in &self.bound_interfaces.clone() {
+            if Self::same_lan(bound_ip, ip) {
+                if tx.send(NetCmd::SendChat { 
+                    ip: ip.to_string(), 
+                    port, 
+                    text: text.to_string(), 
+                    ts: ts.to_string(), 
+                    via: Some(bound_ip.clone()), 
+                    msg_id: msg_id.to_string() 
+                }).is_ok() {
+                    sent = true;
+                    break;
+                }
+            }
+        }
+        
+        if sent {
+            // 添加到待确认列表
+            let deadline = Instant::now() + Duration::from_secs(5);
+            self.pending_acks.entry(peer_id.to_string()).or_default().push((msg_id.to_string(), deadline));
+        } else {
+            // 所有接口都失败，标记离线
+            self.mark_offline(peer_id);
+            if let Some(msgs) = self.messages.get_mut(peer_id) {
+                if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(msg_id)) {
+                    m.transfer_status = Some("发送失败".to_string());
+                }
+            }
+        }
     }
 
     fn send_current(&mut self) {
@@ -834,17 +909,15 @@ impl RustleApp {
     fn append_file_message(&mut self, path: &PathBuf, is_dir: bool) {
         if let Some(id) = self.selected_user_id.clone() {
             self.scroll_to_bottom = true;
-            let (ip, tcp_port, mut via) = {
+            let (ip, tcp_port, via) = {
                 let Some(user) = self.users.iter().find(|u| u.id == id) else { return; };
-                (user.ip.clone(), user.tcp_port, user.bound_interface.clone())
+                let via = if let Some(target_ip) = &user.ip {
+                    self.get_best_interface_for_peer(target_ip)
+                } else {
+                    None
+                };
+                (user.ip.clone(), user.tcp_port, via)
             };
-
-            // 强制寻找与目标 IP 同网段的本地接口
-            if let Some(target_ip) = &ip {
-                if let Some(best_via) = Self::find_interface_for_target(target_ip) {
-                    via = Some(best_via);
-                }
-            }
 
             let icon = if is_dir { "📁" } else { "📄" };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
@@ -1260,8 +1333,11 @@ impl eframe::App for RustleApp {
                         }
                         // 更新用户最优接口（能收到 ACK 的接口）
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == from_id) {
-                            eprintln!("ACK received from {} (msg_id={}), updating best_interface to {}", from_id, msg_id, u.bound_interface.as_deref().unwrap_or("unknown"));
-                            u.best_interface = u.bound_interface.clone();
+                            // 只有当前接口确实能收到 ACK 时才更新 best_interface
+                            if let Some(bound) = &u.bound_interface {
+                                u.best_interface = Some(bound.clone());
+                                eprintln!("ACK received from {} (msg_id={}), confirmed best_interface: {}", from_id, msg_id, bound);
+                            }
                         }
                         if let Some(msgs) = self.messages.get_mut(&from_id) {
                             if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(&msg_id)) {
@@ -1761,6 +1837,16 @@ impl eframe::App for RustleApp {
             for (peer, msg_id) in &timeouts {
                 if let Some(msgs) = self.messages.get_mut(peer) {
                     if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(msg_id)) {
+                        // 尝试重新发送而不是直接标记为未送达
+                        if let Some(user) = self.users.iter().find(|u| &u.id == peer) {
+                            if let (Some(ip), Some(port)) = (&user.ip, user.port) {
+                                eprintln!("Message timeout for {}, attempting retry via different interfaces", peer);
+                                self.try_send_message_with_retry(peer, ip, port, &m.text, &m.send_ts, msg_id, None);
+                                continue; // 跳过标记为未送达
+                            }
+                        }
+                        
+                        // 如果无法重试，才标记为未送达
                         m.transfer_status = Some("未送达".to_string());
                         // 重新加入离线队列时，保留原始 msg_id 以便接收方去重
                         self.offline_msgs.entry(peer.clone()).or_default().push(QueuedMsg { 
@@ -2634,7 +2720,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                         }
                     }
                     NetCmd::SendChat { ip, port, text, ts, via, msg_id } => {
-                        // 同时从所有绑定的 sockets 发出，增加送达概率
+                        // 发送消息时使用指定的接口，如果没有指定则使用所有绑定的 sockets
                         let payload = ChatPayload {
                             msg_type: "chat".to_string(),
                             msg_id: msg_id.clone(),
@@ -2649,13 +2735,44 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                 Err(_) => continue,
                             };
                             eprintln!("Sending chat to {}: {:?}", target, payload);
-                            // 发送给所有绑定接口（本地网卡可靠性高，不需额外重试）
-                            for (sock, _ip, _port) in &bound_sockets {
-                                if let Some(v) = &via {
-                                    if _ip.to_string() != *v { continue; }
+                            
+                            let mut sent = false;
+                            // 如果指定了接口，只使用该接口发送
+                            if let Some(v) = &via {
+                                for (sock, _ip, _port) in &bound_sockets {
+                                    if _ip.to_string() == *v {
+                                        if let Err(e) = sock.send_to(&data, target) {
+                                            eprintln!("Net discovery: failed to send chat from {}:{} to {} - {}", _ip, _port, target, e);
+                                        } else {
+                                            eprintln!("Net discovery: sent chat from {}:{} to {} ({} bytes)", _ip, _port, target, data.len());
+                                            sent = true;
+                                        }
+                                        break;
+                                    }
                                 }
-                                let _ = sock.send_to(&data, target);
-                                    eprintln!("Net discovery: sent chat from {}:{} to {} ({} bytes)", _ip, _port, target, data.len());
+                            } else {
+                                // 没有指定接口，使用所有同网段的绑定接口发送
+                                for (sock, _ip, _port) in &bound_sockets {
+                                    // 只从同网段的接口发送
+                                    let local_octets = _ip.octets();
+                                    if let IpAddr::V4(target_v4) = target.ip() {
+                                        let target_octets = target_v4.octets();
+                                        if local_octets[0] == target_octets[0] && 
+                                           local_octets[1] == target_octets[1] && 
+                                           local_octets[2] == target_octets[2] {
+                                            if let Err(e) = sock.send_to(&data, target) {
+                                                eprintln!("Net discovery: failed to send chat from {}:{} to {} - {}", _ip, _port, target, e);
+                                            } else {
+                                                eprintln!("Net discovery: sent chat from {}:{} to {} ({} bytes)", _ip, _port, target, data.len());
+                                                sent = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if !sent {
+                                eprintln!("Net discovery: failed to send chat to {} - no suitable interface found", target);
                             }
                         }
                     }
