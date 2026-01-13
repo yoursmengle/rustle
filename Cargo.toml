@@ -24,3 +24,11 @@ image = "0.25"
 
 [build-dependencies]
 winres = "0.1"
+
+[profile.release]
+# 优化设置，确保 release 版本没有调试信息和控制台
+debug = false
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

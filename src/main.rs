@@ -1,5 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// 在 release 模式下禁用调试输出的宏
+#[cfg(debug_assertions)]
+macro_rules! debug_println {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! debug_println {
+    ($($arg:tt)*) => {};
+}
+
 use eframe::egui;
 use rfd::FileDialog;
 use std::path::{PathBuf};
@@ -1336,7 +1349,7 @@ impl eframe::App for RustleApp {
                             // 只有当前接口确实能收到 ACK 时才更新 best_interface
                             if let Some(bound) = &u.bound_interface {
                                 u.best_interface = Some(bound.clone());
-                                eprintln!("ACK received from {} (msg_id={}), confirmed best_interface: {}", from_id, msg_id, bound);
+                                debug_println!("ACK received from {} (msg_id={}), confirmed best_interface: {}", from_id, msg_id, bound);
                             }
                         }
                         if let Some(msgs) = self.messages.get_mut(&from_id) {
@@ -1840,7 +1853,7 @@ impl eframe::App for RustleApp {
                         // 尝试重新发送而不是直接标记为未送达
                         if let Some(user) = self.users.iter().find(|u| &u.id == peer) {
                             if let (Some(ip), Some(port)) = (&user.ip, user.port) {
-                                eprintln!("Message timeout for {}, attempting retry via different interfaces", peer);
+                                debug_println!("Message timeout for {}, attempting retry via different interfaces", peer);
                                 self.try_send_message_with_retry(peer, ip, port, &m.text, &m.send_ts, msg_id, None);
                                 continue; // 跳过标记为未送达
                             }
@@ -2027,14 +2040,14 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
     let _ = socket.set_nodelay(true);
     let mut type_buf = [0u8; 1];
     if socket.read_exact(&mut type_buf).await.is_err() {
-        eprintln!("[rx] failed to read type from {addr}");
+        debug_println!("[rx] failed to read type from {addr}");
         return;
     }
     let is_dir = type_buf[0] == 1;
 
     let mut id_len_buf = [0u8; 1];
     if socket.read_exact(&mut id_len_buf).await.is_err() {
-        eprintln!("[rx] failed to read id_len from {addr}");
+        debug_println!("[rx] failed to read id_len from {addr}");
         return;
     }
     let id_len = id_len_buf[0] as usize;

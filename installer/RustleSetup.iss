@@ -27,8 +27,8 @@ Source: "{#SourcePath}vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterin
 
 [Icons]
 ; Launch directly (manifest is now asInvoker, so no UAC prompt).
-Name: "{group}\Rustle"; Filename: "{app}\rustle.exe"; IconFilename: "{app}\rustle.exe"
-Name: "{commondesktop}\Rustle"; Filename: "{app}\rustle.exe"; Tasks: desktopicon; IconFilename: "{app}\rustle.exe"
+Name: "{group}\Rustle"; Filename: "{app}\rustle.exe"; IconFilename: "{app}\rustle.exe"; Parameters: ""; WorkingDir: "{app}"
+Name: "{commondesktop}\Rustle"; Filename: "{app}\rustle.exe"; Tasks: desktopicon; IconFilename: "{app}\rustle.exe"; Parameters: ""; WorkingDir: "{app}"
 
 [Tasks]
 Name: desktopicon; Description: "Create a &desktop icon"; GroupDescription: "Additional icons:"; Flags: unchecked
@@ -40,8 +40,8 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 ; Install VC runtime silently before launching the app (only if not already installed)
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Visual C++ Runtime..."; Flags: waituntilterminated skipifdoesntexist; Check: not IsVCRedistInstalled
-; Launch directly (manifest is asInvoker, so no UAC prompt expected)
-Filename: "{app}\rustle.exe"; Description: "Launch Rustle"; Flags: nowait postinstall skipifsilent
+; Launch directly (manifest is asInvoker, so no UAC prompt expected) - use shellexec to avoid console window
+Filename: "{app}\rustle.exe"; Description: "Launch Rustle"; Flags: nowait postinstall skipifsilent shellexec; WorkingDir: "{app}"
 
 [Code]
 const
