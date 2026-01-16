@@ -232,6 +232,11 @@ pub struct RustleApp {
     pub show_update_dialog: bool,
     pub show_about_window: bool,
 
+    // 修改用户名窗口
+    pub show_edit_name_dialog: bool,
+    pub edit_name_input: String,
+    pub edit_name_error: Option<String>,
+
     // 升级检查
     pub update_check_rx: Option<Receiver<Result<(String, String), String>>>,
     pub is_checking_update: bool,
@@ -1100,9 +1105,14 @@ impl eframe::App for RustleApp {
                     let status = self
                         .me_name
                         .as_deref()
-                        .map(|n| format!("已登录: {}", n))
+                        .map(|n| format!("用户名[双击修改]: {}", n))
                         .unwrap_or_else(|| "未登录".to_string());
-                    ui.label(egui::RichText::new(status).weak());
+                    let resp = ui.add(egui::Label::new(egui::RichText::new(status).weak()));
+                    if resp.double_clicked() {
+                        self.edit_name_input = self.me_name.clone().unwrap_or_default();
+                        self.edit_name_error = None;
+                        self.show_edit_name_dialog = true;
+                    }
                 });
             });
         });
@@ -1458,11 +1468,9 @@ impl eframe::App for RustleApp {
 
                         resp.context_menu(|ui| {
                             if ui.button("用户信息").clicked() {
-                                let ip_info = format!(
-                                    "IP: {}\nPort: {}\nTCP Port: {}\nID: {}",
+                                let ip_info: String = format!(
+                                    "IP: {}\nID: {}",
                                     user.ip.as_deref().unwrap_or("未知"),
-                                    user.port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string()),
-                                    user.tcp_port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string()),
                                     user.id
                                 );
                                 this.show_ip_dialog = Some((user.name.clone(), ip_info));
@@ -1753,6 +1761,48 @@ impl eframe::App for RustleApp {
                         }
                         if ui.button("稍后再说").clicked() {
                             self.show_name_dialog = false;
+                        }
+                    });
+                });
+        }
+
+        if self.show_edit_name_dialog {
+            egui::Window::new("修改用户名")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("请输入新的用户名：");
+                    ui.add_space(6.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.edit_name_input).hint_text("例如：张三"));
+                    ui.add_space(8.0);
+                    if let Some(err) = &self.edit_name_error {
+                        ui.label(egui::RichText::new(err).color(egui::Color32::RED));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("保存").clicked() {
+                            let name = self.edit_name_input.trim();
+                            if name.is_empty() {
+                                self.edit_name_error = Some("请输入名字后再保存".to_string());
+                            } else {
+                                match fs::write(data_path("me.txt"), name) {
+                                    Ok(_) => {
+                                        self.me_name = Some(name.to_string());
+                                        self.show_edit_name_dialog = false;
+                                        self.edit_name_error = None;
+
+                                        if let Some(tx) = &self.net_cmd_tx {
+                                            let _ = tx.send(NetCmd::ChangeName(self.me_name.clone().unwrap_or_default()));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.edit_name_error = Some(format!("保存失败: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button("取消").clicked() {
+                            self.show_edit_name_dialog = false;
                         }
                     });
                 });
