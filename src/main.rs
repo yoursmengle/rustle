@@ -984,6 +984,12 @@ impl RustleApp {
 
             let icon = if is_dir { "📁" } else { "📄" };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
+
+            if is_dir {
+                let prep_text = format!("有一个文件夹（{}）正在准备发送", name);
+                self.send_message_internal(&id, prep_text);
+            }
+
             let text = format!("{} {}", icon, name);
             let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -1521,91 +1527,106 @@ impl eframe::App for RustleApp {
                 ui.add_space(8.0);
 
                         if self.users.is_empty() {
-                    ui.label(egui::RichText::new("暂无联系人").weak());
-                } else {
-                    // 排序：在线优先，然后按名字排序
-                    let mut sorted_users = self.users.clone();
-                    sorted_users.sort_by(|a, b| {
-                        if a.online != b.online {
-                            b.online.cmp(&a.online) // 在线在前
+                            ui.label(egui::RichText::new("暂无联系人").weak());
                         } else {
-                            a.name.cmp(&b.name)
-                        }
-                    });
+                            let mut online_users: Vec<User> = self.users.iter().filter(|u| u.online).cloned().collect();
+                            let mut offline_users: Vec<User> = self.users.iter().filter(|u| !u.online).cloned().collect();
+                            online_users.sort_by(|a, b| a.name.cmp(&b.name));
+                            offline_users.sort_by(|a, b| a.name.cmp(&b.name));
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for user in sorted_users {
-                            let selected = self.selected_user_id.as_deref() == Some(&user.id);
-                            
-                            let mut label_text = user.name.clone();
-                            if !user.online {
-                                label_text = format!("{} (离线)", label_text);
-                            }
-                            if user.has_unread {
-                                label_text.push_str(" *");
-                            }
+                            let render_user = |ui: &mut egui::Ui, user: &User, this: &mut RustleApp| {
+                                let selected = this.selected_user_id.as_deref() == Some(&user.id);
 
-                            let text_color = if selected {
-                                egui::Color32::WHITE
-                            } else if user.has_unread {
-                                egui::Color32::BLACK
-                            } else if user.online {
-                                egui::Color32::from_rgb(34, 197, 94) // 绿色
-                            } else {
-                                egui::Color32::from_gray(140) // 浅灰色
-                            };
-
-                            let bg_color = if user.has_unread {
-                                egui::Color32::from_rgb(255, 255, 0) // 黄色背景
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-
-                            let text = if user.online {
-                                egui::RichText::new(label_text).strong().color(text_color)
-                            } else {
-                                egui::RichText::new(label_text).color(text_color)
-                            };
-
-                            let resp = egui::Frame::none()
-                                .fill(bg_color)
-                                .inner_margin(2.0)
-                                .rounding(2.0)
-                                .show(ui, |ui| {
-                                    ui.selectable_label(selected, text)
-                                }).inner;
-
-                            if resp.clicked() {
-                                self.selected_user_id = Some(user.id.clone());
-                                // 清除未读标记
-                                if let Some(u) = self.users.iter_mut().find(|u| u.id == user.id) {
-                                    u.has_unread = false;
+                                let mut label_text = user.name.clone();
+                                if !user.online {
+                                    label_text = format!("{} (离线)", label_text);
                                 }
-                                // 滚动到第一条未读消息或最后一条
-                                self.scroll_to_first_unread = true;
-                            }
-
-                            // 右键菜单
-                            resp.context_menu(|ui| {
-                                if ui.button("用户信息").clicked() {
-                                    let ip_info = format!("IP: {}\nPort: {}\nTCP Port: {}\nID: {}", 
-                                        user.ip.as_deref().unwrap_or("未知"),
-                                        user.port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string()),
-                                        user.tcp_port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string()),
-                                        user.id
-                                    );
-                                    self.show_ip_dialog = Some((user.name.clone(), ip_info));
-                                    ui.close_menu();
+                                if user.has_unread {
+                                    label_text.push_str(" *");
                                 }
-                                if ui.button("删除联系人").clicked() {
-                                    // 标记删除，稍后在 update 中处理
-                                    self.context_menu_user_id = Some(user.id.clone());
-                                    ui.close_menu();
+
+                                let text_color = if selected {
+                                    egui::Color32::WHITE
+                                } else if user.has_unread {
+                                    egui::Color32::BLACK
+                                } else if user.online {
+                                    egui::Color32::from_rgb(34, 197, 94) // 绿色
+                                } else {
+                                    egui::Color32::from_gray(140) // 浅灰色
+                                };
+
+                                let bg_color = if user.has_unread {
+                                    egui::Color32::from_rgb(255, 255, 0) // 黄色背景
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+
+                                let text = if user.online {
+                                    egui::RichText::new(label_text).strong().color(text_color)
+                                } else {
+                                    egui::RichText::new(label_text).color(text_color)
+                                };
+
+                                let resp = egui::Frame::none()
+                                    .fill(bg_color)
+                                    .inner_margin(2.0)
+                                    .rounding(2.0)
+                                    .show(ui, |ui| {
+                                        ui.selectable_label(selected, text)
+                                    }).inner;
+
+                                if resp.clicked() {
+                                    this.selected_user_id = Some(user.id.clone());
+                                    // 清除未读标记
+                                    if let Some(u) = this.users.iter_mut().find(|u| u.id == user.id) {
+                                        u.has_unread = false;
+                                    }
+                                    // 滚动到第一条未读消息或最后一条
+                                    this.scroll_to_first_unread = true;
+                                }
+
+                                // 右键菜单
+                                resp.context_menu(|ui| {
+                                    if ui.button("用户信息").clicked() {
+                                        let ip_info = format!("IP: {}\nPort: {}\nTCP Port: {}\nID: {}", 
+                                            user.ip.as_deref().unwrap_or("未知"),
+                                            user.port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string()),
+                                            user.tcp_port.map(|p| p.to_string()).unwrap_or_else(|| "未知".to_string()),
+                                            user.id
+                                        );
+                                        this.show_ip_dialog = Some((user.name.clone(), ip_info));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("删除联系人").clicked() {
+                                        // 标记删除，稍后在 update 中处理
+                                        this.context_menu_user_id = Some(user.id.clone());
+                                        ui.close_menu();
+                                    }
+                                });
+                            };
+
+                            let avail = ui.available_height();
+                            let online_height = (avail * 0.5).max(120.0).min(avail);
+                            let offline_height = (avail - online_height - 12.0).max(80.0);
+
+                            ui.label(egui::RichText::new("在线").strong());
+                            egui::ScrollArea::vertical().max_height(online_height).show(ui, |ui| {
+                                for user in &online_users {
+                                    render_user(ui, user, self);
+                                }
+                            });
+
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            ui.label(egui::RichText::new("离线").strong());
+                            egui::ScrollArea::vertical().max_height(offline_height).show(ui, |ui| {
+                                for user in &offline_users {
+                                    render_user(ui, user, self);
                                 }
                             });
                         }
-                    });
-                }
             });
 
         // 处理删除联系人
