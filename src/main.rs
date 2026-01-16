@@ -15,7 +15,7 @@ macro_rules! debug_println {
 
 use eframe::egui;
 use rfd::FileDialog;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::env;
 use std::collections::{HashMap, HashSet};
@@ -36,7 +36,10 @@ use sysinfo::{System, SystemExt, NetworkExt};
 
 const KNOWN_PEERS_FILE: &str = "known_peers.json";
 const HISTORY_FILE: &str = "history.jsonl";
-const UDP_PORT: u16 = 59000;
+const UDP_DISCOVERY_PORT: u16 = 44517;
+const UDP_MESSAGE_PORT: u16 = 44518;
+const TCP_FILE_PORT: u16 = 44517;
+const TCP_DIR_PORT: u16 = 44518;
 
 fn data_dir() -> PathBuf {
     let mut dir = env::var_os("LOCALAPPDATA")
@@ -235,9 +238,9 @@ fn main() -> eframe::Result<()> {
                 app.local_ip = chosen.or_else(|| Some("127.0.0.1".to_string()));
             }
 
-            // 固定使用 UDP_PORT
+            // 固定使用 UDP_DISCOVERY_PORT 展示本机监听信息
             if app.local_port.is_none() {
-                app.local_port = Some(UDP_PORT);
+                app.local_port = Some(UDP_DISCOVERY_PORT);
             }
 
             // 启动网络发现后台线程（使用 channel 向 UI 发送发现事件）
@@ -303,11 +306,18 @@ struct Peer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KnownPeer {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ip: Option<String>,
+    #[serde(skip_serializing, default)]
     port: Option<u16>,
+    #[serde(skip_serializing, default)]
+    #[allow(dead_code)]
     tcp_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     last_seen: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bound_interface: Option<String>,
 }
 
@@ -647,22 +657,17 @@ impl RustleApp {
             // 使用统一的接口选择逻辑
             let via = self.get_best_interface_for_peer(ip);
 
-            let tcp_port = self.users.iter().find(|u| &u.id == peer_id).and_then(|u| u.tcp_port);
-
             for msg in drained {
                 if let Some(path) = &msg.file_path {
-                    if let Some(tcp_port) = tcp_port {
-                        if tx.send(NetCmd::SendFile {
-                            peer_id: peer_id.to_string(),
-                            ip: ip.to_string(),
-                            tcp_port,
-                            path: path.clone(),
-                            is_dir: msg.is_dir,
-                            via: via.clone(),
-                        }).is_err() {
-                            remain.push(msg);
-                        }
-                    } else {
+                    let target_tcp_port = if msg.is_dir { TCP_DIR_PORT } else { TCP_FILE_PORT };
+                    if tx.send(NetCmd::SendFile {
+                        peer_id: peer_id.to_string(),
+                        ip: ip.to_string(),
+                        tcp_port: target_tcp_port,
+                        path: path.clone(),
+                        is_dir: msg.is_dir,
+                        via: via.clone(),
+                    }).is_err() {
                         remain.push(msg);
                     }
                 } else {
@@ -708,8 +713,8 @@ impl RustleApp {
                                 name: display,
                                 online: false,
                                 ip: kp.ip.clone(),
-                                port: kp.port,
-                                tcp_port: kp.tcp_port,
+                                port: None,
+                                tcp_port: None,
                                 bound_interface: kp.bound_interface.clone(),
                                 best_interface: kp.bound_interface.clone(),
                                 has_unread: false,
@@ -734,8 +739,8 @@ impl RustleApp {
                 id: u.id.clone(),
                 name: Some(u.name.clone()),
                 ip: u.ip.clone(),
-                port: u.port,
-                tcp_port: u.tcp_port,
+                port: None,
+                tcp_port: None,
                 last_seen: None,
                 bound_interface: u.best_interface.clone().or_else(|| u.bound_interface.clone()),
             })
@@ -854,14 +859,13 @@ impl RustleApp {
         }
     }
 
-    fn try_send_message_with_retry(&mut self, peer_id: &str, ip: &str, port: u16, text: &str, ts: &str, msg_id: &str, preferred_via: Option<String>) {
+    fn try_send_message_with_retry(&mut self, peer_id: &str, ip: &str, _port: u16, text: &str, ts: &str, msg_id: &str, preferred_via: Option<String>) {
         let Some(tx) = &self.net_cmd_tx else { return; };
         
         // 首先尝试使用首选接口发送
         if let Some(via) = preferred_via {
             if tx.send(NetCmd::SendChat { 
                 ip: ip.to_string(), 
-                port, 
                 text: text.to_string(), 
                 ts: ts.to_string(), 
                 via: Some(via), 
@@ -880,7 +884,6 @@ impl RustleApp {
             if Self::same_lan(bound_ip, ip) {
                 if tx.send(NetCmd::SendChat { 
                     ip: ip.to_string(), 
-                    port, 
                     text: text.to_string(), 
                     ts: ts.to_string(), 
                     via: Some(bound_ip.clone()), 
@@ -922,15 +925,17 @@ impl RustleApp {
     fn append_file_message(&mut self, path: &PathBuf, is_dir: bool) {
         if let Some(id) = self.selected_user_id.clone() {
             self.scroll_to_bottom = true;
-            let (ip, tcp_port, via) = {
+            let (ip, via) = {
                 let Some(user) = self.users.iter().find(|u| u.id == id) else { return; };
                 let via = if let Some(target_ip) = &user.ip {
                     self.get_best_interface_for_peer(target_ip)
                 } else {
                     None
                 };
-                (user.ip.clone(), user.tcp_port, via)
+                (user.ip.clone(), via)
             };
+
+            let target_tcp_port = if is_dir { TCP_DIR_PORT } else { TCP_FILE_PORT };
 
             let icon = if is_dir { "📁" } else { "📄" };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
@@ -938,12 +943,12 @@ impl RustleApp {
             let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
             let mut sent = false;
-            if let (Some(ip), Some(tcp_port)) = (ip, tcp_port) {
+            if let Some(ip) = ip {
                 if let Some(tx) = &self.net_cmd_tx {
                     if tx.send(NetCmd::SendFile {
                         peer_id: id.clone(),
                         ip: ip.clone(),
-                        tcp_port,
+                        tcp_port: target_tcp_port,
                         path: path.clone(),
                         is_dir,
                         via: via.clone(),
@@ -1202,7 +1207,7 @@ impl eframe::App for RustleApp {
                     PeerEvent::Discovered(peer, local_ip) => {
                         // 更新 UI 中保存的本地端口（若尚未设置）
                         if self.local_port.is_none() {
-                            self.local_port = Some(UDP_PORT);
+                            self.local_port = Some(UDP_DISCOVERY_PORT);
                         }
 
                         // 使用 peer.id 作为唯一键，避免创建重复联系人（多网卡场景）
@@ -1215,8 +1220,8 @@ impl eframe::App for RustleApp {
                             Peer {
                                 id: peer.id.clone(),
                                 ip: peer.ip.clone(),
-                                port: peer.port,
-                                tcp_port: peer.tcp_port,
+                                port: UDP_MESSAGE_PORT,
+                                tcp_port: None,
                                 name: peer.name.clone(),
                                 last_seen: Local::now(),
                             },
@@ -1227,14 +1232,14 @@ impl eframe::App for RustleApp {
                         let preferred_ip = peer.ip.clone();
                         
                         // 标记为在线并添加/更新联系人（以 peer.id 为 id）
-                        let (ip_clone, port_clone) = (preferred_ip.clone(), peer.port);
+                        let (ip_clone, port_clone) = (preferred_ip.clone(), UDP_MESSAGE_PORT);
                         self.maybe_switch_primary_interface(&local_ip, &peer.ip);
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == key) {
                             u.online = true;
                             u.name = name.clone();
                             u.ip = Some(ip_clone.clone());
                             u.port = Some(port_clone);
-                            u.tcp_port = peer.tcp_port;
+                            u.tcp_port = None;
                             u.bound_interface = Some(local_ip.clone());
                             u.best_interface = Some(local_ip.clone());  // 首次以接收 hello 的接口作为最优接口
                             self.known_dirty = true;
@@ -1251,7 +1256,7 @@ impl eframe::App for RustleApp {
                                 online: true,
                                 ip: Some(ip_clone.clone()),
                                 port: Some(port_clone),
-                                tcp_port: peer.tcp_port,
+                                tcp_port: None,
                                 bound_interface: Some(local_ip.clone()),
                                 best_interface: Some(local_ip.clone()),  // 首次以接收 hello 的接口作为最优接口
                                 has_unread: false,
@@ -1304,7 +1309,7 @@ impl eframe::App for RustleApp {
 
                         // 确保 contact 存在，并强制更新为当前收信路径
                         // 收到消息意味着该路径当前是通畅的，应立即更新
-                        let (ip_clone, port_clone) = (from_ip.clone(), from_port);
+                        let (ip_clone, port_clone) = (from_ip.clone(), UDP_MESSAGE_PORT);
                         self.maybe_switch_primary_interface(&local_ip, &from_ip);
                         
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == key) {
@@ -1828,8 +1833,8 @@ impl eframe::App for RustleApp {
         if !self.probed_known {
             if let Some(tx) = &self.net_cmd_tx {
                 for u in &self.users {
-                    if let (Some(ip), Some(port)) = (u.ip.as_ref(), u.port) {
-                        let _ = tx.send(NetCmd::ProbePeer { ip: ip.clone(), port, via: u.bound_interface.clone() });
+                    if let (Some(ip), Some(_port)) = (u.ip.as_ref(), u.port) {
+                        let _ = tx.send(NetCmd::ProbePeer { ip: ip.clone(), via: u.bound_interface.clone() });
                     }
                 }
                 self.probed_known = true;
@@ -1978,8 +1983,8 @@ struct DiscoveredPeer {
 #[derive(Debug)]
 enum NetCmd {
     ChangeName(String),
-    SendChat { ip: String, port: u16, text: String, ts: String, via: Option<String>, msg_id: String },
-    ProbePeer { ip: String, port: u16, via: Option<String> },
+    SendChat { ip: String, text: String, ts: String, via: Option<String>, msg_id: String },
+    ProbePeer { ip: String, via: Option<String> },
     SendFile { peer_id: String, ip: String, tcp_port: u16, path: PathBuf, is_dir: bool, via: Option<String> },
 }
 
@@ -2516,17 +2521,33 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (file_cmd_tx, mut file_cmd_rx) = tokio::sync::mpsc::channel::<FileCmd>(32);
 
-        // Bind TCP listener
-        let (tcp_listener, tcp_port) = rt.block_on(async {
-            let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            (listener, port)
+        // Bind fixed TCP listeners: 44517 for files, 44518 for directories
+        let tcp_file_listener = rt
+            .block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, TCP_FILE_PORT)).await })
+            .expect("Failed to bind TCP file listener");
+
+        let tcp_dir_listener = rt
+            .block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, TCP_DIR_PORT)).await })
+            .expect("Failed to bind TCP directory listener");
+
+        let peer_tx_clone = peer_tx.clone();
+        rt.spawn(async move {
+            let listener = tcp_file_listener;
+            loop {
+                if let Ok((socket, addr)) = listener.accept().await {
+                    let tx = peer_tx_clone.clone();
+                    tokio::spawn(async move {
+                        handle_incoming_file(socket, addr, tx).await;
+                    });
+                }
+            }
         });
 
         let peer_tx_clone = peer_tx.clone();
         rt.spawn(async move {
+            let listener = tcp_dir_listener;
             loop {
-                if let Ok((socket, addr)) = tcp_listener.accept().await {
+                if let Ok((socket, addr)) = listener.accept().await {
                     let tx = peer_tx_clone.clone();
                     tokio::spawn(async move {
                         handle_incoming_file(socket, addr, tx).await;
@@ -2546,9 +2567,9 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             }
         });
 
-        // 在每个非 loopback IPv4 接口上绑定一个 socket（固定 UDP_PORT）
-        let last_port_path = data_path("last_port.txt");
-        let mut bound_sockets: Vec<(UdpSocket, Ipv4Addr, u16)> = Vec::new();
+        // 在每个非 loopback IPv4 接口上绑定 discovery 与 chat sockets（固定端口）
+        let mut discovery_sockets: Vec<(UdpSocket, Ipv4Addr)> = Vec::new();
+        let mut chat_sockets: Vec<(UdpSocket, Ipv4Addr)> = Vec::new();
 
         if let Ok(ifaces) = get_if_addrs() {
             for iface in ifaces {
@@ -2565,23 +2586,37 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                         continue;
                     }
 
-                    match UdpSocket::bind((ipv4, UDP_PORT)) {
+                    // 发现端口（广播用）
+                    match UdpSocket::bind((ipv4, UDP_DISCOVERY_PORT)) {
                         Ok(sock) => {
                             let _ = sock.set_broadcast(true);
                             let _ = sock.set_nonblocking(true);
-                            bound_sockets.push((sock, ipv4, UDP_PORT));
-                            eprintln!("Net discovery: bound interface {ipv4}:{UDP_PORT}");
-                            // 报告回 UI 我们在该接口上绑定了端口
-                            let _ = peer_tx.send(PeerEvent::LocalBound { ip: ipv4.to_string(), port: UDP_PORT });
-                            // 保存首选端口（覆盖 last_port.txt）
-                            let _ = fs::write(&last_port_path, UDP_PORT.to_string());
+                            discovery_sockets.push((sock, ipv4));
+                            eprintln!("Net discovery: bound discovery interface {ipv4}:{UDP_DISCOVERY_PORT}");
+                            let _ = peer_tx.send(PeerEvent::LocalBound { ip: ipv4.to_string(), port: UDP_DISCOVERY_PORT });
                         }
                         Err(e) => {
-                            // 常见 10049（WSAEADDRNOTAVAIL）直接跳过，其他错误提示
                             if e.raw_os_error() == Some(10049) {
                                 eprintln!("Net discovery: skip unusable iface {ipv4} (os error 10049)");
                             } else {
-                                eprintln!("Net discovery: failed to bind {ipv4}:{UDP_PORT} - {e}");
+                                eprintln!("Net discovery: failed to bind discovery {ipv4}:{UDP_DISCOVERY_PORT} - {e}");
+                            }
+                        }
+                    }
+
+                    // 消息端口（收发聊天与 ACK）
+                    match UdpSocket::bind((ipv4, UDP_MESSAGE_PORT)) {
+                        Ok(sock) => {
+                            let _ = sock.set_nonblocking(true);
+                            chat_sockets.push((sock, ipv4));
+                            eprintln!("Net discovery: bound chat interface {ipv4}:{UDP_MESSAGE_PORT}");
+                            let _ = peer_tx.send(PeerEvent::LocalBound { ip: ipv4.to_string(), port: UDP_MESSAGE_PORT });
+                        }
+                        Err(e) => {
+                            if e.raw_os_error() == Some(10049) {
+                                eprintln!("Net discovery: skip unusable iface {ipv4} (os error 10049)");
+                            } else {
+                                eprintln!("Net discovery: failed to bind chat {ipv4}:{UDP_MESSAGE_PORT} - {e}");
                             }
                         }
                     }
@@ -2590,62 +2625,82 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
         }
 
         // 如果没有找到任何接口绑定，尝试兜底绑定 0.0.0.0，避免因单个异常地址导致完全不可用
-        if bound_sockets.is_empty() {
-            match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, UDP_PORT)) {
+        if discovery_sockets.is_empty() {
+            match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, UDP_DISCOVERY_PORT)) {
                 Ok(sock) => {
                     let _ = sock.set_broadcast(true);
                     let _ = sock.set_nonblocking(true);
-                    bound_sockets.push((sock, Ipv4Addr::UNSPECIFIED, UDP_PORT));
-                    eprintln!("Net discovery: bound fallback 0.0.0.0:{UDP_PORT}");
-                    let _ = peer_tx.send(PeerEvent::LocalBound { ip: Ipv4Addr::UNSPECIFIED.to_string(), port: UDP_PORT });
-                    let _ = fs::write(&last_port_path, UDP_PORT.to_string());
+                    discovery_sockets.push((sock, Ipv4Addr::UNSPECIFIED));
+                    eprintln!("Net discovery: bound fallback discovery 0.0.0.0:{UDP_DISCOVERY_PORT}");
+                    let _ = peer_tx.send(PeerEvent::LocalBound { ip: Ipv4Addr::UNSPECIFIED.to_string(), port: UDP_DISCOVERY_PORT });
                 }
                 Err(e) => {
-                    eprintln!("Net discovery: 未找到任何可用接口且兜底 0.0.0.0:{UDP_PORT} 绑定失败 - {e}");
+                    eprintln!("Net discovery: discovery sockets unavailable and fallback 0.0.0.0:{UDP_DISCOVERY_PORT} failed - {e}");
+                    return;
+                }
+            }
+        }
+
+        if chat_sockets.is_empty() {
+            match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, UDP_MESSAGE_PORT)) {
+                Ok(sock) => {
+                    let _ = sock.set_nonblocking(true);
+                    chat_sockets.push((sock, Ipv4Addr::UNSPECIFIED));
+                    eprintln!("Net discovery: bound fallback chat 0.0.0.0:{UDP_MESSAGE_PORT}");
+                    let _ = peer_tx.send(PeerEvent::LocalBound { ip: Ipv4Addr::UNSPECIFIED.to_string(), port: UDP_MESSAGE_PORT });
+                }
+                Err(e) => {
+                    eprintln!("Net discovery: chat sockets unavailable and fallback 0.0.0.0:{UDP_MESSAGE_PORT} failed - {e}");
                     return;
                 }
             }
         }
 
         // 汇总日志，便于排查为何看不到节点
-        if bound_sockets.is_empty() {
-            eprintln!("Net discovery: no UDP sockets bound; discovery will not work");
+        if discovery_sockets.is_empty() {
+            eprintln!("Net discovery: no discovery UDP sockets bound; discovery will not work");
         } else {
-            let summary: Vec<String> = bound_sockets.iter().map(|(_, ip, port)| format!("{}:{}", ip, port)).collect();
-            eprintln!("Net discovery: active UDP sockets -> {}", summary.join(", "));
+            let summary: Vec<String> = discovery_sockets.iter().map(|(_, ip)| format!("{}:{}", ip, UDP_DISCOVERY_PORT)).collect();
+            eprintln!("Net discovery: discovery UDP sockets -> {}", summary.join(", "));
+        }
+        if chat_sockets.is_empty() {
+            eprintln!("Net discovery: no chat UDP sockets bound; messaging will not work");
+        } else {
+            let summary: Vec<String> = chat_sockets.iter().map(|(_, ip)| format!("{}:{}", ip, UDP_MESSAGE_PORT)).collect();
+            eprintln!("Net discovery: chat UDP sockets -> {}", summary.join(", "));
         }
 
         let mut our_name = initial_name.unwrap_or_default();
         // 记录最近收到消息/hello 的时间，用于判定在线与节流查询
         let mut last_from_peer: HashMap<String, Instant> = HashMap::new();
-        // 记录最近见过的 peers 的地址
+        // 记录最近见过的 peers 的地址（用于定向探测，端口固定为 UDP_DISCOVERY_PORT）
         let mut peers_seen: HashMap<String, (IpAddr, u16)> = HashMap::new();
 
         // 发送 hello 的函数（包含 our id）
-        let send_hello = |sock: &UdpSocket, target: SocketAddr, name: &str, port: u16, my_id: &str, tcp_port: u16, is_probe: bool| {
+        let send_hello = |sock: &UdpSocket, target: SocketAddr, name: &str, my_id: &str, is_probe: bool| {
             let msg = HelloMsg {
                 msg_type: "hello".to_string(),
                 id: my_id.to_string(),
                 name: if name.is_empty() { None } else { Some(name.to_string()) },
-                port,
-                tcp_port: Some(tcp_port),
+                port: UDP_MESSAGE_PORT,
+                tcp_port: Some(TCP_FILE_PORT),
                 version: "0.1".to_string(),
                 is_reply: false,
                 is_probe,
             };
             if let Ok(payload) = serde_json::to_vec(&msg) {
                 if let Err(e) = sock.send_to(&payload, target) {
-                    eprintln!("Net discovery: failed send hello from {}:{} to {} ({})", sock.local_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), port, target, e);
+                    eprintln!("Net discovery: failed send hello from {}:{} to {} ({})", sock.local_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), UDP_DISCOVERY_PORT, target, e);
                 } else {
-                    eprintln!("Net discovery: sent hello from {}:{} to {}", sock.local_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), port, target);
+                    eprintln!("Net discovery: sent hello from {}:{} to {}", sock.local_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), UDP_DISCOVERY_PORT, target);
                 }
             }
         };
 
         // 构建目标地址列表：对每个有效接口计算定向广播地址并发送到该地址
-        // 广播目标列表：仅全局广播（不使用 loopback），固定 UDP_PORT
+        // 广播目标列表：仅全局广播（不使用 loopback），固定 UDP_DISCOVERY_PORT
         let mut base_targets: Vec<SocketAddr> = vec![
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), UDP_PORT),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), UDP_DISCOVERY_PORT),
         ];
 
         // 针对每个接口计算定向广播地址（根据 netmask），过滤 loopback/link-local/无广播接口
@@ -2685,7 +2740,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
 
                     let bcast_ip = heuristic_broadcast(ipv4);
 
-                    base_targets.push(SocketAddr::new(IpAddr::V4(bcast_ip), UDP_PORT));
+                    base_targets.push(SocketAddr::new(IpAddr::V4(bcast_ip), UDP_DISCOVERY_PORT));
                 }
             }
         }
@@ -2706,9 +2761,9 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
         let mut last_direct_probe = Instant::now();
 
         // 启动时立即发送一轮广播 hello，提高首次发现速度
-        for (sock, _ip, port) in &bound_sockets {
+        for (sock, _ip) in &discovery_sockets {
             for addr in &base_targets {
-                send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port, true);
+                send_hello(sock, *addr, &our_name, &my_id, true);
             }
         }
 
@@ -2721,37 +2776,37 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                     NetCmd::ChangeName(new_name) => {
                         our_name = new_name;
                         // 立刻广播（从每个 socket 发出）
-                        for (sock, _ip, port) in &bound_sockets {
+                        for (sock, _ip) in &discovery_sockets {
                             for addr in &base_targets {
-                                send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port, true);
+                                send_hello(sock, *addr, &our_name, &my_id, true);
                             }
                         }
                     }
                     NetCmd::SendFile { peer_id, ip, tcp_port, path, is_dir, via } => {
                         let _ = rt.block_on(file_cmd_tx.send(FileCmd::SendFile { peer_id, peer_ip: ip, tcp_port, path, is_dir, via }));
                     }
-                    NetCmd::ProbePeer { ip, port, via } => {
+                    NetCmd::ProbePeer { ip, via } => {
                         if let Ok(ipaddr) = ip.parse::<IpAddr>() {
                             if let IpAddr::V4(v4) = ipaddr {
                                 // 仅同网段探测，避免跨网噪声
-                                let send_ok = bound_sockets.iter().any(|(_, lip, _)| {
+                                let send_ok = discovery_sockets.iter().any(|(_, lip)| {
                                     let lp = lip.octets();
                                     let vp = v4.octets();
                                     lp[0] == vp[0] && lp[1] == vp[1] && lp[2] == vp[2]
                                 });
                                 if !send_ok { continue; }
                             }
-                            let target = SocketAddr::new(ipaddr, port);
+                            let target = SocketAddr::new(ipaddr, UDP_DISCOVERY_PORT);
                             eprintln!("Probing known peer {}", target);
-                            for (sock, _ip, p) in &bound_sockets {
+                            for (sock, _ip) in &discovery_sockets {
                                 if let Some(v) = &via {
                                     if _ip.to_string() != *v { continue; }
                                 }
-                                send_hello(sock, target, &our_name, *p, &my_id, tcp_port, false);
+                                send_hello(sock, target, &our_name, &my_id, false);
                             }
                         }
                     }
-                    NetCmd::SendChat { ip, port, text, ts, via, msg_id } => {
+                    NetCmd::SendChat { ip, text, ts, via, msg_id } => {
                         // 发送消息时使用指定的接口，如果没有指定则使用所有绑定的 sockets
                         let payload = ChatPayload {
                             msg_type: "chat".to_string(),
@@ -2763,7 +2818,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                         };
                         if let Ok(data) = serde_json::to_vec(&payload) {
                             let target = match ip.parse::<IpAddr>() {
-                                Ok(ipaddr) => SocketAddr::new(ipaddr, port),
+                                Ok(ipaddr) => SocketAddr::new(ipaddr, UDP_MESSAGE_PORT),
                                 Err(_) => continue,
                             };
                             eprintln!("Sending chat to {}: {:?}", target, payload);
@@ -2771,12 +2826,12 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                             let mut sent = false;
                             // 如果指定了接口，只使用该接口发送
                             if let Some(v) = &via {
-                                for (sock, _ip, _port) in &bound_sockets {
+                                for (sock, _ip) in &chat_sockets {
                                     if _ip.to_string() == *v {
                                         if let Err(e) = sock.send_to(&data, target) {
-                                            eprintln!("Net discovery: failed to send chat from {}:{} to {} - {}", _ip, _port, target, e);
+                                            eprintln!("Net discovery: failed to send chat from {}:{} to {} - {}", _ip, UDP_MESSAGE_PORT, target, e);
                                         } else {
-                                            eprintln!("Net discovery: sent chat from {}:{} to {} ({} bytes)", _ip, _port, target, data.len());
+                                            eprintln!("Net discovery: sent chat from {}:{} to {} ({} bytes)", _ip, UDP_MESSAGE_PORT, target, data.len());
                                             sent = true;
                                         }
                                         break;
@@ -2784,7 +2839,7 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                 }
                             } else {
                                 // 没有指定接口，使用所有同网段的绑定接口发送
-                                for (sock, _ip, _port) in &bound_sockets {
+                                for (sock, _ip) in &chat_sockets {
                                     // 只从同网段的接口发送
                                     let local_octets = _ip.octets();
                                     if let IpAddr::V4(target_v4) = target.ip() {
@@ -2793,9 +2848,9 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                            local_octets[1] == target_octets[1] && 
                                            local_octets[2] == target_octets[2] {
                                             if let Err(e) = sock.send_to(&data, target) {
-                                                eprintln!("Net discovery: failed to send chat from {}:{} to {} - {}", _ip, _port, target, e);
+                                                eprintln!("Net discovery: failed to send chat from {}:{} to {} - {}", _ip, UDP_MESSAGE_PORT, target, e);
                                             } else {
-                                                eprintln!("Net discovery: sent chat from {}:{} to {} ({} bytes)", _ip, _port, target, data.len());
+                                                eprintln!("Net discovery: sent chat from {}:{} to {} ({} bytes)", _ip, UDP_MESSAGE_PORT, target, data.len());
                                                 sent = true;
                                             }
                                         }
@@ -2813,9 +2868,9 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
 
             // 周期性广播（60s）
             if last_broadcast.elapsed() > Duration::from_secs(60) {
-                for (sock, _ip, port) in &bound_sockets {
+                for (sock, _ip) in &discovery_sockets {
                     for addr in &base_targets {
-                        send_hello(sock, *addr, &our_name, *port, &my_id, tcp_port, true);
+                        send_hello(sock, *addr, &our_name, &my_id, true);
                     }
                 }
                 last_broadcast = Instant::now();
@@ -2834,13 +2889,13 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                         }
                     }
                     let target = SocketAddr::new(*ip, *port);
-                    for (sock, _ip, p) in &bound_sockets {
+                    for (sock, _ip) in &discovery_sockets {
                         let msg = HelloMsg {
                             msg_type: "hello".to_string(),
                             id: my_id.clone(),
                             name: if our_name.is_empty() { None } else { Some(our_name.clone()) },
-                            port: *p,
-                            tcp_port: Some(tcp_port),
+                            port: UDP_MESSAGE_PORT,
+                            tcp_port: Some(TCP_FILE_PORT),
                             version: "0.1".to_string(),
                             is_reply: false,
                             is_probe: false,
@@ -2854,14 +2909,15 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
             }
 
             // 接收来自所有 sockets（非阻塞）
-            for (sock, _ip, _port) in &bound_sockets {
+            for (sock, _ip) in discovery_sockets.iter().chain(chat_sockets.iter()) {
                 loop {
                     match sock.recv_from(&mut buf) {
                         Ok((n, src)) => {
                             if src.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) || src.ip().to_string() == _ip.to_string() {
                                 continue;
                             }
-                            eprintln!("Net discovery: recv {} bytes on {}:{} from {}", n, _ip, _port, src);
+                            let local_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+                            eprintln!("Net discovery: recv {} bytes on {}:{} from {}", n, _ip, local_port, src);
                             if let Ok(text) = std::str::from_utf8(&buf[..n]) {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
                                     if let Some(mt) = v.get("msg_type").and_then(|m| m.as_str()) {
@@ -2876,13 +2932,13 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                         };
                                                         let now = Instant::now();
                                                         last_from_peer.insert(pid.clone(), now);
-                                                        peers_seen.insert(pid.clone(), (src.ip(), h.port));
+                                                        peers_seen.insert(pid.clone(), (src.ip(), UDP_DISCOVERY_PORT));
 
                                                         let peer = DiscoveredPeer {
                                                             id: pid.clone(),
                                                             ip: src.ip().to_string(),
-                                                            port: h.port,
-                                                            tcp_port: h.tcp_port,
+                                                            port: UDP_MESSAGE_PORT,
+                                                            tcp_port: Some(TCP_FILE_PORT),
                                                             name: h.name.clone(),
                                                         };
                                                         let _ = peer_tx.send(PeerEvent::Discovered(peer, _ip.to_string()));
@@ -2897,13 +2953,13 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
 
                                                         let should_reply = !h.is_reply && (!h.is_probe || !recently_active);
                                                         if should_reply {
-                                                            let target = SocketAddr::new(src.ip(), h.port);
+                                                            let target = SocketAddr::new(src.ip(), UDP_DISCOVERY_PORT);
                                                             let reply = HelloMsg {
                                                                 msg_type: "hello".to_string(),
                                                                 id: my_id.clone(),
                                                                 name: if our_name.is_empty() { None } else { Some(our_name.clone()) },
-                                                                port: *_port,
-                                                                tcp_port: Some(tcp_port),
+                                                                port: UDP_MESSAGE_PORT,
+                                                                tcp_port: Some(TCP_FILE_PORT),
                                                                 version: "0.1".to_string(),
                                                                 is_reply: true,
                                                                 is_probe: false,
@@ -2919,14 +2975,14 @@ fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, in
                                                     if c.from_id == my_id { continue; }
                                                     last_from_peer.insert(c.from_id.clone(), Instant::now());
                                                     eprintln!("Received chat from {}: {:?}", src, c);
-                                                    // 回复 ACK 到发送端的监听端口（使用 UDP_PORT 而非 src.port()，因为发送端可能使用临时端口发送）
+                                                    // 回复 ACK 到发送端的监听端口（固定 UDP_MESSAGE_PORT）
                                                     let ack = AckPayload { msg_type: "ack".to_string(), msg_id: c.msg_id.clone(), from_id: my_id.clone() };
                                                     if let Ok(ack_data) = serde_json::to_vec(&ack) {
                                                         // 同时发送到源端口和标准端口，确保 ACK 能被接收
-                                                        let ack_target_std = SocketAddr::new(src.ip(), UDP_PORT);
+                                                        let ack_target_std = SocketAddr::new(src.ip(), UDP_MESSAGE_PORT);
                                                         eprintln!("Sending ACK for msg_id={} to {} and {}", c.msg_id, src, ack_target_std);
                                                         let _ = sock.send_to(&ack_data, src);
-                                                        if src.port() != UDP_PORT {
+                                                        if src.port() != UDP_MESSAGE_PORT {
                                                             let _ = sock.send_to(&ack_data, ack_target_std);
                                                         }
                                                     }
