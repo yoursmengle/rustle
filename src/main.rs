@@ -57,6 +57,28 @@ fn data_path(name: &str) -> PathBuf {
     p
 }
 
+fn default_download_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        // Prefer D: if present; otherwise fallback to C:
+        let has_d = std::path::Path::new("D:\\").exists();
+        let base = if has_d {
+            PathBuf::from("D:/rustle_downloads")
+        } else {
+            PathBuf::from("C:/rustle_downloads")
+        };
+        let _ = fs::create_dir_all(&base);
+        base
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut p = data_dir();
+        p.push("downloads");
+        let _ = fs::create_dir_all(&p);
+        p
+    }
+}
+
 fn read_machine_uuid() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
@@ -2122,10 +2144,10 @@ async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: 
         local_path: None,
     });
 
-    let temp_dir = std::env::temp_dir();
+    let base_dir = default_download_dir();
     // 无论文件还是文件夹，都创建一个独立的子目录
     let sub_dir_name = format!("rustle_{}_{}", filename, Local::now().format("%H%M%S"));
-    let sub_dir = temp_dir.join(sub_dir_name);
+    let sub_dir = base_dir.join(sub_dir_name);
     let _ = fs::create_dir_all(&sub_dir);
     
     let save_path = sub_dir.join(&filename);
