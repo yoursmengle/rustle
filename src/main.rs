@@ -649,7 +649,7 @@ impl RustleApp {
 
             let tcp_port = self.users.iter().find(|u| &u.id == peer_id).and_then(|u| u.tcp_port);
 
-            for mut msg in drained {
+            for msg in drained {
                 if let Some(path) = &msg.file_path {
                     if let Some(tcp_port) = tcp_port {
                         if tx.send(NetCmd::SendFile {
@@ -1848,29 +1848,48 @@ impl eframe::App for RustleApp {
         }
         if !timeouts.is_empty() {
             for (peer, msg_id) in &timeouts {
-                if let Some(msgs) = self.messages.get_mut(peer) {
-                    if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(msg_id)) {
-                        // 尝试重新发送而不是直接标记为未送达
-                        if let Some(user) = self.users.iter().find(|u| &u.id == peer) {
-                            if let (Some(ip), Some(port)) = (&user.ip, user.port) {
-                                debug_println!("Message timeout for {}, attempting retry via different interfaces", peer);
-                                self.try_send_message_with_retry(peer, ip, port, &m.text, &m.send_ts, msg_id, None);
-                                continue; // 跳过标记为未送达
+                // 尝试收集重试或离线处理所需的数据，避免持有 messages 的可变借用跨越重试调用
+                let (retry_data, offline_data) = {
+                    let user_addr = self
+                        .users
+                        .iter()
+                        .find(|u| &u.id == peer)
+                        .and_then(|u| u.ip.clone().and_then(|ip| u.port.map(|port| (ip, port))));
+
+                    let mut retry_data = None;
+                    let mut offline_data = None;
+
+                    if let Some(msgs) = self.messages.get_mut(peer) {
+                        if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(msg_id)) {
+                            if let Some((ip, port)) = user_addr {
+                                retry_data = Some((ip, port, m.text.clone(), m.send_ts.clone()));
+                            } else {
+                                m.transfer_status = Some("未送达".to_string());
+                                offline_data = Some((m.text.clone(), m.send_ts.clone()));
                             }
                         }
-                        
-                        // 如果无法重试，才标记为未送达
-                        m.transfer_status = Some("未送达".to_string());
-                        // 重新加入离线队列时，保留原始 msg_id 以便接收方去重
-                        self.offline_msgs.entry(peer.clone()).or_default().push(QueuedMsg { 
-                            text: m.text.clone(), 
-                            send_ts: m.send_ts.clone(), 
-                            msg_id: Some(msg_id.clone()),
-                            file_path: None,
-                            is_dir: false,
-                        });
                     }
+
+                    (retry_data, offline_data)
+                };
+
+                if let Some((text, send_ts)) = offline_data {
+                    // 重新加入离线队列时，保留原始 msg_id 以便接收方去重
+                    self.offline_msgs.entry(peer.clone()).or_default().push(QueuedMsg {
+                        text,
+                        send_ts,
+                        msg_id: Some(msg_id.clone()),
+                        file_path: None,
+                        is_dir: false,
+                    });
                 }
+
+                if let Some((ip, port, text, send_ts)) = retry_data {
+                    debug_println!("Message timeout for {}, attempting retry via different interfaces", peer);
+                    self.try_send_message_with_retry(peer, &ip, port, &text, &send_ts, msg_id, None);
+                    continue; // 跳过标记为未送达
+                }
+
                 self.mark_offline(peer);
             }
             for (peer, msg_id) in timeouts {
