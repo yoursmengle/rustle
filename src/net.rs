@@ -688,3 +688,19 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration as StdDuration;
+
+    #[test]
+    #[ignore = "binds fixed ports and runs an infinite loop; run manually in isolation"]
+    fn spawn_network_worker_smoke() {
+        let (peer_tx, _peer_rx) = mpsc::channel();
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        spawn_network_worker(peer_tx, cmd_rx, None);
+        std::thread::sleep(StdDuration::from_millis(50));
+    }
+}

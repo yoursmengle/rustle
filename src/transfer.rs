@@ -571,3 +571,21 @@ pub async fn handle_outgoing_file(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1024), "1.00 KB");
+        assert_eq!(human_size(1024 * 1024), "1.00 MB");
+    }
+
+    #[test]
+    fn format_speed_formats() {
+        let s = format_speed(1024 * 1024, Duration::from_secs(1));
+        assert!(s.contains("MB/s"));
+    }
+}

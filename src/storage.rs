@@ -114,3 +114,64 @@ pub fn load_or_init_node_id() -> String {
         Uuid::new_v4().to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn data_dir_exists_and_named() {
+        let dir = data_dir();
+        assert!(dir.exists());
+        assert!(dir.ends_with(OsStr::new("Rustle")));
+    }
+
+    #[test]
+    fn data_path_appends_name() {
+        let p = data_path("foo.txt");
+        let tail = PathBuf::from("Rustle").join("foo.txt");
+        assert!(p.ends_with(tail) || p.ends_with(OsStr::new("foo.txt")));
+    }
+
+    #[test]
+    fn default_download_dir_created_and_named() {
+        let p = default_download_dir();
+        assert!(p.exists());
+        #[cfg(target_os = "windows")]
+        assert!(p.to_string_lossy().to_lowercase().ends_with("/rustle_downloads")
+            || p.to_string_lossy().to_lowercase().ends_with("\\rustle_downloads"));
+        #[cfg(not(target_os = "windows"))]
+        assert!(p.ends_with(OsStr::new("downloads")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_long_path_adds_prefix() {
+        let p = Path::new("C:\\temp\\rustle_test");
+        let out = windows_long_path(p);
+        let s = out.to_string_lossy();
+        assert!(s.starts_with(r"\\?\"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn windows_long_path_passthrough() {
+        let p = Path::new("/tmp/rustle_test");
+        let out = windows_long_path(p);
+        assert_eq!(out, p);
+    }
+
+    #[test]
+    fn read_machine_uuid_non_empty_if_present() {
+        if let Some(uuid) = read_machine_uuid() {
+            assert!(!uuid.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn load_or_init_node_id_non_empty() {
+        let id = load_or_init_node_id();
+        assert!(!id.trim().is_empty());
+    }
+}
