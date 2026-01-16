@@ -15,7 +15,7 @@ macro_rules! debug_println {
 
 use eframe::egui;
 use rfd::FileDialog;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use std::process::Command;
 use std::env;
 use std::collections::{HashMap, HashSet};
@@ -77,6 +77,29 @@ fn default_download_dir() -> PathBuf {
         let _ = fs::create_dir_all(&p);
         p
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_long_path(p: &Path) -> PathBuf {
+    // Enable long-path (MAX_PATH) support by adding a verbatim prefix.
+    let s = p.as_os_str().to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        return p.to_path_buf();
+    }
+    // Normalize forward slashes to backslashes to appease Windows verbatim rules.
+    let normalized = s.replace('/', r"\");
+    // Avoid duplicating prefix when path already includes drive/backslash.
+    if normalized.starts_with(r"\\") {
+        // UNC path
+        format!(r"\\?\UNC\{}", normalized.trim_start_matches(r"\\")).into()
+    } else {
+        format!(r"\\?\{}", normalized).into()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_long_path(p: &Path) -> PathBuf {
+    p.to_path_buf()
 }
 
 fn read_machine_uuid() -> Option<String> {
@@ -2329,9 +2352,12 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
         let filename_clone = filename.clone();
 
         let res = tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::create(&tar_path)?;
+            let tar_fs_path = windows_long_path(&tar_path);
+            let src_fs_path = windows_long_path(&path_clone);
+
+            let file = std::fs::File::create(&tar_fs_path)?;
             let mut builder = tar::Builder::new(file);
-            builder.append_dir_all(&filename_clone, &path_clone)?;
+            builder.append_dir_all(&filename_clone, &src_fs_path)?;
             builder.finish()?;
             Ok::<(), std::io::Error>(())
         }).await;
@@ -2343,6 +2369,7 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
                     send_path = temp_tar.clone();
                     cleanup_path = Some(temp_tar);
                 } else {
+                    eprintln!("[tx] tar metadata failed for {:?}", temp_tar);
                     let _ = peer_tx.send(PeerEvent::FileProgress {
                         peer_id: Some(peer_id),
                         file_name: filename,
@@ -2355,7 +2382,22 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
                     return;
                 }
             }
-            _ => {
+            Ok(Err(e)) => {
+                eprintln!("[tx] tar build failed for {:?}: {}", path, e);
+                let _ = tokio::fs::remove_file(&temp_tar).await;
+                let _ = peer_tx.send(PeerEvent::FileProgress {
+                    peer_id: Some(peer_id),
+                    file_name: filename,
+                    progress: 0.0,
+                    status: "打包目录失败".to_string(),
+                    is_incoming: false,
+                    is_dir,
+                    local_path: Some(path.to_string_lossy().to_string()),
+                });
+                return;
+            }
+            Err(join_err) => {
+                eprintln!("[tx] tar build join error for {:?}: {}", path, join_err);
                 let _ = tokio::fs::remove_file(&temp_tar).await;
                 let _ = peer_tx.send(PeerEvent::FileProgress {
                     peer_id: Some(peer_id),
