@@ -986,7 +986,7 @@ impl RustleApp {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
 
             if is_dir {
-                let prep_text = format!("有一个文件夹（{}）正在准备发送", name);
+                let prep_text = format!("对方有一个文件夹（{}）正在准备发送", name);
                 self.send_message_internal(&id, prep_text);
             }
 
@@ -2381,12 +2381,51 @@ async fn handle_outgoing_file(my_id: String, peer_id: String, peer_ip: String, t
         let filename_clone = filename.clone();
 
         let res = tokio::task::spawn_blocking(move || {
+            fn add_dir_to_tar(builder: &mut tar::Builder<std::fs::File>, src: &Path, base_name: &str, skipped: &mut usize) -> std::io::Result<()> {
+                let read_dir = std::fs::read_dir(src)?;
+                for entry in read_dir {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => {
+                            *skipped += 1;
+                            continue;
+                        }
+                    };
+                    let path = entry.path();
+                    let rel = match path.strip_prefix(src) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            *skipped += 1;
+                            continue;
+                        }
+                    };
+                    let tar_path = Path::new(base_name).join(rel);
+                    if path.is_dir() {
+                        if builder.append_dir(&tar_path, &path).is_err() {
+                            *skipped += 1;
+                        }
+                        if let Err(_) = add_dir_to_tar(builder, &path, base_name, skipped) {
+                            *skipped += 1;
+                        }
+                    } else if path.is_file() {
+                        if builder.append_path_with_name(&path, &tar_path).is_err() {
+                            *skipped += 1;
+                        }
+                    }
+                }
+                Ok(())
+            }
+
             let tar_fs_path = windows_long_path(&tar_path);
             let src_fs_path = windows_long_path(&path_clone);
 
             let file = std::fs::File::create(&tar_fs_path)?;
             let mut builder = tar::Builder::new(file);
-            builder.append_dir_all(&filename_clone, &src_fs_path)?;
+            let mut skipped = 0usize;
+            add_dir_to_tar(&mut builder, &src_fs_path, &filename_clone, &mut skipped)?;
+            if skipped > 0 {
+                eprintln!("[tx] tar build skipped {} entries due to read/permission errors", skipped);
+            }
             builder.finish()?;
             Ok::<(), std::io::Error>(())
         }).await;
