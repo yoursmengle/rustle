@@ -1572,7 +1572,9 @@ impl eframe::App for RustleApp {
                                     .inner_margin(2.0)
                                     .rounding(2.0)
                                     .show(ui, |ui| {
-                                        ui.selectable_label(selected, text)
+                                        ui.push_id(&user.id, |ui| {
+                                            ui.add(egui::SelectableLabel::new(selected, text))
+                                        }).inner
                                     }).inner;
 
                                 if resp.clicked() {
@@ -1610,7 +1612,10 @@ impl eframe::App for RustleApp {
                             let offline_height = (avail - online_height - 12.0).max(80.0);
 
                             ui.label(egui::RichText::new("在线").strong());
-                            egui::ScrollArea::vertical().max_height(online_height).show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("online_users")
+                                .max_height(online_height)
+                                .show(ui, |ui| {
                                 for user in &online_users {
                                     render_user(ui, user, self);
                                 }
@@ -1621,7 +1626,10 @@ impl eframe::App for RustleApp {
                             ui.add_space(6.0);
 
                             ui.label(egui::RichText::new("离线").strong());
-                            egui::ScrollArea::vertical().max_height(offline_height).show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("offline_users")
+                                .max_height(offline_height)
+                                .show(ui, |ui| {
                                 for user in &offline_users {
                                     render_user(ui, user, self);
                                 }
