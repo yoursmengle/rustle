@@ -814,14 +814,14 @@ impl RustleApp {
     fn append_file_message(&mut self, path: &PathBuf, is_dir: bool) {
         if let Some(id) = self.selected_user_id.clone() {
             self.scroll_to_bottom = true;
-            let (ip, via) = {
+            let (ip, via, online) = {
                 let Some(user) = self.users.iter().find(|u| u.id == id) else { return };
                 let via = if let Some(target_ip) = &user.ip {
                     self.get_best_interface_for_peer(target_ip)
                 } else {
                     None
                 };
-                (user.ip.clone(), via)
+                (user.ip.clone(), via, user.online)
             };
 
             let target_tcp_port = if is_dir { TCP_DIR_PORT } else { TCP_FILE_PORT };
@@ -838,22 +838,24 @@ impl RustleApp {
             let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
             let mut sent = false;
-            if let Some(ip) = ip {
-                if let Some(tx) = &self.net_cmd_tx {
-                    if tx
-                        .send(NetCmd::SendFile {
-                            peer_id: id.clone(),
-                            ip: ip.clone(),
-                            tcp_port: target_tcp_port,
-                            path: path.clone(),
-                            is_dir,
-                            via: via.clone(),
-                        })
-                        .is_ok()
-                    {
-                        sent = true;
-                    } else {
-                        self.mark_offline(&id);
+            if online {
+                if let Some(ip) = ip {
+                    if let Some(tx) = &self.net_cmd_tx {
+                        if tx
+                            .send(NetCmd::SendFile {
+                                peer_id: id.clone(),
+                                ip: ip.clone(),
+                                tcp_port: target_tcp_port,
+                                path: path.clone(),
+                                is_dir,
+                                via: via.clone(),
+                            })
+                            .is_ok()
+                        {
+                            sent = true;
+                        } else {
+                            self.mark_offline(&id);
+                        }
                     }
                 }
             }
