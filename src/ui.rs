@@ -4,7 +4,10 @@ use crate::model::{
     UDP_MESSAGE_PORT,
 };
 use crate::net::spawn_network_worker;
-use crate::storage::{data_path, file_mtime_seconds, load_sync_tree, save_sync_tree, sha256_file};
+use crate::storage::{
+    data_path, file_mtime_seconds, load_or_init_node_id, load_sync_tree, save_sync_tree,
+    sha256_file,
+};
 use chrono::{Duration as ChronoDuration, Local};
 use eframe::egui;
 use rfd::FileDialog;
@@ -80,6 +83,7 @@ pub fn run() -> eframe::Result<()> {
 
             // 在启动时检查用户数据目录下的 me.txt
             let mut app = RustleApp::default();
+            app.self_id = load_or_init_node_id();
             match fs::read_to_string(data_path("me.txt")) {
                 Ok(s) => {
                     let s = s.trim().to_string();
@@ -188,6 +192,7 @@ struct SyncScanResult {
 
 #[derive(Default)]
 pub struct RustleApp {
+    pub self_id: String,
     pub users: Vec<User>,
     pub selected_user_id: Option<String>,
     pub messages: HashMap<String, Vec<ChatMessage>>,
@@ -1840,6 +1845,9 @@ impl eframe::App for RustleApp {
                             if p.id.is_empty() {
                                 continue;
                             }
+                            if p.id == self.self_id {
+                                continue;
+                            }
                             if let Some(u) = self.users.iter_mut().find(|u| u.id == p.id) {
                                 if let Some(ip) = p.ip.clone() {
                                     u.ip = Some(ip);
@@ -1868,6 +1876,9 @@ impl eframe::App for RustleApp {
                         }
                     }
                     PeerEvent::PeerOnline { id, ip } => {
+                        if id == self.self_id {
+                            continue;
+                        }
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
                             u.online = true;
                             u.ip = Some(ip.clone());
@@ -1924,8 +1935,18 @@ impl eframe::App for RustleApp {
                 if self.users.is_empty() {
                     ui.label(egui::RichText::new("暂无联系人").weak());
                 } else {
-                    let mut online_users: Vec<User> = self.users.iter().filter(|u| u.online).cloned().collect();
-                    let mut offline_users: Vec<User> = self.users.iter().filter(|u| !u.online).cloned().collect();
+                    let mut online_users: Vec<User> = self
+                        .users
+                        .iter()
+                        .filter(|u| u.online && u.id != self.self_id)
+                        .cloned()
+                        .collect();
+                    let mut offline_users: Vec<User> = self
+                        .users
+                        .iter()
+                        .filter(|u| !u.online && u.id != self.self_id)
+                        .cloned()
+                        .collect();
                     online_users.sort_by(|a, b| a.name.cmp(&b.name));
                     offline_users.sort_by(|a, b| a.name.cmp(&b.name));
 
