@@ -184,6 +184,12 @@ struct SyncTransfer {
     is_dir: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameSource {
+    Direct,
+    Indirect,
+}
+
 #[derive(Clone, Debug)]
 struct SyncScanResult {
     tree: SyncTree,
@@ -233,6 +239,9 @@ pub struct RustleApp {
 
     // 离线用户名更新队列
     pub offline_name_updates: HashMap<String, String>,
+
+    // 用户名来源跟踪（Direct 优先）
+    name_source: HashMap<String, NameSource>,
 
     // 本机绑定信息（UI 使用）
     pub local_ip: Option<String>,
@@ -591,6 +600,23 @@ impl RustleApp {
             name,
             local_ip: self.local_ip.clone(),
         });
+    }
+
+    fn apply_name_update(&mut self, id: &str, new_name: &str, source: NameSource) {
+        if new_name.trim().is_empty() {
+            return;
+        }
+        let existing_source = self.name_source.get(id).copied();
+        if matches!(existing_source, Some(NameSource::Direct)) && source == NameSource::Indirect {
+            return;
+        }
+        if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
+            if u.name != new_name {
+                u.name = new_name.to_string();
+                self.known_dirty = true;
+            }
+        }
+        self.name_source.insert(id.to_string(), source);
     }
 
     fn build_sync_node(path: &PathBuf) -> Option<SyncNode> {
@@ -1669,6 +1695,7 @@ impl eframe::App for RustleApp {
                         let (ip_clone, port_clone) = (from_ip.clone(), UDP_MESSAGE_PORT);
                         self.maybe_switch_primary_interface(&local_ip, &from_ip);
 
+                        let mut pending_name_update: Option<String> = None;
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == key) {
                             if self.selected_user_id.as_deref() != Some(&key) {
                                 u.has_unread = true;
@@ -1678,12 +1705,7 @@ impl eframe::App for RustleApp {
                                 u.ip = Some(ip_clone.clone());
                                 self.known_dirty = true;
                             }
-                            if let Some(name) = from_name.clone() {
-                                if !name.trim().is_empty() && u.name != name {
-                                    u.name = name;
-                                    self.known_dirty = true;
-                                }
-                            }
+                            pending_name_update = from_name.clone();
                             u.port = Some(port_clone);
                             u.bound_interface = Some(local_ip.clone());
                             u.best_interface = Some(local_ip.clone());
@@ -1693,6 +1715,7 @@ impl eframe::App for RustleApp {
                             let _ = u;
                             self.flush_offline_queue(&peer_id, ip_opt.as_deref(), port_opt);
                             self.flush_offline_sync(&peer_id, ip_opt.as_deref());
+                            self.flush_offline_name_updates(&peer_id, ip_opt.as_deref());
                         } else {
                             let display = if from_id.is_empty() {
                                 format!("{}:{}", from_ip, from_port)
@@ -1714,6 +1737,10 @@ impl eframe::App for RustleApp {
                             self.known_dirty = true;
                             self.flush_offline_queue(&key, Some(&ip_clone), Some(port_clone));
                             self.flush_offline_sync(&key, Some(&ip_clone));
+                            self.flush_offline_name_updates(&key, Some(&ip_clone));
+                        }
+                        if let Some(name) = pending_name_update {
+                            self.apply_name_update(&key, &name, NameSource::Direct);
                         }
                     }
                     PeerEvent::ChatAck { from_id, msg_id } => {
@@ -1878,10 +1905,7 @@ impl eframe::App for RustleApp {
                                 self.known_dirty = true;
                             }
                             if let Some(name) = from_name.clone() {
-                                if !name.trim().is_empty() && u.name != name {
-                                    u.name = name;
-                                    self.known_dirty = true;
-                                }
+                                self.apply_name_update(&from_id, &name, NameSource::Direct);
                             }
                         } else {
                             self.users.push(User {
@@ -1916,10 +1940,7 @@ impl eframe::App for RustleApp {
                                     }
                                 }
                                 if let Some(name) = p.name.clone() {
-                                    if !name.trim().is_empty() && u.name != name {
-                                        u.name = name;
-                                        self.known_dirty = true;
-                                    }
+                                    self.apply_name_update(&p.id, &name, NameSource::Indirect);
                                 }
                             } else {
                                 self.users.push(User {
@@ -1936,6 +1957,9 @@ impl eframe::App for RustleApp {
                                 self.messages.entry(p.id.clone()).or_default();
                                 self.offline_msgs.entry(p.id.clone()).or_default();
                                 self.known_dirty = true;
+                                if p.name.is_some() {
+                                    self.name_source.insert(p.id.clone(), NameSource::Indirect);
+                                }
                             }
                         }
                     }
@@ -1974,16 +1998,15 @@ impl eframe::App for RustleApp {
                             continue;
                         }
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
-                            if !name.trim().is_empty() && u.name != name {
-                                u.name = name;
-                                self.known_dirty = true;
-                            }
+                            let pending_name = name.clone();
                             if let Some(ipv) = ip.clone() {
                                 if u.ip.as_deref() != Some(&ipv) {
                                     u.ip = Some(ipv);
                                     self.known_dirty = true;
                                 }
                             }
+                            let _ = u;
+                            self.apply_name_update(&id, &pending_name, NameSource::Direct);
                         } else {
                             self.users.push(User {
                                 id: id.clone(),
@@ -1999,6 +2022,7 @@ impl eframe::App for RustleApp {
                             self.messages.entry(id.clone()).or_default();
                             self.offline_msgs.entry(id.clone()).or_default();
                             self.known_dirty = true;
+                            self.name_source.insert(id.clone(), NameSource::Direct);
                         }
                     }
                     PeerEvent::PeerOffline { id } => {
