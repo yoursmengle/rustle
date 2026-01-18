@@ -1,9 +1,10 @@
 use crate::model::{
-    ChatMessage, HistoryEntry, KnownPeer, NetCmd, Peer, PeerEvent, QueuedMsg, User, HISTORY_FILE,
-    KNOWN_PEERS_FILE, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT, UDP_MESSAGE_PORT,
+    ChatMessage, HistoryEntry, KnownPeer, NetCmd, Peer, PeerEvent, QueuedMsg, SyncNode, SyncTree,
+    User, HISTORY_FILE, KNOWN_PEERS_FILE, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT,
+    UDP_MESSAGE_PORT,
 };
 use crate::net::spawn_network_worker;
-use crate::storage::data_path;
+use crate::storage::{data_path, file_mtime_seconds, load_sync_tree, save_sync_tree, sha256_file};
 use chrono::{Duration as ChronoDuration, Local};
 use eframe::egui;
 use rfd::FileDialog;
@@ -43,7 +44,11 @@ pub fn run() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let options = eframe::NativeOptions {
+        viewport,
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
 
     eframe::run_native(
         "Rustle",
@@ -94,6 +99,8 @@ pub fn run() -> eframe::Result<()> {
             app.load_known_peers();
             // 启动时加载最近 15 天的历史记录
             app.load_recent_history();
+            // 启动时加载自动同步树
+            app.load_sync_tree();
 
             // 尝试设置本机显示 IP：优先选择收发总流量最大的接口的 IPv4 地址
             if app.local_ip.is_none() {
@@ -166,6 +173,19 @@ pub fn run() -> eframe::Result<()> {
     )
 }
 
+#[derive(Clone, Debug)]
+struct SyncTransfer {
+    peer_id: String,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SyncScanResult {
+    tree: SyncTree,
+    changes: Vec<SyncTransfer>,
+}
+
 #[derive(Default)]
 pub struct RustleApp {
     pub users: Vec<User>,
@@ -194,6 +214,14 @@ pub struct RustleApp {
 
     // 离线消息队列
     pub offline_msgs: HashMap<String, Vec<QueuedMsg>>,
+
+    // 自动同步相关
+    pub sync_tree: SyncTree,
+    pub sync_dirty: bool,
+    pub last_sync_scan: Option<Instant>,
+    sync_scan_rx: Option<Receiver<SyncScanResult>>,
+    pub sync_scan_in_progress: bool,
+    offline_sync: HashMap<String, Vec<SyncTransfer>>,
 
     // 本机绑定信息（UI 使用）
     pub local_ip: Option<String>,
@@ -390,6 +418,7 @@ impl RustleApp {
         send_ts: &str,
         recv_ts: Option<&str>,
         file_path: Option<&str>,
+        sync_ts: Option<&str>,
     ) {
         let path = data_path(HISTORY_FILE);
         let line = serde_json::json!({
@@ -399,6 +428,7 @@ impl RustleApp {
             "send_ts": send_ts,
             "recv_ts": recv_ts,
             "file_path": file_path,
+            "sync_ts": sync_ts,
             "ts": Local::now().to_rfc3339(),
         })
         .to_string();
@@ -476,11 +506,185 @@ impl RustleApp {
                 text: entry.text,
                 send_ts: entry.send_ts,
                 recv_ts: entry.recv_ts,
+                last_sync_ts: entry.sync_ts,
                 file_path: entry.file_path,
                 transfer_status: None,
                 msg_id: None,
                 is_read: true,
             });
+        }
+    }
+
+    fn load_sync_tree(&mut self) {
+        self.sync_tree = load_sync_tree();
+        self.sync_dirty = false;
+        if self.last_sync_scan.is_none() {
+            self.last_sync_scan = Some(Instant::now());
+        }
+    }
+
+    fn persist_sync_tree(&mut self) {
+        if self.sync_dirty {
+            save_sync_tree(&self.sync_tree);
+            self.sync_dirty = false;
+        }
+    }
+
+    fn build_sync_node(path: &PathBuf) -> Option<SyncNode> {
+        #[derive(Clone)]
+        struct NodeEntry {
+            name: String,
+            path: String,
+            is_dir: bool,
+            mtime: Option<i64>,
+            sha256: Option<String>,
+            children: Vec<usize>,
+        }
+
+        let meta = std::fs::metadata(path).ok()?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item").to_string();
+        if meta.is_file() {
+            let mtime = file_mtime_seconds(path)?;
+            let sha = sha256_file(path)?;
+            return Some(SyncNode {
+                name,
+                path: path.to_string_lossy().to_string(),
+                is_dir: false,
+                mtime: Some(mtime),
+                sha256: Some(sha),
+                children: Vec::new(),
+            });
+        }
+        if !meta.is_dir() {
+            return None;
+        }
+
+        let root_path = path.to_string_lossy().to_string();
+        let mut entries: Vec<NodeEntry> = Vec::new();
+        entries.push(NodeEntry {
+            name,
+            path: root_path.clone(),
+            is_dir: true,
+            mtime: None,
+            sha256: None,
+            children: Vec::new(),
+        });
+
+        let mut stack: Vec<(PathBuf, usize)> = vec![(path.clone(), 0)];
+        while let Some((dir_path, parent_idx)) = stack.pop() {
+            let Ok(read_dir) = std::fs::read_dir(&dir_path) else { continue };
+            for entry in read_dir.flatten() {
+                let child_path = entry.path();
+                let child_meta = match std::fs::metadata(&child_path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let child_name = child_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("item")
+                    .to_string();
+                let child_idx = entries.len();
+                if child_meta.is_file() {
+                    let mtime = file_mtime_seconds(&child_path);
+                    let sha = sha256_file(&child_path);
+                    entries.push(NodeEntry {
+                        name: child_name,
+                        path: child_path.to_string_lossy().to_string(),
+                        is_dir: false,
+                        mtime,
+                        sha256: sha,
+                        children: Vec::new(),
+                    });
+                } else if child_meta.is_dir() {
+                    entries.push(NodeEntry {
+                        name: child_name,
+                        path: child_path.to_string_lossy().to_string(),
+                        is_dir: true,
+                        mtime: None,
+                        sha256: None,
+                        children: Vec::new(),
+                    });
+                    stack.push((child_path, child_idx));
+                } else {
+                    continue;
+                }
+                if let Some(parent) = entries.get_mut(parent_idx) {
+                    parent.children.push(child_idx);
+                }
+            }
+        }
+
+        let mut built: Vec<Option<SyncNode>> = vec![None; entries.len()];
+        let mut stack: Vec<(usize, bool)> = vec![(0, false)];
+        while let Some((idx, visited)) = stack.pop() {
+            if !visited {
+                stack.push((idx, true));
+                let children = entries[idx].children.clone();
+                for c in children {
+                    stack.push((c, false));
+                }
+            } else {
+                let entry = entries[idx].clone();
+                let mut children_nodes = Vec::new();
+                for c in entry.children {
+                    if let Some(child_node) = built[c].take() {
+                        children_nodes.push(child_node);
+                    }
+                }
+                built[idx] = Some(SyncNode {
+                    name: entry.name,
+                    path: entry.path,
+                    is_dir: entry.is_dir,
+                    mtime: entry.mtime,
+                    sha256: entry.sha256,
+                    children: children_nodes,
+                });
+            }
+        }
+
+        built[0].take()
+    }
+
+    fn track_sync_source(&mut self, peer_id: &str, path: &PathBuf) {
+        let Some(node) = Self::build_sync_node(path) else { return };
+        let list = self.sync_tree.peers.entry(peer_id.to_string()).or_default();
+        if let Some(existing) = list.iter_mut().find(|n| n.path == node.path) {
+            *existing = node;
+        } else {
+            list.push(node);
+        }
+        self.sync_dirty = true;
+    }
+
+    fn update_history_sync(&self, peer_id: &str, file_path: &str, sync_ts: &str, from_me: bool) {
+        let path = data_path(HISTORY_FILE);
+        let Ok(content) = fs::read_to_string(&path) else { return };
+        let mut lines: Vec<String> = Vec::new();
+        let mut updated = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
+                let matches_peer = val.get("peer_id").and_then(|v| v.as_str()) == Some(peer_id);
+                let matches_from = val.get("from_me").and_then(|v| v.as_bool()) == Some(from_me);
+                let matches_file = val
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p == file_path || p.ends_with(file_path) || file_path.ends_with(p))
+                    .unwrap_or(false);
+                if matches_peer && matches_from && matches_file {
+                    val["sync_ts"] = serde_json::Value::String(sync_ts.to_string());
+                    lines.push(val.to_string());
+                    updated = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+        if updated {
+            let _ = fs::write(&path, lines.join("\n") + "\n");
         }
     }
 
@@ -509,6 +713,7 @@ impl RustleApp {
                             path: path.clone(),
                             is_dir: msg.is_dir,
                             via: via.clone(),
+                            is_sync: false,
                         })
                         .is_err()
                     {
@@ -532,6 +737,151 @@ impl RustleApp {
             }
             if !remain.is_empty() {
                 self.offline_msgs.insert(peer_id.to_string(), remain);
+            }
+        }
+    }
+
+    fn flush_offline_sync(&mut self, peer_id: &str, ip: Option<&str>) {
+        let Some(ip) = ip else { return };
+        let Some(tx) = self.net_cmd_tx.clone() else { return };
+        if let Some(queue) = self.offline_sync.get_mut(peer_id) {
+            if queue.is_empty() {
+                return;
+            }
+            let drained: Vec<SyncTransfer> = queue.drain(..).collect();
+            let mut remain = Vec::new();
+            let via = self.get_best_interface_for_peer(ip);
+            for item in drained {
+                let target_tcp_port = if item.is_dir { TCP_DIR_PORT } else { TCP_FILE_PORT };
+                if tx
+                    .send(NetCmd::SendFile {
+                        peer_id: peer_id.to_string(),
+                        ip: ip.to_string(),
+                        tcp_port: target_tcp_port,
+                        path: item.path.clone(),
+                        is_dir: item.is_dir,
+                        via: via.clone(),
+                        is_sync: true,
+                    })
+                    .is_err()
+                {
+                    remain.push(item);
+                }
+            }
+            if !remain.is_empty() {
+                self.offline_sync.insert(peer_id.to_string(), remain);
+            }
+        }
+    }
+
+    fn scan_node_for_changes(node: &mut SyncNode) -> bool {
+        if node.is_dir {
+            let mut changed = false;
+            for child in &mut node.children {
+                if Self::scan_node_for_changes(child) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        let path = PathBuf::from(&node.path);
+        let Some(mtime) = file_mtime_seconds(&path) else { return false };
+        if node.mtime != Some(mtime) {
+            let new_sha = sha256_file(&path);
+            node.mtime = Some(mtime);
+            if let Some(sha) = new_sha {
+                let changed = node.sha256.as_deref() != Some(&sha);
+                node.sha256 = Some(sha);
+                return changed;
+            }
+        }
+        false
+    }
+
+    fn scan_sync_tree(mut tree: SyncTree) -> SyncScanResult {
+        let mut changes = Vec::new();
+        for (peer_id, nodes) in tree.peers.iter_mut() {
+            for node in nodes.iter_mut() {
+                let changed = Self::scan_node_for_changes(node);
+                if changed {
+                    changes.push(SyncTransfer {
+                        peer_id: peer_id.clone(),
+                        path: PathBuf::from(&node.path),
+                        is_dir: node.is_dir,
+                    });
+                }
+            }
+        }
+        SyncScanResult { tree, changes }
+    }
+
+    fn maybe_start_sync_scan(&mut self) {
+        if self.sync_scan_in_progress {
+            return;
+        }
+        let elapsed_ok = self
+            .last_sync_scan
+            .map(|t| t.elapsed() >= Duration::from_secs(30 * 60))
+            .unwrap_or(true);
+        if !elapsed_ok {
+            return;
+        }
+
+        let tree = self.sync_tree.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = RustleApp::scan_sync_tree(tree);
+            let _ = tx.send(result);
+        });
+        self.sync_scan_rx = Some(rx);
+        self.sync_scan_in_progress = true;
+        self.last_sync_scan = Some(Instant::now());
+    }
+
+    fn handle_sync_scan_result(&mut self) {
+        if let Some(rx) = &self.sync_scan_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.sync_tree = result.tree;
+                self.sync_dirty = true;
+                self.sync_scan_in_progress = false;
+                self.sync_scan_rx = None;
+
+                for change in result.changes {
+                    let peer_id = change.peer_id.clone();
+                    let (ip, online) = self
+                        .users
+                        .iter()
+                        .find(|u| u.id == peer_id)
+                        .map(|u| (u.ip.clone(), u.online))
+                        .unwrap_or((None, false));
+                    if online {
+                        if let Some(ip) = ip {
+                            if let Some(tx) = &self.net_cmd_tx {
+                                let target_tcp_port = if change.is_dir { TCP_DIR_PORT } else { TCP_FILE_PORT };
+                                let via = self.get_best_interface_for_peer(&ip);
+                                if tx
+                                    .send(NetCmd::SendFile {
+                                        peer_id: peer_id.clone(),
+                                        ip: ip.clone(),
+                                        tcp_port: target_tcp_port,
+                                        path: change.path.clone(),
+                                        is_dir: change.is_dir,
+                                        via,
+                                        is_sync: true,
+                                    })
+                                    .is_err()
+                                {
+                                    self.offline_sync.entry(peer_id.clone()).or_default().push(change);
+                                }
+                            }
+                        } else {
+                            self.offline_sync.entry(peer_id.clone()).or_default().push(change);
+                        }
+                    } else {
+                        self.offline_sync.entry(peer_id.clone()).or_default().push(change);
+                    }
+                }
             }
         }
     }
@@ -669,13 +1019,14 @@ impl RustleApp {
                 text: text.clone(),
                 send_ts: ts.clone(),
                 recv_ts: None,
+                last_sync_ts: None,
                 file_path: None,
                 transfer_status: Some("发送中...".to_string()),
                 msg_id: Some(msg_id.clone()),
                 is_read: true,
             });
 
-        self.log_history(id, true, &text, &ts, None, None);
+        self.log_history(id, true, &text, &ts, None, None, None);
 
         let Some(u) = self.users.iter().find(|u| u.id == id) else { return };
         let online = u.online;
@@ -829,6 +1180,8 @@ impl RustleApp {
             let icon = if is_dir { "📁" } else { "📄" };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
 
+            self.track_sync_source(&id, path);
+
             if is_dir {
                 let prep_text = format!("对方有一个文件夹（{}）正在准备发送", name);
                 self.send_message_internal(&id, prep_text);
@@ -849,6 +1202,7 @@ impl RustleApp {
                                 path: path.clone(),
                                 is_dir,
                                 via: via.clone(),
+                                is_sync: false,
                             })
                             .is_ok()
                         {
@@ -876,13 +1230,14 @@ impl RustleApp {
                 text: text.clone(),
                 send_ts: ts.clone(),
                 recv_ts: None,
+                last_sync_ts: None,
                 file_path: Some(path.to_string_lossy().to_string()),
                 transfer_status: Some(if sent { "发送中...".to_string() } else { "等待对方上线...".to_string() }),
                 msg_id: None,
                 is_read: true,
             });
 
-            self.log_history(&id, true, &text, &ts, None, Some(&path.to_string_lossy()));
+            self.log_history(&id, true, &text, &ts, None, Some(&path.to_string_lossy()), None);
         }
     }
 
@@ -1173,6 +1528,7 @@ impl eframe::App for RustleApp {
                             let port_opt = u.port;
                             let _ = u;
                             self.flush_offline_queue(&peer_id, ip_opt.as_deref(), port_opt);
+                            self.flush_offline_sync(&peer_id, ip_opt.as_deref());
                         } else {
                             self.users.push(User {
                                 id: key.clone(),
@@ -1192,6 +1548,7 @@ impl eframe::App for RustleApp {
                                 self.selected_user_id = Some(key.clone());
                             }
                             self.flush_offline_queue(&key, Some(&ip_clone), Some(port_clone));
+                            self.flush_offline_sync(&key, Some(&ip_clone));
                         }
                     }
                     PeerEvent::ChatReceived {
@@ -1219,12 +1576,13 @@ impl eframe::App for RustleApp {
                                 text: text.clone(),
                                 send_ts: send_ts.clone(),
                                 recv_ts: Some(recv_ts.clone()),
+                                last_sync_ts: None,
                                 file_path: None,
                                 transfer_status: None,
                                 msg_id: Some(msg_id.clone()),
                                 is_read: false,
                             });
-                            self.log_history(&key, false, &text, &send_ts, Some(&recv_ts), None);
+                            self.log_history(&key, false, &text, &send_ts, Some(&recv_ts), None, None);
 
                             // 触发任务栏闪烁
                             if !self.has_unread_messages {
@@ -1258,6 +1616,7 @@ impl eframe::App for RustleApp {
                             let port_opt = u.port;
                             let _ = u;
                             self.flush_offline_queue(&peer_id, ip_opt.as_deref(), port_opt);
+                            self.flush_offline_sync(&peer_id, ip_opt.as_deref());
                         } else {
                             let display = if from_id.is_empty() {
                                 format!("{}:{}", from_ip, from_port)
@@ -1278,6 +1637,7 @@ impl eframe::App for RustleApp {
                             self.offline_msgs.entry(key.clone()).or_default();
                             self.known_dirty = true;
                             self.flush_offline_queue(&key, Some(&ip_clone), Some(port_clone));
+                            self.flush_offline_sync(&key, Some(&ip_clone));
                         }
                     }
                     PeerEvent::ChatAck { from_id, msg_id } => {
@@ -1333,68 +1693,100 @@ impl eframe::App for RustleApp {
                         is_incoming,
                         is_dir,
                         local_path,
+                        is_sync,
                     } => {
                         if let Some(pid) = peer_id {
+                            let mut pending_log: Option<(String, String, String)> = None;
+                            let mut pending_sync: Option<(String, String, bool)> = None;
                             if let Some(msgs) = self.messages.get_mut(&pid) {
                                 if is_incoming {
-                                    let log_key = (pid.clone(), file_name.clone());
-                                    if progress == 0.0 {
-                                        let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                        let text = if is_dir {
-                                            format!("📁 {}", file_name)
-                                        } else {
-                                            format!("📄 {}", file_name)
-                                        };
-                                        msgs.push(ChatMessage {
-                                            from_me: false,
-                                            text: text.clone(),
-                                            send_ts: ts.clone(),
-                                            recv_ts: Some(ts.clone()),
-                                            file_path: Some(file_name.clone()),
-                                            transfer_status: Some(status.clone()),
-                                            msg_id: None,
-                                            is_read: false,
-                                        });
-
-                                        if self.logged_incoming_files.insert(log_key.clone()) {
-                                            let path_for_history =
-                                                local_path.as_deref().unwrap_or(file_name.as_str());
-                                            self.log_history(&pid, false, &text, &ts, Some(&ts), Some(path_for_history));
+                                    if is_sync {
+                                        if progress >= 1.0 {
+                                            if let Some(msg) = msgs.iter_mut().rev().find(|m| {
+                                                !m.from_me
+                                                    && (m.file_path.as_ref().map(|p| p.ends_with(&file_name)).unwrap_or(false)
+                                                        || m.text.contains(&file_name))
+                                            }) {
+                                                let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                                msg.last_sync_ts = Some(ts.clone());
+                                                if let Some(path) = msg.file_path.clone() {
+                                                    pending_sync = Some((path, ts, false));
+                                                }
+                                            }
                                         }
-                                    } else if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                        !m.from_me
-                                            && (m.file_path.as_ref().map(|p| p.ends_with(&file_name)).unwrap_or(false)
-                                                || m.text.contains(&file_name))
-                                    }) {
-                                        msg.transfer_status = Some(status.clone());
-                                        if let Some(path) = local_path.as_deref() {
-                                            msg.file_path = Some(path.to_string());
-                                        } else if msg.file_path.is_none() {
-                                            msg.file_path = Some(file_name.clone());
-                                        }
+                                    } else {
+                                        let log_key = (pid.clone(), file_name.clone());
+                                        if progress == 0.0 {
+                                            let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                            let text = if is_dir {
+                                                format!("📁 {}", file_name)
+                                            } else {
+                                                format!("📄 {}", file_name)
+                                            };
+                                            msgs.push(ChatMessage {
+                                                from_me: false,
+                                                text: text.clone(),
+                                                send_ts: ts.clone(),
+                                                recv_ts: Some(ts.clone()),
+                                                last_sync_ts: None,
+                                                file_path: Some(file_name.clone()),
+                                                transfer_status: Some(status.clone()),
+                                                msg_id: None,
+                                                is_read: false,
+                                            });
 
-                                        let mut to_log: Option<(String, String, String)> = None;
-                                        if progress >= 1.0 && self.logged_incoming_files.insert(log_key.clone()) {
-                                            let ts = msg
-                                                .recv_ts
-                                                .clone()
-                                                .unwrap_or_else(|| Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-                                            let path_for_history = msg
-                                                .file_path
-                                                .clone()
-                                                .unwrap_or_else(|| file_name.clone());
-                                            to_log = Some((msg.text.clone(), ts, path_for_history));
-                                        }
+                                            if self.logged_incoming_files.insert(log_key.clone()) {
+                                                let path_for_history =
+                                                    local_path.as_deref().unwrap_or(file_name.as_str());
+                                                pending_log = Some((text, ts, path_for_history.to_string()));
+                                            }
+                                        } else if let Some(msg) = msgs.iter_mut().rev().find(|m| {
+                                            !m.from_me
+                                                && (m.file_path.as_ref().map(|p| p.ends_with(&file_name)).unwrap_or(false)
+                                                    || m.text.contains(&file_name))
+                                        }) {
+                                            msg.transfer_status = Some(status.clone());
+                                            if let Some(path) = local_path.as_deref() {
+                                                msg.file_path = Some(path.to_string());
+                                            } else if msg.file_path.is_none() {
+                                                msg.file_path = Some(file_name.clone());
+                                            }
 
-                                        if let Some((text, ts, path)) = to_log {
-                                            self.log_history(&pid, false, &text, &ts, Some(&ts), Some(&path));
+                                            if progress >= 1.0 {
+                                                let ts = msg
+                                                    .recv_ts
+                                                    .clone()
+                                                    .unwrap_or_else(|| Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                                                if let Some(path) = msg.file_path.clone() {
+                                                    msg.last_sync_ts = Some(ts.clone());
+                                                    pending_sync = Some((path.clone(), ts.clone(), false));
+                                                    if self.logged_incoming_files.insert(log_key.clone()) {
+                                                        pending_log = Some((msg.text.clone(), ts, path));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 } else if let Some(msg) = msgs.iter_mut().rev().find(|m| {
                                     m.from_me && m.file_path.as_ref().map(|p| p.ends_with(&file_name)).unwrap_or(false)
                                 }) {
-                                    msg.transfer_status = Some(status.clone());
+                                    if !is_sync {
+                                        msg.transfer_status = Some(status.clone());
+                                    }
+                                    if progress >= 1.0 {
+                                        let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                        msg.last_sync_ts = Some(ts.clone());
+                                        if let Some(path) = msg.file_path.clone() {
+                                            pending_sync = Some((path, ts, true));
+                                        }
+                                    }
                                 }
+                            }
+                            if let Some((text, ts, path)) = pending_log {
+                                self.log_history(&pid, false, &text, &ts, Some(&ts), Some(&path), None);
+                            }
+                            if let Some((path, ts, from_me)) = pending_sync {
+                                self.update_history_sync(&pid, &path, &ts, from_me);
                             }
                         }
                     }
@@ -1402,6 +1794,11 @@ impl eframe::App for RustleApp {
             }
             self.merge_users_by_id();
         }
+
+        // 处理自动同步扫描与持久化
+        self.handle_sync_scan_result();
+        self.maybe_start_sync_scan();
+        self.persist_sync_tree();
 
         egui::SidePanel::left("contacts")
             .resizable(false)
@@ -1593,6 +1990,9 @@ impl eframe::App for RustleApp {
                                     let mut meta = format!("发送: {}", msg.send_ts);
                                     if let Some(r) = &msg.recv_ts {
                                         meta.push_str(&format!("  |  接收: {}", r));
+                                    }
+                                    if let Some(s) = &msg.last_sync_ts {
+                                        meta.push_str(&format!("  |  同步: {}", s));
                                     }
                                     ui.label(egui::RichText::new(meta).small().weak());
 

@@ -1,5 +1,5 @@
 use crate::model::PeerEvent;
-use crate::storage::{default_download_dir, windows_long_path};
+use crate::storage::{default_download_dir, load_receive_map, save_receive_map, windows_long_path};
 use chrono::Local;
 use std::fs;
 use std::net::SocketAddr;
@@ -35,6 +35,10 @@ fn format_speed(bytes: u64, elapsed: Duration) -> String {
     format!("{:.2} MB/s", mb_per_sec)
 }
 
+fn receive_map_key(sender_id: &str, is_dir: bool, filename: &str) -> String {
+    format!("{}|{}|{}", sender_id, if is_dir { "dir" } else { "file" }, filename)
+}
+
 pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: Sender<PeerEvent>) {
     let _ = socket.set_nodelay(true);
     let mut type_buf = [0u8; 1];
@@ -42,7 +46,13 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
         debug_println!("[rx] failed to read type from {addr}");
         return;
     }
+    let mut flag_buf = [0u8; 1];
+    if socket.read_exact(&mut flag_buf).await.is_err() {
+        debug_println!("[rx] failed to read flags from {addr}");
+        return;
+    }
     let is_dir = type_buf[0] == 1;
+    let is_sync = (flag_buf[0] & 0x01) == 0x01;
 
     let mut id_len_buf = [0u8; 1];
     if socket.read_exact(&mut id_len_buf).await.is_err() {
@@ -95,15 +105,40 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
         is_incoming: true,
         is_dir,
         local_path: None,
+        is_sync,
     });
 
     let base_dir = default_download_dir();
-    // 无论文件还是文件夹，都创建一个独立的子目录
-    let sub_dir_name = format!("rustle_{}_{}", filename, Local::now().format("%H%M%S"));
-    let sub_dir = base_dir.join(sub_dir_name);
-    let _ = fs::create_dir_all(&sub_dir);
+    let mut mapped_path: Option<PathBuf> = None;
+    if is_sync {
+        let map = load_receive_map();
+        let key = receive_map_key(&sender_id, is_dir, &filename);
+        if let Some(p) = map.get(&key) {
+            mapped_path = Some(PathBuf::from(p));
+        }
+    }
 
-    let save_path = sub_dir.join(&filename);
+    let (sub_dir, save_path) = if let Some(mapped) = mapped_path {
+        if is_dir {
+            let parent = mapped.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| base_dir.clone());
+            let _ = fs::create_dir_all(&parent);
+            let _ = fs::create_dir_all(&mapped);
+            (parent, mapped)
+        } else {
+            if let Some(parent) = mapped.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let parent = mapped.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| base_dir.clone());
+            (parent, mapped)
+        }
+    } else {
+        // 无论文件还是文件夹，都创建一个独立的子目录
+        let sub_dir_name = format!("rustle_{}_{}", filename, Local::now().format("%H%M%S"));
+        let sub_dir = base_dir.join(sub_dir_name);
+        let _ = fs::create_dir_all(&sub_dir);
+        let save_path = sub_dir.join(&filename);
+        (sub_dir, save_path)
+    };
 
     let mut success = false;
     let mut last_progress = 0.0f32;
@@ -146,6 +181,7 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
                                     is_incoming: true,
                                     is_dir,
                                     local_path: None,
+                                    is_sync,
                                 });
                                 last_progress = progress;
                                 last_report_instant = now;
@@ -218,6 +254,7 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
                                 is_incoming: true,
                                 is_dir,
                                 local_path: None,
+                                is_sync,
                             });
                             last_progress = progress;
                             last_report_instant = now;
@@ -256,6 +293,13 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
     } else {
         "接收失败".to_string()
     };
+    if success {
+        let mut map = load_receive_map();
+        let key = receive_map_key(&sender_id, is_dir, &filename);
+        map.insert(key, save_path.to_string_lossy().to_string());
+        save_receive_map(&map);
+    }
+
     let _ = peer_tx.send(PeerEvent::FileProgress {
         peer_id: Some(sender_id),
         file_name: filename,
@@ -264,6 +308,7 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
         is_incoming: true,
         is_dir,
         local_path: Some(save_path.to_string_lossy().to_string()),
+        is_sync,
     });
 }
 
@@ -275,6 +320,7 @@ pub async fn handle_outgoing_file(
     path: PathBuf,
     is_dir: bool,
     via: Option<String>,
+    is_sync: bool,
     peer_tx: Sender<PeerEvent>,
 ) {
     let addr_str = format!("{}:{}", peer_ip, tcp_port);
@@ -375,6 +421,7 @@ pub async fn handle_outgoing_file(
                         is_incoming: false,
                         is_dir,
                         local_path: Some(path.to_string_lossy().to_string()),
+                        is_sync,
                     });
                     return;
                 }
@@ -390,6 +437,7 @@ pub async fn handle_outgoing_file(
                     is_incoming: false,
                     is_dir,
                     local_path: Some(path.to_string_lossy().to_string()),
+                    is_sync,
                 });
                 return;
             }
@@ -404,6 +452,7 @@ pub async fn handle_outgoing_file(
                     is_incoming: false,
                     is_dir,
                     local_path: Some(path.to_string_lossy().to_string()),
+                    is_sync,
                 });
                 return;
             }
@@ -422,6 +471,7 @@ pub async fn handle_outgoing_file(
             is_incoming: false,
             is_dir,
             local_path: Some(path.to_string_lossy().to_string()),
+            is_sync,
         });
 
         let name_bytes = filename.as_bytes();
@@ -431,6 +481,7 @@ pub async fn handle_outgoing_file(
 
         let mut header = Vec::new();
         header.push(if is_dir { 1 } else { 0 });
+        header.push(if is_sync { 1 } else { 0 });
         header.push(id_len);
         header.extend_from_slice(id_bytes);
         header.extend_from_slice(&name_len.to_be_bytes());
@@ -480,6 +531,7 @@ pub async fn handle_outgoing_file(
                                             is_incoming: false,
                                             is_dir,
                                             local_path: Some(path.to_string_lossy().to_string()),
+                                            is_sync,
                                         });
                                         last_progress = progress;
                                         last_report_instant = now;
@@ -524,6 +576,7 @@ pub async fn handle_outgoing_file(
                         is_incoming: false,
                         is_dir,
                         local_path: Some(path.to_string_lossy().to_string()),
+                        is_sync,
                     });
                 }
                 Err(e) => {
@@ -539,6 +592,7 @@ pub async fn handle_outgoing_file(
                         is_incoming: false,
                         is_dir,
                         local_path: Some(path.to_string_lossy().to_string()),
+                        is_sync,
                     });
                 }
             }
@@ -554,6 +608,7 @@ pub async fn handle_outgoing_file(
                 is_incoming: false,
                 is_dir,
                 local_path: Some(path.to_string_lossy().to_string()),
+                is_sync,
             });
         }
     } else {
@@ -568,6 +623,7 @@ pub async fn handle_outgoing_file(
             is_incoming: false,
             is_dir,
             local_path: Some(path.to_string_lossy().to_string()),
+            is_sync,
         });
     }
 }

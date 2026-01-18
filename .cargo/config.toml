@@ -13,4 +13,4 @@ registry = "https://mirrors.ustc.edu.cn/crates.io-index"
 
 # Link the MSVC CRT statically so the binary no longer depends on vcruntime*.dll at runtime.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:16777216"]

@@ -1,7 +1,12 @@
+use crate::model::{SyncTree, RECEIVE_MAP_FILE, SYNC_TREE_FILE};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 
 pub fn data_dir() -> PathBuf {
@@ -18,6 +23,75 @@ pub fn data_path(name: &str) -> PathBuf {
     let mut p = data_dir();
     p.push(name);
     p
+}
+
+fn sync_tree_path() -> PathBuf {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join(SYNC_TREE_FILE);
+        }
+    }
+    data_path(SYNC_TREE_FILE)
+}
+
+pub fn load_sync_tree() -> SyncTree {
+    let path = sync_tree_path();
+    if let Ok(text) = fs::read_to_string(path) {
+        let mut de = serde_json::Deserializer::from_str(&text);
+        let de = serde_stacker::Deserializer::new(&mut de);
+        if let Ok(tree) = SyncTree::deserialize(de) {
+            return tree;
+        }
+    }
+    SyncTree::default()
+}
+
+pub fn save_sync_tree(tree: &SyncTree) {
+    let path = sync_tree_path();
+    if let Ok(mut file) = fs::File::create(path) {
+        let mut ser = serde_json::Serializer::pretty(&mut file);
+        let ser = serde_stacker::Serializer::new(&mut ser);
+        let _ = tree.serialize(ser);
+    }
+}
+
+pub fn load_receive_map() -> HashMap<String, String> {
+    let path = data_path(RECEIVE_MAP_FILE);
+    if let Ok(text) = fs::read_to_string(path) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&text) {
+            return map;
+        }
+    }
+    HashMap::new()
+}
+
+pub fn save_receive_map(map: &HashMap<String, String>) {
+    let path = data_path(RECEIVE_MAP_FILE);
+    if let Ok(text) = serde_json::to_string_pretty(map) {
+        let _ = fs::write(path, text);
+    }
+}
+
+pub fn file_mtime_seconds(path: &Path) -> Option<i64> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(dur.as_secs() as i64)
+}
+
+pub fn sha256_file(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Some(hex::encode(digest))
 }
 
 pub fn default_download_dir() -> PathBuf {

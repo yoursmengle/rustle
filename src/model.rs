@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 pub const KNOWN_PEERS_FILE: &str = "known_peers.json";
 pub const HISTORY_FILE: &str = "history.jsonl";
+pub const SYNC_TREE_FILE: &str = "sync_tree.json";
+pub const RECEIVE_MAP_FILE: &str = "receive_map.json";
 pub const UDP_DISCOVERY_PORT: u16 = 44517;
 pub const UDP_MESSAGE_PORT: u16 = 44518;
 pub const TCP_FILE_PORT: u16 = 44517;
@@ -28,6 +30,7 @@ pub struct ChatMessage {
     pub text: String,
     pub send_ts: String,
     pub recv_ts: Option<String>,
+    pub last_sync_ts: Option<String>,
     pub file_path: Option<String>,
     pub transfer_status: Option<String>,
     pub msg_id: Option<String>,
@@ -41,8 +44,28 @@ pub struct HistoryEntry {
     pub text: String,
     pub send_ts: String,
     pub recv_ts: Option<String>,
+    pub sync_ts: Option<String>,
     pub ts: Option<String>,
     pub file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SyncTree {
+    #[serde(default)]
+    pub peers: std::collections::HashMap<String, Vec<SyncNode>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNode {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    #[serde(default)]
+    pub mtime: Option<i64>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub children: Vec<SyncNode>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +136,7 @@ pub enum NetCmd {
         path: PathBuf,
         is_dir: bool,
         via: Option<String>,
+        is_sync: bool,
     },
 }
 
@@ -142,6 +166,7 @@ pub enum PeerEvent {
         is_incoming: bool,
         is_dir: bool,
         local_path: Option<String>,
+        is_sync: bool,
     },
 }
 
@@ -185,5 +210,6 @@ pub enum FileCmd {
         path: PathBuf,
         is_dir: bool,
         via: Option<String>,
+        is_sync: bool,
     },
 }

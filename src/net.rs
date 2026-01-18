@@ -71,6 +71,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                         path,
                         is_dir,
                         via,
+                        is_sync,
                     } => {
                         handle_outgoing_file(
                             my_id_clone.clone(),
@@ -80,6 +81,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                             path,
                             is_dir,
                             via,
+                            is_sync,
                             peer_tx_clone2.clone(),
                         )
                         .await;
@@ -357,6 +359,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                         path,
                         is_dir,
                         via,
+                        is_sync,
                     } => {
                         let _ = rt.block_on(file_cmd_tx.send(FileCmd::SendFile {
                             peer_id,
@@ -365,6 +368,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                             path,
                             is_dir,
                             via,
+                            is_sync,
                         }));
                     }
                     NetCmd::ProbePeer { ip, via } => {
