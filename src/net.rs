@@ -305,6 +305,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                 .map(|p| PeerBrief {
                     id: p.id.clone(),
                     ip: p.ip.clone(),
+                    name: p.name.clone(),
                 })
                 .collect()
         };

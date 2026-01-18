@@ -542,6 +542,7 @@ impl RustleApp {
                 id: u.id.clone(),
                 ip: u.ip.clone(),
                 online: u.online,
+                name: Some(u.name.clone()),
             })
             .collect();
         let online_count = self.users.iter().filter(|u| u.online).count();
@@ -1843,10 +1844,15 @@ impl eframe::App for RustleApp {
                                 if let Some(ip) = p.ip.clone() {
                                     u.ip = Some(ip);
                                 }
+                                if let Some(name) = p.name.clone() {
+                                    if !name.trim().is_empty() {
+                                        u.name = name;
+                                    }
+                                }
                             } else {
                                 self.users.push(User {
                                     id: p.id.clone(),
-                                    name: p.id.clone(),
+                                    name: p.name.clone().unwrap_or_else(|| p.id.clone()),
                                     online: false,
                                     ip: p.ip.clone(),
                                     port: Some(UDP_MESSAGE_PORT),

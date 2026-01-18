@@ -222,6 +222,8 @@ pub struct PeerBrief {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -239,6 +241,7 @@ pub struct PeerSnapshot {
     pub id: String,
     pub ip: Option<String>,
     pub online: bool,
+    pub name: Option<String>,
 }
 
 #[derive(Debug)]
