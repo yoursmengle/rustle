@@ -1,12 +1,11 @@
 use crate::model::{
     ChatMessage, HistoryEntry, KnownPeer, NetCmd, Peer, PeerEvent, QueuedMsg, SyncNode, SyncTree,
-    User, HISTORY_FILE, KNOWN_PEERS_FILE, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT,
-    UDP_MESSAGE_PORT,
+    User, KNOWN_PEERS_FILE, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT, UDP_MESSAGE_PORT,
 };
 use crate::net::spawn_network_worker;
 use crate::storage::{
     data_path, file_mtime_seconds, load_or_init_node_id, load_sync_tree, save_sync_tree,
-    sha256_file,
+    sha256_file, peer_history_path,
 };
 use chrono::{Duration as ChronoDuration, Local};
 use eframe::egui;
@@ -448,8 +447,11 @@ impl RustleApp {
         recv_ts: Option<&str>,
         file_path: Option<&str>,
         sync_ts: Option<&str>,
+        msg_id: Option<&str>,
+        is_pending: bool,
+        needs_sync: bool,
     ) {
-        let path = data_path(HISTORY_FILE);
+        let path = peer_history_path(peer_id);
         let line = serde_json::json!({
             "peer_id": peer_id,
             "from_me": from_me,
@@ -458,6 +460,9 @@ impl RustleApp {
             "recv_ts": recv_ts,
             "file_path": file_path,
             "sync_ts": sync_ts,
+            "msg_id": msg_id,
+            "is_pending": is_pending,
+            "needs_sync": needs_sync,
             "ts": Local::now().to_rfc3339(),
         })
         .to_string();
@@ -473,74 +478,83 @@ impl RustleApp {
     }
 
     fn clear_history(&self, peer_id: &str) {
-        let path = data_path(HISTORY_FILE);
-        let Ok(content) = fs::read_to_string(&path) else { return };
-        let mut new_lines = Vec::new();
-        for line in content.lines() {
-            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-                if entry.get("peer_id").and_then(|v| v.as_str()) != Some(peer_id) {
-                    new_lines.push(line);
-                }
-            }
-        }
-        let _ = fs::write(&path, new_lines.join("\n") + "\n");
+        let path = peer_history_path(peer_id);
+        let _ = fs::remove_file(&path);
     }
 
     fn load_recent_history(&mut self) {
-        let path = data_path(HISTORY_FILE);
-        let file = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
+        let history_dir = crate::storage::history_dir();
+        let Ok(entries) = fs::read_dir(&history_dir) else { return };
 
         let cutoff = Local::now() - ChronoDuration::days(15);
-        let reader = BufReader::new(file);
-        for line in reader.lines().flatten() {
-            if line.trim().is_empty() {
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            let entry: HistoryEntry = match serde_json::from_str(&line) {
-                Ok(v) => v,
+
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
                 Err(_) => continue,
             };
 
-            if let Some(ts) = entry.ts.as_deref() {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                    let dt_local = dt.with_timezone(&Local);
-                    if dt_local < cutoff {
-                        continue;
+            let reader = BufReader::new(file);
+            for line in reader.lines().flatten() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let entry: HistoryEntry = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                if let Some(ts) = entry.ts.as_deref() {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                        let dt_local = dt.with_timezone(&Local);
+                        if dt_local < cutoff {
+                            continue;
+                        }
                     }
                 }
-            }
 
-            let pid = entry.peer_id.clone();
-            if !self.users.iter().any(|u| u.id == pid) {
-                self.users.push(User {
-                    id: pid.clone(),
-                    name: pid.clone(),
-                    online: false,
-                    ip: None,
-                    port: None,
-                    tcp_port: None,
-                    bound_interface: None,
-                    best_interface: None,
-                    has_unread: false,
+                let pid = entry.peer_id.clone();
+                if !self.users.iter().any(|u| u.id == pid) {
+                    self.users.push(User {
+                        id: pid.clone(),
+                        name: pid.clone(),
+                        online: false,
+                        ip: None,
+                        port: None,
+                        tcp_port: None,
+                        bound_interface: None,
+                        best_interface: None,
+                        has_unread: false,
+                    });
+                    self.offline_msgs.entry(pid.clone()).or_default();
+                }
+
+                let pending = entry.is_pending.unwrap_or(false);
+                let transfer_status = if pending && entry.from_me {
+                    Some("等待对方上线...".to_string())
+                } else {
+                    None
+                };
+                let msgs = self.messages.entry(pid.clone()).or_default();
+                msgs.push(ChatMessage {
+                    from_me: entry.from_me,
+                    text: entry.text,
+                    send_ts: entry.send_ts,
+                    recv_ts: entry.recv_ts,
+                    last_sync_ts: entry.sync_ts,
+                    file_path: entry.file_path,
+                    transfer_status,
+                    msg_id: entry.msg_id,
+                    is_read: true,
+                    is_pending: pending,
+                    needs_sync: entry.needs_sync.unwrap_or(false),
                 });
-                self.offline_msgs.entry(pid.clone()).or_default();
             }
-
-            let msgs = self.messages.entry(pid.clone()).or_default();
-            msgs.push(ChatMessage {
-                from_me: entry.from_me,
-                text: entry.text,
-                send_ts: entry.send_ts,
-                recv_ts: entry.recv_ts,
-                last_sync_ts: entry.sync_ts,
-                file_path: entry.file_path,
-                transfer_status: None,
-                msg_id: None,
-                is_read: true,
-            });
         }
     }
 
@@ -756,7 +770,7 @@ impl RustleApp {
     }
 
     fn update_history_sync(&self, peer_id: &str, file_path: &str, sync_ts: &str, from_me: bool) {
-        let path = data_path(HISTORY_FILE);
+        let path = peer_history_path(peer_id);
         let Ok(content) = fs::read_to_string(&path) else { return };
         let mut lines: Vec<String> = Vec::new();
         let mut updated = false;
@@ -765,15 +779,71 @@ impl RustleApp {
                 continue;
             }
             if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
-                let matches_peer = val.get("peer_id").and_then(|v| v.as_str()) == Some(peer_id);
                 let matches_from = val.get("from_me").and_then(|v| v.as_bool()) == Some(from_me);
                 let matches_file = val
                     .get("file_path")
                     .and_then(|v| v.as_str())
                     .map(|p| p == file_path || p.ends_with(file_path) || file_path.ends_with(p))
                     .unwrap_or(false);
-                if matches_peer && matches_from && matches_file {
+                if matches_from && matches_file {
                     val["sync_ts"] = serde_json::Value::String(sync_ts.to_string());
+                    lines.push(val.to_string());
+                    updated = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+        if updated {
+            let _ = fs::write(&path, lines.join("\n") + "\n");
+        }
+    }
+
+    fn update_history_ack(&self, peer_id: &str, msg_id: &str, recv_ts: &str) {
+        let path = peer_history_path(peer_id);
+        let Ok(content) = fs::read_to_string(&path) else { return };
+        let mut lines: Vec<String> = Vec::new();
+        let mut updated = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
+                let matches_msg_id = val.get("msg_id").and_then(|v| v.as_str()) == Some(msg_id);
+                if matches_msg_id {
+                    val["recv_ts"] = serde_json::Value::String(recv_ts.to_string());
+                    val["is_pending"] = serde_json::Value::Bool(false);
+                    lines.push(val.to_string());
+                    updated = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+        if updated {
+            let _ = fs::write(&path, lines.join("\n") + "\n");
+        }
+    }
+
+    fn update_history_file_done(&self, peer_id: &str, file_path: &str, recv_ts: &str, from_me: bool) {
+        let path = peer_history_path(peer_id);
+        let Ok(content) = fs::read_to_string(&path) else { return };
+        let mut lines: Vec<String> = Vec::new();
+        let mut updated = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
+                let matches_from = val.get("from_me").and_then(|v| v.as_bool()) == Some(from_me);
+                let matches_file = val
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p == file_path || p.ends_with(file_path) || file_path.ends_with(p))
+                    .unwrap_or(false);
+                if matches_from && matches_file {
+                    val["recv_ts"] = serde_json::Value::String(recv_ts.to_string());
+                    val["is_pending"] = serde_json::Value::Bool(false);
                     lines.push(val.to_string());
                     updated = true;
                     continue;
@@ -1122,9 +1192,9 @@ impl RustleApp {
                 transfer_status: Some("发送中...".to_string()),
                 msg_id: Some(msg_id.clone()),
                 is_read: true,
+                is_pending: false,
+                needs_sync: false,
             });
-
-        self.log_history(id, true, &text, &ts, None, None, None);
 
         let Some(u) = self.users.iter().find(|u| u.id == id) else { return };
         let online = u.online;
@@ -1144,6 +1214,7 @@ impl RustleApp {
             if let (Some(ip), Some(port)) = (ip.as_deref(), port) {
                 self.try_send_message_with_retry(id, &ip, port, &text, &ts, &msg_id, via);
             }
+            self.log_history(id, true, &text, &ts, None, None, None, Some(&msg_id), false, false);
         } else {
             // 离线：排队，并且如果已有地址尝试一次乐观发送
             self.offline_msgs
@@ -1170,9 +1241,13 @@ impl RustleApp {
                 if let Some(msgs) = self.messages.get_mut(id) {
                     if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(&msg_id)) {
                         m.transfer_status = Some("等待对方上线...".to_string());
+                        m.is_pending = true;
                     }
                 }
             }
+
+            // 离线消息：写入历史并标记等待确认
+            self.log_history(id, true, &text, &ts, None, None, None, Some(&msg_id), true, false);
         }
     }
 
@@ -1239,13 +1314,10 @@ impl RustleApp {
                 .entry(peer_id.to_string())
                 .or_default()
                 .push((msg_id.to_string(), deadline));
-        } else {
-            // 所有接口都失败，标记离线
-            self.mark_offline(peer_id);
-            if let Some(msgs) = self.messages.get_mut(peer_id) {
-                if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(msg_id)) {
-                    m.transfer_status = Some("发送失败".to_string());
-                }
+        } else if let Some(msgs) = self.messages.get_mut(peer_id) {
+            if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(msg_id)) {
+                m.transfer_status = Some("未送达".to_string());
+                m.is_pending = true;
             }
         }
     }
@@ -1335,9 +1407,22 @@ impl RustleApp {
                 transfer_status: Some(if sent { "发送中...".to_string() } else { "等待对方上线...".to_string() }),
                 msg_id: None,
                 is_read: true,
+                is_pending: !sent,
+                needs_sync: true,
             });
 
-            self.log_history(&id, true, &text, &ts, None, Some(&path.to_string_lossy()), None);
+            self.log_history(
+                &id,
+                true,
+                &text,
+                &ts,
+                None,
+                Some(&path.to_string_lossy()),
+                None,
+                None,
+                !sent,
+                true,
+            );
         }
     }
 
@@ -1684,8 +1769,21 @@ impl eframe::App for RustleApp {
                                 transfer_status: None,
                                 msg_id: Some(msg_id.clone()),
                                 is_read: false,
+                                is_pending: false,
+                                needs_sync: false,
                             });
-                            self.log_history(&key, false, &text, &send_ts, Some(&recv_ts), None, None);
+                            self.log_history(
+                                &key,
+                                false,
+                                &text,
+                                &send_ts,
+                                Some(&recv_ts),
+                                None,
+                                None,
+                                Some(&msg_id),
+                                false,
+                                false,
+                            );
 
                             // 触发任务栏闪烁
                             if !self.has_unread_messages {
@@ -1768,13 +1866,15 @@ impl eframe::App for RustleApp {
                                 );
                             }
                         }
+                        let ack_ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                         if let Some(msgs) = self.messages.get_mut(&from_id) {
                             if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(&msg_id)) {
                                 m.transfer_status = Some("已送达".to_string());
-                                m.recv_ts =
-                                    Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                                m.recv_ts = Some(ack_ts.clone());
+                                m.is_pending = false;
                             }
                         }
+                        self.update_history_ack(&from_id, &msg_id, &ack_ts);
                         if let Some(queue) = self.offline_msgs.get_mut(&from_id) {
                             queue.retain(|q| q.msg_id.as_deref() != Some(&msg_id));
                         }
@@ -1810,6 +1910,7 @@ impl eframe::App for RustleApp {
                         if let Some(pid) = peer_id {
                             let mut pending_log: Option<(String, String, String)> = None;
                             let mut pending_sync: Option<(String, String, bool)> = None;
+                            let mut pending_file_done: Option<(String, String, bool)> = None;
                             if let Some(msgs) = self.messages.get_mut(&pid) {
                                 if is_incoming {
                                     if is_sync {
@@ -1845,6 +1946,8 @@ impl eframe::App for RustleApp {
                                                 transfer_status: Some(status.clone()),
                                                 msg_id: None,
                                                 is_read: false,
+                                                is_pending: false,
+                                                needs_sync: is_sync,
                                             });
 
                                             if self.logged_incoming_files.insert(log_key.clone()) {
@@ -1891,17 +1994,33 @@ impl eframe::App for RustleApp {
                                     if progress >= 1.0 {
                                         let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                                         msg.last_sync_ts = Some(ts.clone());
+                                        msg.is_pending = false;
                                         if let Some(path) = msg.file_path.clone() {
-                                            pending_sync = Some((path, ts, true));
+                                            pending_sync = Some((path.clone(), ts.clone(), true));
+                                            pending_file_done = Some((path, ts, true));
                                         }
                                     }
                                 }
                             }
                             if let Some((text, ts, path)) = pending_log {
-                                self.log_history(&pid, false, &text, &ts, Some(&ts), Some(&path), None);
+                                self.log_history(
+                                    &pid,
+                                    false,
+                                    &text,
+                                    &ts,
+                                    Some(&ts),
+                                    Some(&path),
+                                    None,
+                                    None,
+                                    false,
+                                    is_sync,
+                                );
                             }
                             if let Some((path, ts, from_me)) = pending_sync {
                                 self.update_history_sync(&pid, &path, &ts, from_me);
+                            }
+                            if let Some((path, ts, from_me)) = pending_file_done {
+                                self.update_history_file_done(&pid, &path, &ts, from_me);
                             }
                         }
                     }
@@ -2284,6 +2403,11 @@ impl eframe::App for RustleApp {
                                             if let Some(status) = &msg.transfer_status {
                                                 ui.separator();
                                                 ui.label(egui::RichText::new(format!("状态: {}", status)).small().color(fg));
+                                            }
+
+                                            if msg.needs_sync {
+                                                ui.separator();
+                                                ui.label(egui::RichText::new("需同步").small().color(fg));
                                             }
 
                                             if let Some(path) = &msg.file_path {

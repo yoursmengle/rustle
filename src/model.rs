@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const KNOWN_PEERS_FILE: &str = "known_peers.json";
-pub const HISTORY_FILE: &str = "history.jsonl";
 pub const SYNC_TREE_FILE: &str = "sync_tree.json";
 pub const RECEIVE_MAP_FILE: &str = "receive_map.json";
 pub const UDP_DISCOVERY_PORT: u16 = 44517;
@@ -35,6 +34,9 @@ pub struct ChatMessage {
     pub transfer_status: Option<String>,
     pub msg_id: Option<String>,
     pub is_read: bool,
+    pub is_pending: bool,  // 是否等待确认
+    #[allow(dead_code)]
+    pub needs_sync: bool,  // 是否需要同步
 }
 
 #[derive(Deserialize)]
@@ -47,6 +49,9 @@ pub struct HistoryEntry {
     pub sync_ts: Option<String>,
     pub ts: Option<String>,
     pub file_path: Option<String>,
+    pub is_pending: Option<bool>,    // 是否等待确认
+    pub needs_sync: Option<bool>,    // 是否需要同步
+    pub msg_id: Option<String>,      // 消息ID，用于追踪确认
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

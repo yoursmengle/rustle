@@ -25,6 +25,19 @@ pub fn data_path(name: &str) -> PathBuf {
     p
 }
 
+pub fn history_dir() -> PathBuf {
+    let mut dir = data_dir();
+    dir.push("history");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+pub fn peer_history_path(peer_id: &str) -> PathBuf {
+    let mut p = history_dir();
+    p.push(format!("{}.jsonl", peer_id));
+    p
+}
+
 fn sync_tree_path() -> PathBuf {
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
