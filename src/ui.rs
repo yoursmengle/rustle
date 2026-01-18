@@ -233,6 +233,8 @@ pub struct RustleApp {
 
     // 离线消息队列
     pub offline_msgs: HashMap<String, Vec<QueuedMsg>>,
+    // 重试发送的待处理列表：peer_id -> due instant
+    pub pending_resend: std::collections::HashMap<String, Instant>,
 
     // 自动同步相关
     pub sync_tree: SyncTree,
@@ -429,10 +431,21 @@ impl RustleApp {
 
     fn update_outgoing_msg_id(&mut self, peer_id: &str, new_id: &str, text: &str) {
         if let Some(msgs) = self.messages.get_mut(peer_id) {
-            if let Some(m) = msgs.iter_mut().rev().find(|m| m.from_me && m.text == text) {
+            let mut target = msgs
+                .iter_mut()
+                .rev()
+                .find(|m| m.from_me && m.msg_id.as_deref() == Some(new_id));
+            if target.is_none() {
+                target = msgs.iter_mut().rev().find(|m| m.from_me && m.text == text);
+            }
+            if let Some(m) = target {
                 m.msg_id = Some(new_id.to_string());
-                if m.transfer_status.is_none() || m.transfer_status.as_deref() == Some("未送达") {
+                if m.transfer_status.is_none()
+                    || m.transfer_status.as_deref() == Some("未送达")
+                    || m.transfer_status.as_deref() == Some("等待对方上线...")
+                {
                     m.transfer_status = Some("发送中...".to_string());
+                    m.is_pending = false;
                 }
             }
         }
@@ -856,6 +869,31 @@ impl RustleApp {
         }
     }
 
+    fn update_history_pending(&self, peer_id: &str, msg_id: &str, is_pending: bool) {
+        let path = peer_history_path(peer_id);
+        let Ok(content) = fs::read_to_string(&path) else { return };
+        let mut lines: Vec<String> = Vec::new();
+        let mut updated = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
+                let matches_msg_id = val.get("msg_id").and_then(|v| v.as_str()) == Some(msg_id);
+                if matches_msg_id {
+                    val["is_pending"] = serde_json::Value::Bool(is_pending);
+                    lines.push(val.to_string());
+                    updated = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+        if updated {
+            let _ = fs::write(&path, lines.join("\n") + "\n");
+        }
+    }
+
     fn flush_offline_queue(&mut self, peer_id: &str, ip: Option<&str>, port: Option<u16>) {
         let Some(ip) = ip else { return };
         let Some(port) = port else { return };
@@ -889,6 +927,7 @@ impl RustleApp {
                     }
                 } else {
                     let mid = msg.msg_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+                    debug_println!("Flushing offline queue for {} mid={} text={}", peer_id, mid, msg.text);
                     self.update_outgoing_msg_id(peer_id, &mid, &msg.text);
 
                     // 使用重试机制发送消息
@@ -901,6 +940,14 @@ impl RustleApp {
                         &mid,
                         via.clone(),
                     );
+
+                    let sent = self
+                        .pending_acks
+                        .get(peer_id)
+                        .map(|list| list.iter().any(|(mid_item, _)| mid_item == &mid))
+                        .unwrap_or(false);
+                    debug_println!("Flush result for {} mid={} sent={} pending_acks_count={}", peer_id, mid, sent, self.pending_acks.get(peer_id).map(|l| l.len()).unwrap_or(0));
+                    self.update_history_pending(peer_id, &mid, !sent);
                 }
             }
             if !remain.is_empty() {
@@ -938,6 +985,83 @@ impl RustleApp {
             }
             if !remain.is_empty() {
                 self.offline_sync.insert(peer_id.to_string(), remain);
+            }
+        }
+    }
+
+    fn resend_pending_for_peer(&mut self, peer_id: &str, ip: &str, port: u16) {
+        // Collect pending messages and prepare them for sending to avoid holding a mutable borrow
+        let via = self.get_best_interface_for_peer(ip);
+        let mut to_send: Vec<(String, String, String)> = Vec::new(); // (mid, text, send_ts)
+
+        if let Some(msgs) = self.messages.get_mut(peer_id) {
+            for m in msgs.iter_mut() {
+                if m.from_me && m.is_pending {
+                    let mid = m.msg_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+                    m.msg_id = Some(mid.clone());
+                    // mark as sending (optimistic)
+                    m.transfer_status = Some("发送中...".to_string());
+                    // keep pending until we see ack
+                    to_send.push((mid, m.text.clone(), m.send_ts.clone()));
+                }
+            }
+        }
+
+        // Now release the borrow on messages and actually attempt sends
+        for (mid, text, send_ts) in to_send {
+            debug_println!("Resend pending message to {}: mid={} text={}", peer_id, mid, text);
+            self.try_send_message_with_retry(peer_id, ip, port, &text, &send_ts, &mid, via.clone());
+
+            // see if it was enqueued for ack
+            let was_sent = self
+                .pending_acks
+                .get(peer_id)
+                .map(|list| list.iter().any(|(mid_item, _)| mid_item == &mid))
+                .unwrap_or(false);
+            debug_println!("Resend result for {} mid={} sent={} pending_acks_count={}", peer_id, mid, was_sent, self.pending_acks.get(peer_id).map(|l| l.len()).unwrap_or(0));
+
+            if was_sent {
+                // update message state
+                if let Some(msgs) = self.messages.get_mut(peer_id) {
+                    if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(&mid)) {
+                        m.is_pending = false;
+                        m.transfer_status = Some("发送中...".to_string());
+                    }
+                }
+                self.update_history_pending(peer_id, &mid, false);
+                // remove from offline queue if any
+                if let Some(queue) = self.offline_msgs.get_mut(peer_id) {
+                    queue.retain(|q| q.msg_id.as_deref() != Some(&mid));
+                }
+            } else {
+                // still not sent, ensure it's queued for offline send and state reflects waiting
+                if let Some(msgs) = self.messages.get_mut(peer_id) {
+                    if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(&mid)) {
+                        m.transfer_status = Some("等待对方上线...".to_string());
+                        m.is_pending = true;
+                    }
+                }
+
+                if let Some(queue) = self.offline_msgs.get_mut(peer_id) {
+                    if !queue.iter().any(|q| q.msg_id.as_deref() == Some(&mid) && q.text == text) {
+                        queue.push(QueuedMsg {
+                            text: text.clone(),
+                            send_ts: send_ts.clone(),
+                            msg_id: Some(mid.clone()),
+                            file_path: None,
+                            is_dir: false,
+                        });
+                    }
+                } else {
+                    self.offline_msgs.insert(peer_id.to_string(), vec![QueuedMsg {
+                        text: text.clone(),
+                        send_ts: send_ts.clone(),
+                        msg_id: Some(mid.clone()),
+                        file_path: None,
+                        is_dir: false,
+                    }]);
+                }
+                self.update_history_pending(peer_id, &mid, true);
             }
         }
     }
@@ -2025,6 +2149,9 @@ impl eframe::App for RustleApp {
                         }
                     }
                     PeerEvent::DiscoverReceived { from_id, from_ip, from_name, peers } => {
+                        let mut flush_targets: Vec<(String, Option<String>, Option<u16>)> = Vec::new();
+                        let mut pending_name_updates: Vec<(String, String, NameSource)> = Vec::new();
+
                         // 确保发送方在线
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == from_id) {
                             u.online = true;
@@ -2032,8 +2159,11 @@ impl eframe::App for RustleApp {
                                 u.ip = Some(from_ip.clone());
                                 self.known_dirty = true;
                             }
+                            if u.port.is_none() {
+                                u.port = Some(UDP_MESSAGE_PORT);
+                            }
                             if let Some(name) = from_name.clone() {
-                                self.apply_name_update(&from_id, &name, NameSource::Direct);
+                                pending_name_updates.push((from_id.clone(), name, NameSource::Direct));
                             }
                         } else {
                             self.users.push(User {
@@ -2050,6 +2180,14 @@ impl eframe::App for RustleApp {
                             self.messages.entry(from_id.clone()).or_default();
                             self.offline_msgs.entry(from_id.clone()).or_default();
                             self.known_dirty = true;
+                            if let Some(name) = from_name.clone() {
+                                pending_name_updates.push((from_id.clone(), name, NameSource::Direct));
+                            }
+                        }
+
+                        // 发送方上线后立即刷新离线队列
+                        if let Some(u) = self.users.iter().find(|u| u.id == from_id) {
+                            flush_targets.push((from_id.clone(), u.ip.clone(), u.port));
                         }
 
                         // 合并 peers 列表
@@ -2068,9 +2206,13 @@ impl eframe::App for RustleApp {
                                         self.known_dirty = true;
                                     }
                                 }
-                                if let Some(name) = p.name.clone() {
-                                    self.apply_name_update(&p.id, &name, NameSource::Indirect);
+                                if u.port.is_none() {
+                                    u.port = Some(UDP_MESSAGE_PORT);
                                 }
+                                if let Some(name) = p.name.clone() {
+                                    pending_name_updates.push((p.id.clone(), name, NameSource::Indirect));
+                                }
+                                flush_targets.push((p.id.clone(), u.ip.clone(), u.port));
                             } else {
                                 self.users.push(User {
                                     id: p.id.clone(),
@@ -2087,9 +2229,28 @@ impl eframe::App for RustleApp {
                                 self.offline_msgs.entry(p.id.clone()).or_default();
                                 self.known_dirty = true;
                                 if p.name.is_some() {
-                                    self.name_source.insert(p.id.clone(), NameSource::Indirect);
+                                    pending_name_updates.push((
+                                        p.id.clone(),
+                                        p.name.clone().unwrap_or_default(),
+                                        NameSource::Indirect,
+                                    ));
                                 }
+                                flush_targets.push((p.id.clone(), p.ip.clone(), Some(UDP_MESSAGE_PORT)));
                             }
+                        }
+
+                        for (id, ip, port) in flush_targets {
+                            let ip_opt = ip.as_deref();
+                            self.flush_offline_queue(&id, ip_opt, port);
+                            self.flush_offline_sync(&id, ip_opt);
+                            self.flush_offline_name_updates(&id, ip_opt);
+                            if let (Some(ip_str), Some(port_val)) = (ip_opt, port) {
+                                self.resend_pending_for_peer(&id, ip_str, port_val);
+                            }
+                        }
+
+                        for (id, name, source) in pending_name_updates {
+                            self.apply_name_update(&id, &name, source);
                         }
                     }
                     PeerEvent::PeerOnline { id, ip } => {
@@ -2099,12 +2260,17 @@ impl eframe::App for RustleApp {
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
                             u.online = true;
                             u.ip = Some(ip.clone());
+                            if u.port.is_none() {
+                                u.port = Some(UDP_MESSAGE_PORT);
+                            }
                             self.known_dirty = true;
                             let ip_opt = u.ip.clone();
                             let port_opt = u.port;
                             self.flush_offline_queue(&id, ip_opt.as_deref(), port_opt);
                             self.flush_offline_sync(&id, ip_opt.as_deref());
                             self.flush_offline_name_updates(&id, ip_opt.as_deref());
+                            // schedule a follow-up resend in 1s to let network stabilize
+                            self.pending_resend.insert(id.clone(), Instant::now() + Duration::from_secs(1));
                         } else {
                             self.users.push(User {
                                 id: id.clone(),
@@ -2634,29 +2800,15 @@ impl eframe::App for RustleApp {
         }
         if !timeouts.is_empty() {
             for (peer, msg_id) in &timeouts {
-                let (retry_data, offline_data) = {
-                    let user_addr = self
-                        .users
-                        .iter()
-                        .find(|u| &u.id == peer)
-                        .and_then(|u| u.ip.clone().and_then(|ip| u.port.map(|port| (ip, port))));
+                let mut offline_data = None;
 
-                    let mut retry_data = None;
-                    let mut offline_data = None;
-
-                    if let Some(msgs) = self.messages.get_mut(peer) {
-                        if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(msg_id)) {
-                            if let Some((ip, port)) = user_addr {
-                                retry_data = Some((ip, port, m.text.clone(), m.send_ts.clone()));
-                            } else {
-                                m.transfer_status = Some("未送达".to_string());
-                                offline_data = Some((m.text.clone(), m.send_ts.clone()));
-                            }
-                        }
+                if let Some(msgs) = self.messages.get_mut(peer) {
+                    if let Some(m) = msgs.iter_mut().rev().find(|m| m.msg_id.as_deref() == Some(msg_id)) {
+                        m.transfer_status = Some("等待对方上线...".to_string());
+                        m.is_pending = true;
+                        offline_data = Some((m.text.clone(), m.send_ts.clone()));
                     }
-
-                    (retry_data, offline_data)
-                };
+                }
 
                 if let Some((text, send_ts)) = offline_data {
                     self.offline_msgs.entry(peer.clone()).or_default().push(QueuedMsg {
@@ -2666,12 +2818,7 @@ impl eframe::App for RustleApp {
                         file_path: None,
                         is_dir: false,
                     });
-                }
-
-                if let Some((ip, port, text, send_ts)) = retry_data {
-                    debug_println!("Message timeout for {}, attempting retry via different interfaces", peer);
-                    self.try_send_message_with_retry(peer, &ip, port, &text, &send_ts, msg_id, None);
-                    continue;
+                    self.update_history_pending(peer, msg_id, true);
                 }
 
                 self.mark_offline(peer);
@@ -2681,6 +2828,30 @@ impl eframe::App for RustleApp {
                     list.retain(|(mid, _)| mid != &msg_id);
                 }
             }
+        }
+
+        // 检查计划的重试任务（用于在对方上线后一段短时间再重试）
+        let now_instant = Instant::now();
+        let mut due_resend: Vec<String> = Vec::new();
+        for (peer, due) in self.pending_resend.iter() {
+            if *due <= now_instant {
+                due_resend.push(peer.clone());
+            }
+        }
+        for peer in due_resend.iter() {
+            // Clone ip/port to avoid holding an immutable borrow while calling mutable method
+            if let Some((ip_clone, port_clone)) = self
+                .users
+                .iter()
+                .find(|u| u.id == *peer)
+                .and_then(|u| Some((u.ip.clone(), u.port)))
+            {
+                if let (Some(ip), Some(port)) = (ip_clone.as_deref(), port_clone) {
+                    debug_println!("Scheduled resend for {}", peer);
+                    self.resend_pending_for_peer(peer, ip, port);
+                }
+            }
+            self.pending_resend.remove(peer);
         }
 
         // 清理长时间离线的 peers（例如 120 秒未见）
