@@ -1740,6 +1740,9 @@ impl eframe::App for RustleApp {
                                                     local_path.as_deref().unwrap_or(file_name.as_str());
                                                 pending_log = Some((text, ts, path_for_history.to_string()));
                                             }
+                                            if self.selected_user_id.as_deref() == Some(&pid) {
+                                                self.scroll_to_bottom = true;
+                                            }
                                         } else if let Some(msg) = msgs.iter_mut().rev().find(|m| {
                                             !m.from_me
                                                 && (m.file_path.as_ref().map(|p| p.ends_with(&file_name)).unwrap_or(false)
