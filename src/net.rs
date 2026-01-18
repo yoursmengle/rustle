@@ -1,7 +1,7 @@
 use crate::model::{
-    AckPayload, ChatPayload, DiscoveredPeer, DiscoverPayload, FileCmd, HelloMsg, NameUpdatePayload,
-    NetCmd, PeerBrief, PeerEvent, PeerSnapshot, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT,
-    UDP_MESSAGE_PORT,
+    AckPayload, ByePayload, ChatPayload, DiscoveredPeer, DiscoverPayload, FileCmd, HeartbeatPayload,
+    HelloMsg, NameUpdatePayload, NetCmd, PeerBrief, PeerEvent, PeerSnapshot, SyncPayload,
+    TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT, UDP_MESSAGE_PORT,
 };
 use crate::storage::load_or_init_node_id;
 use crate::transfer::{handle_incoming_file, handle_outgoing_file};
@@ -16,7 +16,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
-pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>, initial_name: Option<String>) {
+pub fn spawn_network_worker(
+    peer_tx: Sender<PeerEvent>,
+    cmd_rx: Receiver<NetCmd>,
+    initial_name: Option<String>,
+    known_peers: Vec<PeerBrief>,
+) {
     thread::spawn(move || {
         let my_id = load_or_init_node_id();
         let my_id_clone = my_id.clone();
@@ -215,12 +220,17 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
         let mut last_from_peer: HashMap<String, Instant> = HashMap::new();
         let mut peers_seen: HashMap<String, (IpAddr, u16)> = HashMap::new();
 
-        let send_hello =
-            |sock: &UdpSocket, target: SocketAddr, name: &str, my_id: &str, is_probe: bool| {
+        let send_hello = |sock: &UdpSocket,
+                          target: SocketAddr,
+                          name: &str,
+                          my_id: &str,
+                          list_hash: u64,
+                          is_probe: bool| {
                 let msg = HelloMsg {
                     msg_type: "hello".to_string(),
                     id: my_id.to_string(),
                     name: if name.is_empty() { None } else { Some(name.to_string()) },
+                    list_hash,
                     port: UDP_MESSAGE_PORT,
                     tcp_port: Some(TCP_FILE_PORT),
                     version: "0.1".to_string(),
@@ -284,10 +294,34 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
 
         let mut last_broadcast = Instant::now();
         let mut last_discover_tick = Instant::now();
+        let mut last_heartbeat_tick = Instant::now();
+
+        let startup_list_hash = {
+            let mut ids: Vec<String> = known_peers.iter().map(|p| p.id.clone()).collect();
+            ids.push(my_id.clone());
+            ids.sort();
+            let mut hasher = crc32fast::Hasher::new();
+            for id in ids {
+                hasher.update(id.as_bytes());
+                hasher.update(&[0]);
+            }
+            hasher.finalize() as u64
+        };
+
+        for peer in &known_peers {
+            if let Some(ip) = &peer.ip {
+                if let Ok(ipaddr) = ip.parse::<IpAddr>() {
+                    let target = SocketAddr::new(ipaddr, UDP_DISCOVERY_PORT);
+                    for (sock, _ip) in &discovery_sockets {
+                        send_hello(sock, target, &our_name, &my_id, startup_list_hash, false);
+                    }
+                }
+            }
+        }
 
         for (sock, _ip) in &discovery_sockets {
             for addr in &base_targets {
-                send_hello(sock, *addr, &our_name, &my_id, true);
+                send_hello(sock, *addr, &our_name, &my_id, startup_list_hash, true);
             }
         }
 
@@ -296,8 +330,22 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
         let mut peer_snapshots: HashMap<String, PeerSnapshot> = HashMap::new();
         let mut online_count: usize = 0;
         let mut last_reply: HashMap<String, Instant> = HashMap::new();
-        let mut last_sent: HashMap<String, Instant> = HashMap::new();
         let mut miss_count: HashMap<String, u8> = HashMap::new();
+
+        for peer in &known_peers {
+            if peer.id == my_id {
+                continue;
+            }
+            peer_snapshots.insert(
+                peer.id.clone(),
+                PeerSnapshot {
+                    id: peer.id.clone(),
+                    ip: peer.ip.clone(),
+                    online: false,
+                    name: peer.name.clone(),
+                },
+            );
+        }
 
         let build_peer_list = |peers: &HashMap<String, PeerSnapshot>| -> Vec<PeerBrief> {
             peers
@@ -309,6 +357,47 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                     name: p.name.clone(),
                 })
                 .collect()
+        };
+
+        let compute_list_hash = |peers: &HashMap<String, PeerSnapshot>, my_id: &str| -> u64 {
+            let mut ids: Vec<String> = peers.keys().cloned().collect();
+            ids.push(my_id.to_string());
+            ids.sort();
+            let mut hasher = crc32fast::Hasher::new();
+            for id in ids {
+                hasher.update(id.as_bytes());
+                hasher.update(&[0]);
+            }
+            hasher.finalize() as u64
+        };
+
+        let compute_offline_hash = |peers: &HashMap<String, PeerSnapshot>| -> u64 {
+            let mut ids: Vec<String> = peers
+                .values()
+                .filter(|p| !p.online)
+                .map(|p| p.id.clone())
+                .collect();
+            ids.sort();
+            let mut hasher = crc32fast::Hasher::new();
+            for id in ids {
+                hasher.update(id.as_bytes());
+                hasher.update(&[0]);
+            }
+            hasher.finalize() as u64
+        };
+
+        let build_sync_list = |peers: &HashMap<String, PeerSnapshot>, my_id: &str, my_name: &str| {
+            let mut list = build_peer_list(peers);
+            list.push(PeerBrief {
+                id: my_id.to_string(),
+                ip: None,
+                name: if my_name.is_empty() {
+                    None
+                } else {
+                    Some(my_name.to_string())
+                },
+            });
+            list
         };
 
         let send_discover = |sock: &UdpSocket,
@@ -329,14 +418,61 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
             }
         };
 
+        let send_heartbeat = |sock: &UdpSocket,
+                              target: SocketAddr,
+                              my_id: &str,
+                              my_name: &str,
+                              list_hash: u64,
+                              offline_hash: u64,
+                              online_count: u32,
+                              offline_count: u32| {
+            let payload = HeartbeatPayload {
+                msg_type: "heartbeat".to_string(),
+                id: my_id.to_string(),
+                list_hash,
+                offline_hash,
+                online_count,
+                offline_count,
+                name: if my_name.is_empty() { None } else { Some(my_name.to_string()) },
+            };
+            if let Ok(data) = serde_json::to_vec(&payload) {
+                let _ = sock.send_to(&data, target);
+            }
+        };
+
+        let _send_bye = |sock: &UdpSocket, target: SocketAddr, my_id: &str| {
+            let payload = ByePayload {
+                msg_type: "bye".to_string(),
+                id: my_id.to_string(),
+            };
+            if let Ok(data) = serde_json::to_vec(&payload) {
+                let _ = sock.send_to(&data, target);
+            }
+        };
+
+        let send_sync = |sock: &UdpSocket,
+                         target: SocketAddr,
+                         my_id: &str,
+                         peers: &[PeerBrief]| {
+            let payload = SyncPayload {
+                msg_type: "sync".to_string(),
+                from_id: my_id.to_string(),
+                peers: peers.to_vec(),
+            };
+            if let Ok(data) = serde_json::to_vec(&payload) {
+                let _ = sock.send_to(&data, target);
+            }
+        };
+
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     NetCmd::ChangeName(new_name) => {
                         our_name = new_name;
+                        let list_hash = compute_list_hash(&peer_snapshots, &my_id);
                         for (sock, _ip) in &discovery_sockets {
                             for addr in &base_targets {
-                                send_hello(sock, *addr, &our_name, &my_id, true);
+                                send_hello(sock, *addr, &our_name, &my_id, list_hash, true);
                             }
                         }
                     }
@@ -380,13 +516,14 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                             }
                             let target = SocketAddr::new(ipaddr, UDP_DISCOVERY_PORT);
                             eprintln!("Probing known peer {}", target);
+                            let list_hash = compute_list_hash(&peer_snapshots, &my_id);
                             for (sock, _ip) in &discovery_sockets {
                                 if let Some(v) = &via {
                                     if _ip.to_string() != *v {
                                         continue;
                                     }
                                 }
-                                send_hello(sock, target, &our_name, &my_id, false);
+                                send_hello(sock, target, &our_name, &my_id, list_hash, false);
                             }
                         }
                     }
@@ -470,51 +607,56 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                 }
             }
 
-            if last_discover_tick.elapsed() >= Duration::from_secs(1) {
-                last_discover_tick = Instant::now();
-                let peers_list = build_peer_list(&peer_snapshots);
-                for (peer_id, p) in &peer_snapshots {
-                    let Some(ip) = p.ip.clone() else { continue };
-                    if let Ok(ipaddr) = ip.parse::<IpAddr>() {
-                        let target = SocketAddr::new(ipaddr, UDP_DISCOVERY_PORT);
-                        for (sock, _ip) in &discovery_sockets {
-                            send_discover(sock, target, &my_id, &our_name, &peers_list, false);
-                        }
-                        last_sent.insert(peer_id.clone(), Instant::now());
-                    }
-                }
-
-                let now = Instant::now();
-                for (peer_id, p) in peer_snapshots.iter() {
-                    if !p.online {
-                        continue;
-                    }
-                    let last_rep = last_reply.get(peer_id).cloned();
-                    let last_s = last_sent.get(peer_id).cloned();
-                    let missed = match (last_rep, last_s) {
-                        (Some(r), Some(s)) => r < s && now.duration_since(s) >= Duration::from_secs(1),
-                        (None, Some(_)) => true,
-                        _ => false,
-                    };
-                    if missed {
-                        let c = miss_count.entry(peer_id.clone()).or_insert(0);
-                        *c = c.saturating_add(1);
-                        if *c >= 3 {
-                            let _ = peer_tx.send(PeerEvent::PeerOffline { id: peer_id.clone() });
-                            *c = 0;
-                        }
-                    } else {
-                        miss_count.insert(peer_id.clone(), 0);
+            if last_heartbeat_tick.elapsed() >= Duration::from_secs(5) {
+                last_heartbeat_tick = Instant::now();
+                let list_hash = compute_list_hash(&peer_snapshots, &my_id);
+                let offline_hash = compute_offline_hash(&peer_snapshots);
+                let online_count_u32 = peer_snapshots.values().filter(|p| p.online).count() as u32;
+                let offline_count_u32 = peer_snapshots.values().filter(|p| !p.online).count() as u32;
+                for (sock, _ip) in &discovery_sockets {
+                    for addr in &base_targets {
+                        send_heartbeat(
+                            sock,
+                            *addr,
+                            &my_id,
+                            &our_name,
+                            list_hash,
+                            offline_hash,
+                            online_count_u32,
+                            offline_count_u32,
+                        );
                     }
                 }
             }
 
-            if online_count == 0 && last_broadcast.elapsed() >= Duration::from_secs(5) {
+            if last_discover_tick.elapsed() >= Duration::from_secs(1) {
+                last_discover_tick = Instant::now();
+                let now = Instant::now();
+                let mut removed: Vec<String> = Vec::new();
+                for (peer_id, last_seen) in last_from_peer.iter() {
+                    if now.duration_since(*last_seen) > Duration::from_secs(15) {
+                        removed.push(peer_id.clone());
+                    }
+                }
+                for peer_id in removed {
+                    last_from_peer.remove(&peer_id);
+                    miss_count.remove(&peer_id);
+                    if let Some(p) = peer_snapshots.get_mut(&peer_id) {
+                        if p.online {
+                            p.online = false;
+                            let _ = peer_tx.send(PeerEvent::PeerOffline { id: peer_id.clone() });
+                        }
+                    }
+                }
+                online_count = peer_snapshots.values().filter(|p| p.online).count();
+            }
+
+            if online_count == 0 && last_broadcast.elapsed() >= Duration::from_secs(3) {
                 last_broadcast = Instant::now();
-                let peers_list = build_peer_list(&peer_snapshots);
+                let list_hash = compute_list_hash(&peer_snapshots, &my_id);
                 for (sock, _ip) in &discovery_sockets {
                     for addr in &base_targets {
-                        send_discover(sock, *addr, &my_id, &our_name, &peers_list, false);
+                        send_hello(sock, *addr, &our_name, &my_id, list_hash, true);
                     }
                 }
             }
@@ -541,11 +683,26 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                             h.id.clone()
                                                         };
                                                         let now = Instant::now();
+                                                        let first_seen = !peers_seen.contains_key(&pid);
                                                         last_from_peer.insert(pid.clone(), now);
                                                         peers_seen.insert(
                                                             pid.clone(),
                                                             (src.ip(), UDP_DISCOVERY_PORT),
                                                         );
+
+                                                        let entry = peer_snapshots.entry(pid.clone()).or_insert(
+                                                            PeerSnapshot {
+                                                                id: pid.clone(),
+                                                                ip: Some(src.ip().to_string()),
+                                                                online: true,
+                                                                name: h.name.clone(),
+                                                            },
+                                                        );
+                                                        entry.ip = Some(src.ip().to_string());
+                                                        entry.online = true;
+                                                        if h.name.is_some() {
+                                                            entry.name = h.name.clone();
+                                                        }
 
                                                         let peer = DiscoveredPeer {
                                                             id: pid.clone(),
@@ -575,6 +732,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                                 } else {
                                                                     Some(our_name.clone())
                                                                 },
+                                                                list_hash: compute_list_hash(&peer_snapshots, &my_id),
                                                                 port: UDP_MESSAGE_PORT,
                                                                 tcp_port: Some(TCP_FILE_PORT),
                                                                 version: "0.1".to_string(),
@@ -586,7 +744,140 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                                 target,
                                                             );
                                                         }
+
+                                                        let local_hash = compute_list_hash(&peer_snapshots, &my_id);
+                                                        if h.list_hash != 0 && h.list_hash != local_hash {
+                                                            let target =
+                                                                SocketAddr::new(src.ip(), UDP_DISCOVERY_PORT);
+                                                            let sync_list =
+                                                                build_sync_list(&peer_snapshots, &my_id, &our_name);
+                                                            for (sock, _ip) in &discovery_sockets {
+                                                                send_sync(sock, target, &my_id, &sync_list);
+                                                            }
+                                                        }
+
+                                                        if first_seen {
+                                                            let _ = peer_tx.send(PeerEvent::PeerOnline {
+                                                                id: pid.clone(),
+                                                                ip: src.ip().to_string(),
+                                                            });
+                                                        }
+
+                                                        online_count =
+                                                            peer_snapshots.values().filter(|p| p.online).count();
                                                     }
+                                                }
+                                            }
+                                            "heartbeat" => {
+                                                if let Ok(hb) =
+                                                    serde_json::from_value::<HeartbeatPayload>(v)
+                                                {
+                                                    if hb.id == my_id {
+                                                        continue;
+                                                    }
+                                                    last_from_peer.insert(hb.id.clone(), Instant::now());
+                                                    peers_seen.insert(
+                                                        hb.id.clone(),
+                                                        (src.ip(), UDP_DISCOVERY_PORT),
+                                                    );
+                                                    let entry = peer_snapshots.entry(hb.id.clone()).or_insert(
+                                                        PeerSnapshot {
+                                                            id: hb.id.clone(),
+                                                            ip: Some(src.ip().to_string()),
+                                                            online: true,
+                                                            name: hb.name.clone(),
+                                                        },
+                                                    );
+                                                    entry.ip = Some(src.ip().to_string());
+                                                    entry.online = true;
+                                                    if hb.name.is_some() {
+                                                        entry.name = hb.name.clone();
+                                                    }
+
+                                                    online_count =
+                                                        peer_snapshots.values().filter(|p| p.online).count();
+
+                                                    let local_hash =
+                                                        compute_list_hash(&peer_snapshots, &my_id);
+                                                    let local_offline_hash =
+                                                        compute_offline_hash(&peer_snapshots);
+                                                    if hb.list_hash != local_hash
+                                                        || hb.offline_hash != local_offline_hash
+                                                    {
+                                                        let target =
+                                                            SocketAddr::new(src.ip(), UDP_DISCOVERY_PORT);
+                                                        let sync_list = build_sync_list(
+                                                            &peer_snapshots,
+                                                            &my_id,
+                                                            &our_name,
+                                                        );
+                                                        for (sock, _ip) in &discovery_sockets {
+                                                            send_sync(sock, target, &my_id, &sync_list);
+                                                        }
+                                                    }
+
+                                                    let _ = peer_tx.send(PeerEvent::PeerOnline {
+                                                        id: hb.id.clone(),
+                                                        ip: src.ip().to_string(),
+                                                    });
+                                                }
+                                            }
+                                            "bye" => {
+                                                if let Ok(b) = serde_json::from_value::<ByePayload>(v) {
+                                                    if b.id == my_id {
+                                                        continue;
+                                                    }
+                                                    last_from_peer.remove(&b.id);
+                                                    miss_count.remove(&b.id);
+                                                    if let Some(p) = peer_snapshots.get_mut(&b.id) {
+                                                        if p.online {
+                                                            p.online = false;
+                                                            let _ = peer_tx.send(PeerEvent::PeerOffline {
+                                                                id: b.id.clone(),
+                                                            });
+                                                        }
+                                                    }
+                                                    online_count =
+                                                        peer_snapshots.values().filter(|p| p.online).count();
+                                                }
+                                            }
+                                            "sync" => {
+                                                if let Ok(s) = serde_json::from_value::<SyncPayload>(v) {
+                                                    if s.from_id == my_id {
+                                                        continue;
+                                                    }
+                                                    for p in s.peers.iter() {
+                                                        if p.id == my_id || p.id.is_empty() {
+                                                            continue;
+                                                        }
+                                                        let entry = peer_snapshots
+                                                            .entry(p.id.clone())
+                                                            .or_insert(PeerSnapshot {
+                                                                id: p.id.clone(),
+                                                                ip: p.ip.clone(),
+                                                                online: true,
+                                                                name: p.name.clone(),
+                                                            });
+                                                        if p.ip.is_some() {
+                                                            entry.ip = p.ip.clone();
+                                                        }
+                                                        if p.name.is_some() {
+                                                            entry.name = p.name.clone();
+                                                        }
+                                                        entry.online = true;
+                                                        last_from_peer
+                                                            .insert(p.id.clone(), Instant::now());
+                                                    }
+
+                                                    online_count =
+                                                        peer_snapshots.values().filter(|p| p.online).count();
+
+                                                    let _ = peer_tx.send(PeerEvent::DiscoverReceived {
+                                                        from_id: s.from_id.clone(),
+                                                        from_ip: src.ip().to_string(),
+                                                        from_name: None,
+                                                        peers: s.peers.clone(),
+                                                    });
                                                 }
                                             }
                                             "chat" => {

@@ -168,7 +168,16 @@ pub fn run() -> eframe::Result<()> {
             let (peer_tx, peer_rx) = mpsc::channel();
             let (cmd_tx, cmd_rx) = mpsc::channel();
             let initial_name = app.me_name.clone();
-            spawn_network_worker(peer_tx, cmd_rx, initial_name);
+            let known_peers: Vec<crate::model::PeerBrief> = app
+                .users
+                .iter()
+                .map(|u| crate::model::PeerBrief {
+                    id: u.id.clone(),
+                    ip: u.ip.clone(),
+                    name: Some(u.name.clone()),
+                })
+                .collect();
+            spawn_network_worker(peer_tx, cmd_rx, initial_name, known_peers);
             app.peer_rx = Some(peer_rx);
             app.net_cmd_tx = Some(cmd_tx);
 

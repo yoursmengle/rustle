@@ -205,6 +205,8 @@ pub struct HelloMsg {
     pub msg_type: String,
     pub id: String,
     pub name: Option<String>,
+    #[serde(default)]
+    pub list_hash: u64,
     pub port: u16,
     pub tcp_port: Option<u16>,
     pub version: String,
@@ -212,6 +214,30 @@ pub struct HelloMsg {
     pub is_reply: bool,
     #[serde(default)]
     pub is_probe: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct HeartbeatPayload {
+    pub msg_type: String,
+    pub id: String,
+    pub list_hash: u64,
+    pub offline_hash: u64,
+    pub online_count: u32,
+    pub offline_count: u32,
+    pub name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ByePayload {
+    pub msg_type: String,
+    pub id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SyncPayload {
+    pub msg_type: String,
+    pub from_id: String,
+    pub peers: Vec<PeerBrief>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
