@@ -1817,16 +1817,24 @@ impl eframe::App for RustleApp {
                             }
                         }
                     }
-                    PeerEvent::DiscoverReceived { from_id, from_ip, peers } => {
+                    PeerEvent::DiscoverReceived { from_id, from_ip, from_name, peers } => {
                         // 确保发送方在线
                         if let Some(u) = self.users.iter_mut().find(|u| u.id == from_id) {
                             u.online = true;
-                            u.ip = Some(from_ip.clone());
-                            self.known_dirty = true;
+                            if u.ip.as_deref() != Some(&from_ip) {
+                                u.ip = Some(from_ip.clone());
+                                self.known_dirty = true;
+                            }
+                            if let Some(name) = from_name.clone() {
+                                if !name.trim().is_empty() && u.name != name {
+                                    u.name = name;
+                                    self.known_dirty = true;
+                                }
+                            }
                         } else {
                             self.users.push(User {
                                 id: from_id.clone(),
-                                name: from_id.clone(),
+                                name: from_name.clone().unwrap_or_else(|| from_id.clone()),
                                 online: true,
                                 ip: Some(from_ip.clone()),
                                 port: Some(UDP_MESSAGE_PORT),
@@ -1850,11 +1858,15 @@ impl eframe::App for RustleApp {
                             }
                             if let Some(u) = self.users.iter_mut().find(|u| u.id == p.id) {
                                 if let Some(ip) = p.ip.clone() {
-                                    u.ip = Some(ip);
+                                    if u.ip.as_deref() != Some(&ip) {
+                                        u.ip = Some(ip);
+                                        self.known_dirty = true;
+                                    }
                                 }
                                 if let Some(name) = p.name.clone() {
-                                    if !name.trim().is_empty() {
+                                    if !name.trim().is_empty() && u.name != name {
                                         u.name = name;
+                                        self.known_dirty = true;
                                     }
                                 }
                             } else {

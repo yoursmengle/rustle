@@ -623,6 +623,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                     let _ = peer_tx.send(PeerEvent::DiscoverReceived {
                                                         from_id: d.from_id.clone(),
                                                         from_ip: src.ip().to_string(),
+                                                        from_name: d.from_name.clone(),
                                                         peers: d.peers.clone(),
                                                     });
 

@@ -175,6 +175,7 @@ pub enum PeerEvent {
     DiscoverReceived {
         from_id: String,
         from_ip: String,
+        from_name: Option<String>,
         peers: Vec<PeerBrief>,
     },
     PeerOnline {
