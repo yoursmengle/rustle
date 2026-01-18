@@ -302,6 +302,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
         let build_peer_list = |peers: &HashMap<String, PeerSnapshot>| -> Vec<PeerBrief> {
             peers
                 .values()
+                .filter(|p| p.online)
                 .map(|p| PeerBrief {
                     id: p.id.clone(),
                     ip: p.ip.clone(),
@@ -1090,15 +1091,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
         let mut last_sent: HashMap<String, Instant> = HashMap::new();
         let mut miss_count: HashMap<String, u8> = HashMap::new();
 
-        let build_peer_list = || -> Vec<PeerBrief> {
-            peer_snapshots
-                .values()
-                .map(|p| PeerBrief {
-                    id: p.id.clone(),
-                    ip: p.ip.clone(),
-                })
-                .collect()
-        };
+        let build_peer_list = || -> Vec<PeerBrief> { peer_snapshots.values().filter(|p| p.online).map(|p| PeerBrief { id: p.id.clone(), ip: p.ip.clone(), name: p.name.clone(), }).collect() };
 
         let send_discover = |sock: &UdpSocket,
                              target: SocketAddr,
@@ -1900,15 +1893,7 @@ use get_if_addrs::get_if_addrs;
         let mut last_sent: HashMap<String, Instant> = HashMap::new();
         let mut miss_count: HashMap<String, u8> = HashMap::new();
 
-        let build_peer_list = || -> Vec<PeerBrief> {
-            peer_snapshots
-                .values()
-                .map(|p| PeerBrief {
-                    id: p.id.clone(),
-                    ip: p.ip.clone(),
-                })
-                .collect()
-        };
+        let build_peer_list = || -> Vec<PeerBrief> { peer_snapshots.values().filter(|p| p.online).map(|p| PeerBrief { id: p.id.clone(), ip: p.ip.clone(), name: p.name.clone(), }).collect() };
 
         let send_discover = |sock: &UdpSocket,
                              target: SocketAddr,
@@ -2335,3 +2320,4 @@ mod tests {
 }
 
 */
+
