@@ -1933,6 +1933,7 @@ impl eframe::App for RustleApp {
                                 continue;
                             }
                             if let Some(u) = self.users.iter_mut().find(|u| u.id == p.id) {
+                                u.online = true;  // 从 peers 列表来的用户应标记为在线
                                 if let Some(ip) = p.ip.clone() {
                                     if u.ip.as_deref() != Some(&ip) {
                                         u.ip = Some(ip);
@@ -1946,7 +1947,7 @@ impl eframe::App for RustleApp {
                                 self.users.push(User {
                                     id: p.id.clone(),
                                     name: p.name.clone().unwrap_or_else(|| p.id.clone()),
-                                    online: false,
+                                    online: true,
                                     ip: p.ip.clone(),
                                     port: Some(UDP_MESSAGE_PORT),
                                     tcp_port: None,
