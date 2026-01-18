@@ -1,6 +1,6 @@
 use crate::model::{
-    AckPayload, ChatPayload, DiscoveredPeer, DiscoverPayload, FileCmd, HelloMsg, NetCmd,
-    PeerBrief, PeerEvent, PeerSnapshot, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT,
+    AckPayload, ChatPayload, DiscoveredPeer, DiscoverPayload, FileCmd, HelloMsg, NameUpdatePayload,
+    NetCmd, PeerBrief, PeerEvent, PeerSnapshot, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT,
     UDP_MESSAGE_PORT,
 };
 use crate::storage::load_or_init_node_id;
@@ -389,12 +389,15 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                             }
                         }
                     }
-                    NetCmd::SendChat { ip, text, ts, via, msg_id } => {
+                    NetCmd::SendChat { ip, text, ts, via, msg_id, local_ip } => {
                         let payload = ChatPayload {
                             msg_type: "chat".to_string(),
                             msg_id: msg_id.clone(),
                             from_id: my_id.clone(),
                             from_name: if our_name.is_empty() { None } else { Some(our_name.clone()) },
+                            from_ip: local_ip.clone().or_else(|| {
+                                via.clone().or_else(|| chat_sockets.first().map(|(_, ip)| ip.to_string()))
+                            }),
                             text: text.clone(),
                             timestamp: ts.clone(),
                         };
@@ -434,6 +437,32 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                     "Net discovery: failed to send chat to {} - no suitable interface found",
                                     target
                                 );
+                            }
+                        }
+                    }
+                    NetCmd::SendNameUpdate { ip, via, name, local_ip } => {
+                        let payload = NameUpdatePayload {
+                            msg_type: "name_update".to_string(),
+                            from_id: my_id.clone(),
+                            from_name: name.clone(),
+                            from_ip: local_ip.clone().or_else(|| via.clone()),
+                        };
+                        if let Ok(data) = serde_json::to_vec(&payload) {
+                            let target = match ip.parse::<IpAddr>() {
+                                Ok(ipaddr) => SocketAddr::new(ipaddr, UDP_MESSAGE_PORT),
+                                Err(_) => continue,
+                            };
+                            if let Some(v) = &via {
+                                for (sock, _ip) in &chat_sockets {
+                                    if _ip.to_string() == *v {
+                                        let _ = sock.send_to(&data, target);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                for (sock, _ip) in &chat_sockets {
+                                    let _ = sock.send_to(&data, target);
+                                }
                             }
                         }
                     }
@@ -570,6 +599,15 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                         msg_type: "ack".to_string(),
                                                         msg_id: c.msg_id.clone(),
                                                         from_id: my_id.clone(),
+                                                        from_name: if our_name.is_empty() {
+                                                            None
+                                                        } else {
+                                                            Some(our_name.clone())
+                                                        },
+                                                        from_ip: sock
+                                                            .local_addr()
+                                                            .ok()
+                                                            .map(|a| a.ip().to_string()),
                                                     };
                                                     if let Ok(ack_data) = serde_json::to_vec(&ack) {
                                                         let ack_target_std =
@@ -584,6 +622,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                         from_id: c.from_id.clone(),
                                                         from_ip: src.ip().to_string(),
                                                         from_port: src.port(),
+                                                        from_name: c.from_name.clone(),
                                                         text: c.text.clone(),
                                                         send_ts: c.timestamp.clone(),
                                                         recv_ts: Local::now()
@@ -601,9 +640,29 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                     }
                                                     last_from_peer
                                                         .insert(a.from_id.clone(), Instant::now());
+                                                    let from_id = a.from_id.clone();
                                                     let _ = peer_tx.send(PeerEvent::ChatAck {
-                                                        from_id: a.from_id,
+                                                        from_id: from_id.clone(),
                                                         msg_id: a.msg_id,
+                                                    });
+                                                    if let Some(name) = a.from_name.clone() {
+                                                        let _ = peer_tx.send(PeerEvent::NameUpdate {
+                                                            id: from_id,
+                                                            name,
+                                                            ip: a.from_ip.clone(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            "name_update" => {
+                                                if let Ok(nu) = serde_json::from_value::<NameUpdatePayload>(v) {
+                                                    if nu.from_id == my_id {
+                                                        continue;
+                                                    }
+                                                    let _ = peer_tx.send(PeerEvent::NameUpdate {
+                                                        id: nu.from_id.clone(),
+                                                        name: nu.from_name.clone(),
+                                                        ip: nu.from_ip.clone(),
                                                     });
                                                 }
                                             }
@@ -1123,7 +1182,7 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                             }
                         }
                     }
-                    NetCmd::SendChat { ip, text, ts, via, msg_id } => {
+                    NetCmd::SendChat { ip, text, ts, via, msg_id, local_ip } => {
                         // 发送消息时使用指定的接口，如果没有指定则使用所有绑定的 sockets
                         let payload = ChatPayload {
                             msg_type: "chat".to_string(),
@@ -1134,6 +1193,9 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                             } else {
                                 Some(our_name.clone())
                             },
+                            from_ip: local_ip.clone().or_else(|| {
+                                via.clone().or_else(|| chat_sockets.first().map(|(_, ip)| ip.to_string()))
+                            }),
                             text: text.clone(),
                             timestamp: ts.clone(),
                         };
@@ -1354,6 +1416,15 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                         msg_type: "ack".to_string(),
                                                         msg_id: c.msg_id.clone(),
                                                         from_id: my_id.clone(),
+                                                        from_name: if our_name.is_empty() {
+                                                            None
+                                                        } else {
+                                                            Some(our_name.clone())
+                                                        },
+                                                        from_ip: sock
+                                                            .local_addr()
+                                                            .ok()
+                                                            .map(|a| a.ip().to_string()),
                                                     };
                                                     if let Ok(ack_data) = serde_json::to_vec(&ack) {
                                                         // 同时发送到源端口和标准端口，确保 ACK 能被接收
@@ -1921,7 +1992,7 @@ use get_if_addrs::get_if_addrs;
                             }
                         }
                     }
-                    NetCmd::SendChat { ip, text, ts, via, msg_id } => {
+                    NetCmd::SendChat { ip, text, ts, via, msg_id, local_ip } => {
                         // 发送消息时使用指定的接口，如果没有指定则使用所有绑定的 sockets
                         let payload = ChatPayload {
                             msg_type: "chat".to_string(),
@@ -1932,6 +2003,9 @@ use get_if_addrs::get_if_addrs;
                             } else {
                                 Some(our_name.clone())
                             },
+                            from_ip: local_ip.clone().or_else(|| {
+                                via.clone().or_else(|| chat_sockets.first().map(|(_, ip)| ip.to_string()))
+                            }),
                             text: text.clone(),
                             timestamp: ts.clone(),
                         };

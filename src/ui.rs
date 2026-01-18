@@ -231,6 +231,9 @@ pub struct RustleApp {
     // 发现帧 peers 列表推送节流
     pub last_peerlist_push: Option<Instant>,
 
+    // 离线用户名更新队列
+    pub offline_name_updates: HashMap<String, String>,
+
     // 本机绑定信息（UI 使用）
     pub local_ip: Option<String>,
     pub local_port: Option<u16>,
@@ -552,6 +555,42 @@ impl RustleApp {
             .collect();
         let online_count = self.users.iter().filter(|u| u.online).count();
         let _ = tx.send(NetCmd::UpdatePeerList { peers, online_count });
+    }
+
+    fn send_name_update_to_all(&mut self, name: &str) {
+        let Some(tx) = self.net_cmd_tx.clone() else { return };
+        let local_ip = self.local_ip.clone();
+        for u in &self.users {
+            if u.id == self.self_id {
+                continue;
+            }
+            if u.online {
+                if let Some(ip) = &u.ip {
+                    let via = self.get_best_interface_for_peer(ip);
+                    let _ = tx.send(NetCmd::SendNameUpdate {
+                        ip: ip.clone(),
+                        via,
+                        name: name.to_string(),
+                        local_ip: local_ip.clone(),
+                    });
+                }
+            } else {
+                self.offline_name_updates.insert(u.id.clone(), name.to_string());
+            }
+        }
+    }
+
+    fn flush_offline_name_updates(&mut self, peer_id: &str, ip: Option<&str>) {
+        let Some(ip) = ip else { return };
+        let Some(name) = self.offline_name_updates.remove(peer_id) else { return };
+        let Some(tx) = self.net_cmd_tx.clone() else { return };
+        let via = self.get_best_interface_for_peer(ip);
+        let _ = tx.send(NetCmd::SendNameUpdate {
+            ip: ip.to_string(),
+            via,
+            name,
+            local_ip: self.local_ip.clone(),
+        });
     }
 
     fn build_sync_node(path: &PathBuf) -> Option<SyncNode> {
@@ -1123,6 +1162,7 @@ impl RustleApp {
                     ts: ts.to_string(),
                     via: Some(via),
                     msg_id: msg_id.to_string(),
+                    local_ip: self.local_ip.clone(),
                 })
                 .is_ok()
             {
@@ -1147,6 +1187,7 @@ impl RustleApp {
                         ts: ts.to_string(),
                         via: Some(bound_ip.clone()),
                         msg_id: msg_id.to_string(),
+                        local_ip: self.local_ip.clone(),
                     })
                     .is_ok()
                 {
@@ -1553,6 +1594,7 @@ impl eframe::App for RustleApp {
                             let _ = u;
                             self.flush_offline_queue(&peer_id, ip_opt.as_deref(), port_opt);
                             self.flush_offline_sync(&peer_id, ip_opt.as_deref());
+                            self.flush_offline_name_updates(&peer_id, ip_opt.as_deref());
                         } else {
                             self.users.push(User {
                                 id: key.clone(),
@@ -1573,12 +1615,14 @@ impl eframe::App for RustleApp {
                             }
                             self.flush_offline_queue(&key, Some(&ip_clone), Some(port_clone));
                             self.flush_offline_sync(&key, Some(&ip_clone));
+                            self.flush_offline_name_updates(&key, Some(&ip_clone));
                         }
                     }
                     PeerEvent::ChatReceived {
                         from_id,
                         from_ip,
                         from_port,
+                        from_name,
                         text,
                         send_ts,
                         recv_ts,
@@ -1630,11 +1674,19 @@ impl eframe::App for RustleApp {
                                 u.has_unread = true;
                             }
                             u.online = true;
-                            u.ip = Some(ip_clone.clone());
+                            if u.ip.as_deref() != Some(&ip_clone) {
+                                u.ip = Some(ip_clone.clone());
+                                self.known_dirty = true;
+                            }
+                            if let Some(name) = from_name.clone() {
+                                if !name.trim().is_empty() && u.name != name {
+                                    u.name = name;
+                                    self.known_dirty = true;
+                                }
+                            }
                             u.port = Some(port_clone);
                             u.bound_interface = Some(local_ip.clone());
                             u.best_interface = Some(local_ip.clone());
-                            self.known_dirty = true;
                             let peer_id = u.id.clone();
                             let ip_opt = u.ip.clone();
                             let port_opt = u.port;
@@ -1645,7 +1697,7 @@ impl eframe::App for RustleApp {
                             let display = if from_id.is_empty() {
                                 format!("{}:{}", from_ip, from_port)
                             } else {
-                                from_id.clone()
+                                from_name.clone().unwrap_or_else(|| from_id.clone())
                             };
                             self.users.push(User {
                                 id: key.clone(),
@@ -1899,12 +1951,45 @@ impl eframe::App for RustleApp {
                             let port_opt = u.port;
                             self.flush_offline_queue(&id, ip_opt.as_deref(), port_opt);
                             self.flush_offline_sync(&id, ip_opt.as_deref());
+                            self.flush_offline_name_updates(&id, ip_opt.as_deref());
                         } else {
                             self.users.push(User {
                                 id: id.clone(),
                                 name: id.clone(),
                                 online: true,
                                 ip: Some(ip.clone()),
+                                port: Some(UDP_MESSAGE_PORT),
+                                tcp_port: None,
+                                bound_interface: None,
+                                best_interface: None,
+                                has_unread: false,
+                            });
+                            self.messages.entry(id.clone()).or_default();
+                            self.offline_msgs.entry(id.clone()).or_default();
+                            self.known_dirty = true;
+                        }
+                    }
+                    PeerEvent::NameUpdate { id, name, ip } => {
+                        if id == self.self_id {
+                            continue;
+                        }
+                        if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
+                            if !name.trim().is_empty() && u.name != name {
+                                u.name = name;
+                                self.known_dirty = true;
+                            }
+                            if let Some(ipv) = ip.clone() {
+                                if u.ip.as_deref() != Some(&ipv) {
+                                    u.ip = Some(ipv);
+                                    self.known_dirty = true;
+                                }
+                            }
+                        } else {
+                            self.users.push(User {
+                                id: id.clone(),
+                                name: name.clone(),
+                                online: false,
+                                ip,
                                 port: Some(UDP_MESSAGE_PORT),
                                 tcp_port: None,
                                 bound_interface: None,
@@ -2301,6 +2386,9 @@ impl eframe::App for RustleApp {
                                         if let Some(tx) = &self.net_cmd_tx {
                                             let _ = tx.send(NetCmd::ChangeName(self.me_name.clone().unwrap_or_default()));
                                         }
+                                        if let Some(name) = self.me_name.clone() {
+                                            self.send_name_update_to_all(&name);
+                                        }
                                     }
                                     Err(e) => {
                                         self.name_save_error = Some(format!("保存失败: {}", e));
@@ -2342,6 +2430,9 @@ impl eframe::App for RustleApp {
 
                                         if let Some(tx) = &self.net_cmd_tx {
                                             let _ = tx.send(NetCmd::ChangeName(self.me_name.clone().unwrap_or_default()));
+                                        }
+                                        if let Some(name) = self.me_name.clone() {
+                                            self.send_name_update_to_all(&name);
                                         }
                                     }
                                     Err(e) => {

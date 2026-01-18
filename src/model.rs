@@ -122,12 +122,19 @@ pub enum NetCmd {
         peers: Vec<PeerSnapshot>,
         online_count: usize,
     },
+    SendNameUpdate {
+        ip: String,
+        via: Option<String>,
+        name: String,
+        local_ip: Option<String>,
+    },
     SendChat {
         ip: String,
         text: String,
         ts: String,
         via: Option<String>,
         msg_id: String,
+        local_ip: Option<String>,
     },
     ProbePeer {
         ip: String,
@@ -152,6 +159,7 @@ pub enum PeerEvent {
         from_id: String,
         from_ip: String,
         from_port: u16,
+        from_name: Option<String>,
         text: String,
         send_ts: String,
         recv_ts: String,
@@ -177,6 +185,11 @@ pub enum PeerEvent {
         from_ip: String,
         from_name: Option<String>,
         peers: Vec<PeerBrief>,
+    },
+    NameUpdate {
+        id: String,
+        name: String,
+        ip: Option<String>,
     },
     PeerOnline {
         id: String,
@@ -207,6 +220,7 @@ pub struct ChatPayload {
     pub msg_id: String,
     pub from_id: String,
     pub from_name: Option<String>,
+    pub from_ip: Option<String>,
     pub text: String,
     pub timestamp: String,
 }
@@ -216,6 +230,16 @@ pub struct AckPayload {
     pub msg_type: String,
     pub msg_id: String,
     pub from_id: String,
+    pub from_name: Option<String>,
+    pub from_ip: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NameUpdatePayload {
+    pub msg_type: String,
+    pub from_id: String,
+    pub from_name: String,
+    pub from_ip: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
