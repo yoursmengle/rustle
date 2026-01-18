@@ -223,6 +223,9 @@ pub struct RustleApp {
     pub sync_scan_in_progress: bool,
     offline_sync: HashMap<String, Vec<SyncTransfer>>,
 
+    // 发现帧 peers 列表推送节流
+    pub last_peerlist_push: Option<Instant>,
+
     // 本机绑定信息（UI 使用）
     pub local_ip: Option<String>,
     pub local_port: Option<u16>,
@@ -528,6 +531,21 @@ impl RustleApp {
             save_sync_tree(&self.sync_tree);
             self.sync_dirty = false;
         }
+    }
+
+    fn push_peer_list_to_net(&mut self) {
+        let Some(tx) = self.net_cmd_tx.clone() else { return };
+        let peers: Vec<crate::model::PeerSnapshot> = self
+            .users
+            .iter()
+            .map(|u| crate::model::PeerSnapshot {
+                id: u.id.clone(),
+                ip: u.ip.clone(),
+                online: u.online,
+            })
+            .collect();
+        let online_count = self.users.iter().filter(|u| u.online).count();
+        let _ = tx.send(NetCmd::UpdatePeerList { peers, online_count });
     }
 
     fn build_sync_node(path: &PathBuf) -> Option<SyncNode> {
@@ -1793,12 +1811,99 @@ impl eframe::App for RustleApp {
                             }
                         }
                     }
+                    PeerEvent::DiscoverReceived { from_id, from_ip, peers } => {
+                        // 确保发送方在线
+                        if let Some(u) = self.users.iter_mut().find(|u| u.id == from_id) {
+                            u.online = true;
+                            u.ip = Some(from_ip.clone());
+                            self.known_dirty = true;
+                        } else {
+                            self.users.push(User {
+                                id: from_id.clone(),
+                                name: from_id.clone(),
+                                online: true,
+                                ip: Some(from_ip.clone()),
+                                port: Some(UDP_MESSAGE_PORT),
+                                tcp_port: None,
+                                bound_interface: None,
+                                best_interface: None,
+                                has_unread: false,
+                            });
+                            self.messages.entry(from_id.clone()).or_default();
+                            self.offline_msgs.entry(from_id.clone()).or_default();
+                            self.known_dirty = true;
+                        }
+
+                        // 合并 peers 列表
+                        for p in peers {
+                            if p.id.is_empty() {
+                                continue;
+                            }
+                            if let Some(u) = self.users.iter_mut().find(|u| u.id == p.id) {
+                                if let Some(ip) = p.ip.clone() {
+                                    u.ip = Some(ip);
+                                }
+                            } else {
+                                self.users.push(User {
+                                    id: p.id.clone(),
+                                    name: p.id.clone(),
+                                    online: false,
+                                    ip: p.ip.clone(),
+                                    port: Some(UDP_MESSAGE_PORT),
+                                    tcp_port: None,
+                                    bound_interface: None,
+                                    best_interface: None,
+                                    has_unread: false,
+                                });
+                                self.messages.entry(p.id.clone()).or_default();
+                                self.offline_msgs.entry(p.id.clone()).or_default();
+                                self.known_dirty = true;
+                            }
+                        }
+                    }
+                    PeerEvent::PeerOnline { id, ip } => {
+                        if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
+                            u.online = true;
+                            u.ip = Some(ip.clone());
+                            self.known_dirty = true;
+                            let ip_opt = u.ip.clone();
+                            let port_opt = u.port;
+                            self.flush_offline_queue(&id, ip_opt.as_deref(), port_opt);
+                            self.flush_offline_sync(&id, ip_opt.as_deref());
+                        } else {
+                            self.users.push(User {
+                                id: id.clone(),
+                                name: id.clone(),
+                                online: true,
+                                ip: Some(ip.clone()),
+                                port: Some(UDP_MESSAGE_PORT),
+                                tcp_port: None,
+                                bound_interface: None,
+                                best_interface: None,
+                                has_unread: false,
+                            });
+                            self.messages.entry(id.clone()).or_default();
+                            self.offline_msgs.entry(id.clone()).or_default();
+                            self.known_dirty = true;
+                        }
+                    }
+                    PeerEvent::PeerOffline { id } => {
+                        self.mark_offline(&id);
+                    }
                 }
             }
             self.merge_users_by_id();
         }
 
         // 处理自动同步扫描与持久化
+        if self
+            .last_peerlist_push
+            .map(|t| t.elapsed() >= Duration::from_secs(1))
+            .unwrap_or(true)
+        {
+            self.push_peer_list_to_net();
+            self.last_peerlist_push = Some(Instant::now());
+        }
         self.handle_sync_scan_result();
         self.maybe_start_sync_scan();
         self.persist_sync_tree();

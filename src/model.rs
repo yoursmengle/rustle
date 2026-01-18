@@ -118,6 +118,10 @@ pub struct DiscoveredPeer {
 #[derive(Debug)]
 pub enum NetCmd {
     ChangeName(String),
+    UpdatePeerList {
+        peers: Vec<PeerSnapshot>,
+        online_count: usize,
+    },
     SendChat {
         ip: String,
         text: String,
@@ -168,6 +172,18 @@ pub enum PeerEvent {
         local_path: Option<String>,
         is_sync: bool,
     },
+    DiscoverReceived {
+        from_id: String,
+        from_ip: String,
+        peers: Vec<PeerBrief>,
+    },
+    PeerOnline {
+        id: String,
+        ip: String,
+    },
+    PeerOffline {
+        id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -199,6 +215,30 @@ pub struct AckPayload {
     pub msg_type: String,
     pub msg_id: String,
     pub from_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PeerBrief {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DiscoverPayload {
+    pub msg_type: String,
+    pub from_id: String,
+    pub from_name: Option<String>,
+    #[serde(default)]
+    pub is_reply: bool,
+    pub peers: Vec<PeerBrief>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerSnapshot {
+    pub id: String,
+    pub ip: Option<String>,
+    pub online: bool,
 }
 
 #[derive(Debug)]
