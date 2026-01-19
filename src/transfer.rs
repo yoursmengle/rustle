@@ -355,6 +355,8 @@ pub async fn handle_outgoing_file(
                 src: &Path,
                 base_name: &str,
                 skipped: &mut usize,
+                processed: &mut usize,
+                last_pause: &mut Instant,
             ) -> std::io::Result<()> {
                 let read_dir = std::fs::read_dir(src)?;
                 for entry in read_dir {
@@ -378,13 +380,19 @@ pub async fn handle_outgoing_file(
                         if builder.append_dir(&tar_path, &path).is_err() {
                             *skipped += 1;
                         }
-                        if add_dir_to_tar(builder, &path, base_name, skipped).is_err() {
+                        if add_dir_to_tar(builder, &path, base_name, skipped, processed, last_pause).is_err() {
                             *skipped += 1;
                         }
                     } else if path.is_file() {
                         if builder.append_path_with_name(&path, &tar_path).is_err() {
                             *skipped += 1;
                         }
+                    }
+
+                    *processed += 1;
+                    if *processed % 200 == 0 && last_pause.elapsed() >= Duration::from_millis(25) {
+                        std::thread::sleep(Duration::from_millis(2));
+                        *last_pause = Instant::now();
                     }
                 }
                 Ok(())
@@ -396,7 +404,16 @@ pub async fn handle_outgoing_file(
             let file = std::fs::File::create(&tar_fs_path)?;
             let mut builder = tar::Builder::new(file);
             let mut skipped = 0usize;
-            add_dir_to_tar(&mut builder, &src_fs_path, &filename_clone, &mut skipped)?;
+            let mut processed = 0usize;
+            let mut last_pause = Instant::now();
+            add_dir_to_tar(
+                &mut builder,
+                &src_fs_path,
+                &filename_clone,
+                &mut skipped,
+                &mut processed,
+                &mut last_pause,
+            )?;
             if skipped > 0 {
                 eprintln!("[tx] tar build skipped {} entries due to read/permission errors", skipped);
             }

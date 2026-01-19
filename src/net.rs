@@ -690,6 +690,7 @@ pub fn spawn_network_worker(
                                                             (src.ip(), UDP_DISCOVERY_PORT),
                                                         );
 
+                                                        let existed = peer_snapshots.contains_key(&pid);
                                                         let entry = peer_snapshots.entry(pid.clone()).or_insert(
                                                             PeerSnapshot {
                                                                 id: pid.clone(),
@@ -698,6 +699,7 @@ pub fn spawn_network_worker(
                                                                 name: h.name.clone(),
                                                             },
                                                         );
+                                                        let was_online = entry.online;
                                                         entry.ip = Some(src.ip().to_string());
                                                         entry.online = true;
                                                         if h.name.is_some() {
@@ -756,7 +758,7 @@ pub fn spawn_network_worker(
                                                             }
                                                         }
 
-                                                        if first_seen {
+                                                        if !existed || !was_online || first_seen {
                                                             let _ = peer_tx.send(PeerEvent::PeerOnline {
                                                                 id: pid.clone(),
                                                                 ip: src.ip().to_string(),
@@ -780,6 +782,7 @@ pub fn spawn_network_worker(
                                                         hb.id.clone(),
                                                         (src.ip(), UDP_DISCOVERY_PORT),
                                                     );
+                                                    let existed = peer_snapshots.contains_key(&hb.id);
                                                     let entry = peer_snapshots.entry(hb.id.clone()).or_insert(
                                                         PeerSnapshot {
                                                             id: hb.id.clone(),
@@ -788,6 +791,7 @@ pub fn spawn_network_worker(
                                                             name: hb.name.clone(),
                                                         },
                                                     );
+                                                    let was_online = entry.online;
                                                     entry.ip = Some(src.ip().to_string());
                                                     entry.online = true;
                                                     if hb.name.is_some() {
@@ -816,10 +820,12 @@ pub fn spawn_network_worker(
                                                         }
                                                     }
 
-                                                    let _ = peer_tx.send(PeerEvent::PeerOnline {
-                                                        id: hb.id.clone(),
-                                                        ip: src.ip().to_string(),
-                                                    });
+                                                    if !existed || !was_online {
+                                                        let _ = peer_tx.send(PeerEvent::PeerOnline {
+                                                            id: hb.id.clone(),
+                                                            ip: src.ip().to_string(),
+                                                        });
+                                                    }
                                                 }
                                             }
                                             "bye" => {
@@ -846,6 +852,7 @@ pub fn spawn_network_worker(
                                                     if s.from_id == my_id {
                                                         continue;
                                                     }
+                                                    last_from_peer.insert(s.from_id.clone(), Instant::now());
                                                     for p in s.peers.iter() {
                                                         if p.id == my_id || p.id.is_empty() {
                                                             continue;
@@ -951,6 +958,34 @@ pub fn spawn_network_worker(
                                                     if nu.from_id == my_id {
                                                         continue;
                                                     }
+                                                    last_from_peer.insert(nu.from_id.clone(), Instant::now());
+                                                    let existed = peer_snapshots.contains_key(&nu.from_id);
+                                                    let entry = peer_snapshots
+                                                        .entry(nu.from_id.clone())
+                                                        .or_insert(PeerSnapshot {
+                                                            id: nu.from_id.clone(),
+                                                            ip: nu.from_ip.clone(),
+                                                            online: true,
+                                                            name: if nu.from_name.trim().is_empty() {
+                                                                None
+                                                            } else {
+                                                                Some(nu.from_name.clone())
+                                                            },
+                                                        });
+                                                    let was_online = entry.online;
+                                                    if nu.from_ip.is_some() {
+                                                        entry.ip = nu.from_ip.clone();
+                                                    }
+                                                    if !nu.from_name.trim().is_empty() {
+                                                        entry.name = Some(nu.from_name.clone());
+                                                    }
+                                                    entry.online = true;
+                                                    if !existed || !was_online {
+                                                        let _ = peer_tx.send(PeerEvent::PeerOnline {
+                                                            id: nu.from_id.clone(),
+                                                            ip: src.ip().to_string(),
+                                                        });
+                                                    }
                                                     let _ = peer_tx.send(PeerEvent::NameUpdate {
                                                         id: nu.from_id.clone(),
                                                         name: nu.from_name.clone(),
@@ -963,13 +998,32 @@ pub fn spawn_network_worker(
                                                     if d.from_id == my_id {
                                                         continue;
                                                     }
+                                                    last_from_peer.insert(d.from_id.clone(), Instant::now());
                                                     last_reply.insert(d.from_id.clone(), Instant::now());
                                                     miss_count.insert(d.from_id.clone(), 0);
 
-                                                    let _ = peer_tx.send(PeerEvent::PeerOnline {
-                                                        id: d.from_id.clone(),
-                                                        ip: src.ip().to_string(),
-                                                    });
+                                                    let existed = peer_snapshots.contains_key(&d.from_id);
+                                                    let entry = peer_snapshots
+                                                        .entry(d.from_id.clone())
+                                                        .or_insert(PeerSnapshot {
+                                                            id: d.from_id.clone(),
+                                                            ip: Some(src.ip().to_string()),
+                                                            online: true,
+                                                            name: d.from_name.clone(),
+                                                        });
+                                                    let was_online = entry.online;
+                                                    entry.ip = Some(src.ip().to_string());
+                                                    if d.from_name.is_some() {
+                                                        entry.name = d.from_name.clone();
+                                                    }
+                                                    entry.online = true;
+
+                                                    if !existed || !was_online {
+                                                        let _ = peer_tx.send(PeerEvent::PeerOnline {
+                                                            id: d.from_id.clone(),
+                                                            ip: src.ip().to_string(),
+                                                        });
+                                                    }
 
                                                     let _ = peer_tx.send(PeerEvent::DiscoverReceived {
                                                         from_id: d.from_id.clone(),
@@ -1027,7 +1081,7 @@ mod tests {
     fn spawn_network_worker_smoke() {
         let (tx, _rx) = mpsc::channel::<PeerEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::channel::<NetCmd>();
-        spawn_network_worker(tx, cmd_rx, Some("tester".to_string()));
+        spawn_network_worker(tx, cmd_rx, Some("tester".to_string()), Vec::new());
         std::thread::sleep(StdDuration::from_millis(100));
     }
 }
