@@ -21,7 +21,7 @@ mod transfer;
 mod net;
 mod ui;
 
-pub const APP_VERSION: &str = "v1.1.0";
+pub const APP_VERSION: &str = "v1.1.1";
 
 fn main() -> eframe::Result<()> {
     ui::run()

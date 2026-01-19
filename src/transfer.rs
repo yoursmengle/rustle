@@ -1,4 +1,4 @@
-use crate::model::PeerEvent;
+use crate::model::{PeerEvent, TCP_DIR_PORT, TCP_FILE_PORT};
 use crate::storage::{default_download_dir, load_receive_map, save_receive_map, windows_long_path};
 use chrono::Local;
 use std::fs;
@@ -323,20 +323,41 @@ pub async fn handle_outgoing_file(
     is_sync: bool,
     peer_tx: Sender<PeerEvent>,
 ) {
-    let addr_str = format!("{}:{}", peer_ip, tcp_port);
-    let socket = if let Some(via_ip) = via {
-        match tokio::net::TcpSocket::new_v4() {
-            Ok(s) => {
-                if let Ok(bind_addr) = format!("{}:0", via_ip).parse::<SocketAddr>() {
-                    let _ = s.bind(bind_addr);
+    async fn connect_with_via(
+        peer_ip: &str,
+        port: u16,
+        via: &Option<String>,
+    ) -> std::io::Result<TcpStream> {
+        let addr_str = format!("{}:{}", peer_ip, port);
+        if let Some(via_ip) = via {
+            match tokio::net::TcpSocket::new_v4() {
+                Ok(s) => {
+                    if let Ok(bind_addr) = format!("{}:0", via_ip).parse::<SocketAddr>() {
+                        let _ = s.bind(bind_addr);
+                    }
+                    s.connect(addr_str.parse().unwrap()).await
                 }
-                s.connect(addr_str.parse().unwrap()).await
+                Err(_) => TcpStream::connect(&addr_str).await,
             }
-            Err(_) => TcpStream::connect(&addr_str).await,
+        } else {
+            TcpStream::connect(&addr_str).await
         }
-    } else {
-        TcpStream::connect(&addr_str).await
-    };
+    }
+
+    let mut used_port = tcp_port;
+    let mut socket = connect_with_via(&peer_ip, tcp_port, &via).await;
+    if socket.is_err() && is_dir && tcp_port == TCP_DIR_PORT {
+        let alt_port = TCP_FILE_PORT;
+        if alt_port != tcp_port {
+            socket = connect_with_via(&peer_ip, alt_port, &via).await;
+            if socket.is_ok() {
+                used_port = alt_port;
+                eprintln!("[tx] dir connect fallback to file port {}", used_port);
+            }
+        }
+    }
+
+    let addr_str = format!("{}:{}", peer_ip, used_port);
 
     let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
     let declared_size: u64;
