@@ -4,8 +4,8 @@ use crate::model::{
 };
 use crate::net::spawn_network_worker;
 use crate::storage::{
-    data_path, file_mtime_seconds, load_or_init_node_id, load_sync_tree, save_sync_tree,
-    sha256_file, peer_history_path,
+    data_path, file_mtime_seconds, load_or_init_node_id, load_settings, load_sync_tree,
+    save_settings, save_sync_tree, sha256_file, peer_history_path, AppSettings,
 };
 use chrono::{Duration as ChronoDuration, Local};
 use eframe::egui;
@@ -98,12 +98,33 @@ pub fn run() -> eframe::Result<()> {
                 }
             }
 
+            // 加载设置
+            app.settings = load_settings();
+
+            // 初始化设置输入框
+            let default_recv = crate::storage::default_download_dir();
+            app.settings_recv_dir_input = app
+                .settings
+                .recv_dir
+                .clone()
+                .unwrap_or_else(|| default_recv.to_string_lossy().to_string());
+            app.settings_name_input = app.me_name.clone().unwrap_or_default();
+
             // 启动时加载已知节点（离线列表）
             app.load_known_peers();
-            // 启动时加载最近 15 天的历史记录
+            // 启动时加载最近配置天数的历史记录
             app.load_recent_history();
             // 启动时加载自动同步树
             app.load_sync_tree();
+
+            // 启动时自动检查更新（可配置）
+            if app.settings.auto_check_update {
+                let (tx, rx) = mpsc::channel();
+                app.update_check_rx = Some(rx);
+                app.is_checking_update = true;
+                app.new_version_info = None;
+                spawn_check_update(tx);
+            }
 
             // 尝试设置本机显示 IP：优先选择收发总流量最大的接口的 IPv4 地址
             if app.local_ip.is_none() {
@@ -289,6 +310,12 @@ pub struct RustleApp {
     pub show_usage_window: bool,
     pub show_update_dialog: bool,
     pub show_about_window: bool,
+    pub show_settings_window: bool,
+
+    // 设置
+    pub settings: AppSettings,
+    pub settings_recv_dir_input: String,
+    pub settings_name_input: String,
 
     // 修改用户名窗口
     pub show_edit_name_dialog: bool,
@@ -346,6 +373,11 @@ impl RustleApp {
 
     // 统一接口选择逻辑 - 修复消息发送问题
     fn get_best_interface_for_peer(&self, peer_ip: &str) -> Option<String> {
+        if let Some(pref) = self.settings.preferred_interface.as_ref() {
+            if self.bound_interfaces.contains(pref) {
+                return Some(pref.clone());
+            }
+        }
         // 优先选择能直接路由到目标的接口
         if let Some(direct_interface) = Self::find_interface_for_target(peer_ip) {
             // 验证该接口是否在我们的绑定列表中
@@ -499,7 +531,8 @@ impl RustleApp {
         let history_dir = crate::storage::history_dir();
         let Ok(entries) = fs::read_dir(&history_dir) else { return };
 
-        let cutoff = Local::now() - ChronoDuration::days(15);
+        let days = self.settings.history_days.max(1);
+        let cutoff = Local::now() - ChronoDuration::days(days);
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1521,6 +1554,7 @@ impl RustleApp {
             }
 
             let msgs = self.messages.entry(id.clone()).or_default();
+            let needs_sync = self.settings.auto_sync_on_send;
             msgs.push(ChatMessage {
                 from_me: true,
                 text: text.clone(),
@@ -1532,7 +1566,7 @@ impl RustleApp {
                 msg_id: None,
                 is_read: true,
                 is_pending: !sent,
-                needs_sync: true,
+                needs_sync,
             });
 
             self.log_history(
@@ -1545,7 +1579,7 @@ impl RustleApp {
                 None,
                 None,
                 !sent,
-                true,
+                needs_sync,
             );
         }
     }
@@ -1662,6 +1696,132 @@ impl eframe::App for RustleApp {
             }
         }
 
+        // 设置窗口
+        let mut show_settings = self.show_settings_window;
+        if show_settings {
+            egui::Window::new("设置")
+                .open(&mut show_settings)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    let mut changed = false;
+
+                    ui.label("历史记录保存天数");
+                    let mut days = self.settings.history_days.max(1);
+                    if ui
+                        .add(egui::DragValue::new(&mut days).range(1..=3650))
+                        .changed()
+                    {
+                        self.settings.history_days = days;
+                        changed = true;
+                    }
+
+                    ui.add_space(6.0);
+                    ui.label("接收文件夹");
+                    ui.horizontal(|ui| {
+                        let resp = ui.text_edit_singleline(&mut self.settings_recv_dir_input);
+                        if resp.changed() {
+                            changed = true;
+                        }
+                        if ui.button("选择...").clicked() {
+                            if let Some(path) = FileDialog::new().pick_folder() {
+                                self.settings_recv_dir_input = path.to_string_lossy().to_string();
+                                changed = true;
+                            }
+                        }
+                        if ui.button("恢复默认").clicked() {
+                            let def = crate::storage::default_download_dir();
+                            self.settings_recv_dir_input = def.to_string_lossy().to_string();
+                            changed = true;
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    if ui
+                        .checkbox(&mut self.settings.auto_sync_on_send, "发送文件/文件夹自动同步")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
+                    if ui
+                        .checkbox(&mut self.settings.auto_check_update, "启动时检查更新")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
+                    ui.add_space(6.0);
+                    ui.label("首选发送网卡");
+                    let mut interfaces: Vec<String> = self.bound_interfaces.iter().cloned().collect();
+                    interfaces.sort();
+                    let current_label = self
+                        .settings
+                        .preferred_interface
+                        .as_deref()
+                        .unwrap_or("自动");
+                    egui::ComboBox::from_id_salt("preferred_iface")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut self.settings.preferred_interface,
+                                    None,
+                                    "自动",
+                                )
+                                .clicked()
+                            {
+                                changed = true;
+                            }
+                            for iface in interfaces {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.settings.preferred_interface,
+                                        Some(iface.clone()),
+                                        iface.clone(),
+                                    )
+                                    .clicked()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label("本机显示名称");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.settings_name_input));
+                        if ui.button("保存名称").clicked() {
+                            let name = self.settings_name_input.trim();
+                            if !name.is_empty() {
+                                if fs::write(data_path("me.txt"), name).is_ok() {
+                                    self.me_name = Some(name.to_string());
+                                    if let Some(tx) = &self.net_cmd_tx {
+                                        let _ = tx
+                                            .send(NetCmd::ChangeName(self.me_name.clone().unwrap_or_default()));
+                                    }
+                                    if let Some(name) = self.me_name.clone() {
+                                        self.send_name_update_to_all(&name);
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    if changed {
+                        let recv = self.settings_recv_dir_input.trim().to_string();
+                        self.settings.recv_dir = if recv.is_empty() { None } else { Some(recv) };
+                        if let Some(dir) = self.settings.recv_dir.as_ref() {
+                            let _ = fs::create_dir_all(dir);
+                        }
+                        save_settings(&self.settings);
+                    }
+                });
+            self.show_settings_window = show_settings;
+        }
+
         // 使用说明窗口
         let mut show_usage = self.show_usage_window;
         if show_usage {
@@ -1757,6 +1917,16 @@ impl eframe::App for RustleApp {
                         ui.close_menu();
                     }
                 });
+
+                if ui.button("设置").clicked() {
+                    self.settings_recv_dir_input = self
+                        .settings
+                        .recv_dir
+                        .clone()
+                        .unwrap_or_else(|| crate::storage::default_download_dir().to_string_lossy().to_string());
+                    self.settings_name_input = self.me_name.clone().unwrap_or_default();
+                    self.show_settings_window = true;
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let addr = match (self.local_ip.as_deref(), self.local_port) {

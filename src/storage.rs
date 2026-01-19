@@ -9,6 +9,71 @@ use std::process::Command;
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 
+const SETTINGS_FILE: &str = "settings.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    #[serde(default = "default_history_days")]
+    pub history_days: i64,
+    #[serde(default)]
+    pub recv_dir: Option<String>,
+    #[serde(default = "default_auto_sync_on_send")]
+    pub auto_sync_on_send: bool,
+    #[serde(default = "default_auto_check_update")]
+    pub auto_check_update: bool,
+    #[serde(default)]
+    pub preferred_interface: Option<String>,
+}
+
+fn default_history_days() -> i64 {
+    180
+}
+
+fn default_auto_sync_on_send() -> bool {
+    true
+}
+
+fn default_auto_check_update() -> bool {
+    true
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            history_days: default_history_days(),
+            recv_dir: None,
+            auto_sync_on_send: default_auto_sync_on_send(),
+            auto_check_update: default_auto_check_update(),
+            preferred_interface: None,
+        }
+    }
+}
+
+pub fn load_settings() -> AppSettings {
+    let path = data_path(SETTINGS_FILE);
+    if let Ok(text) = fs::read_to_string(&path) {
+        if let Ok(mut settings) = serde_json::from_str::<AppSettings>(&text) {
+            if settings.history_days <= 0 {
+                settings.history_days = default_history_days();
+            }
+            if let Some(dir) = settings.recv_dir.as_ref() {
+                if dir.trim().is_empty() {
+                    settings.recv_dir = None;
+                }
+            }
+            return settings;
+        }
+    }
+    AppSettings::default()
+}
+
+pub fn save_settings(settings: &AppSettings) {
+    let path = data_path(SETTINGS_FILE);
+    if let Ok(text) = serde_json::to_string_pretty(settings) {
+        let _ = fs::write(path, text);
+    }
+}
+
 pub fn data_dir() -> PathBuf {
     let mut dir = env::var_os("LOCALAPPDATA")
         .or_else(|| env::var_os("APPDATA"))
@@ -108,6 +173,14 @@ pub fn sha256_file(path: &Path) -> Option<String> {
 }
 
 pub fn default_download_dir() -> PathBuf {
+    let settings = load_settings();
+    if let Some(dir) = settings.recv_dir.as_ref() {
+        if !dir.trim().is_empty() {
+            let custom = PathBuf::from(dir.trim());
+            let _ = fs::create_dir_all(&custom);
+            return custom;
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         // Prefer D: if present; otherwise fallback to C:
