@@ -3,9 +3,17 @@
 ; `installer\VC_redist.x64.exe` (or allow the installer to download it from Microsoft).
 ; Build with Inno Setup (ISCC.exe) or use command-line tools.
 
+#define AppVersion "0.0.0"
+#expr LoadStringFromFile(SourcePath + "..\\src\\main.rs", MainRs)
+#expr Tail = Copy(MainRs, Pos('APP_VERSION', MainRs), Length(MainRs))
+#expr Quote1 = Pos('"', Tail)
+#expr Tail2 = Copy(Tail, Quote1 + 1, Length(Tail))
+#expr Quote2 = Pos('"', Tail2)
+#expr AppVersion = Copy(Tail2, 1, Quote2 - 1)
+
 [Setup]
 AppName=Rustle
-AppVersion=0.1.0
+AppVersion={#AppVersion}
 DefaultDirName={commonpf}\Rustle
 DefaultGroupName=Rustle
 DisableProgramGroupPage=yes
@@ -13,7 +21,7 @@ DisableDirPage=no
 Compression=lzma
 SolidCompression=yes
 PrivilegesRequired=admin
-OutputBaseFilename=rustle-setup
+OutputBaseFilename=rustle-setup-{#AppVersion}
 ArchitecturesInstallIn64BitMode=x64
 
 ; Files to include. Adjust the Source paths if your build output location differs.
