@@ -373,6 +373,7 @@ pub async fn handle_outgoing_file(
         let res = tokio::task::spawn_blocking(move || {
             fn add_dir_to_tar(
                 builder: &mut tar::Builder<std::fs::File>,
+                root: &Path,
                 src: &Path,
                 base_name: &str,
                 skipped: &mut usize,
@@ -389,7 +390,7 @@ pub async fn handle_outgoing_file(
                         }
                     };
                     let path = entry.path();
-                    let rel = match path.strip_prefix(src) {
+                    let rel = match path.strip_prefix(root) {
                         Ok(r) => r,
                         Err(_) => {
                             *skipped += 1;
@@ -401,7 +402,7 @@ pub async fn handle_outgoing_file(
                         if builder.append_dir(&tar_path, &path).is_err() {
                             *skipped += 1;
                         }
-                        if add_dir_to_tar(builder, &path, base_name, skipped, processed, last_pause).is_err() {
+                        if add_dir_to_tar(builder, root, &path, base_name, skipped, processed, last_pause).is_err() {
                             *skipped += 1;
                         }
                     } else if path.is_file() {
@@ -429,6 +430,7 @@ pub async fn handle_outgoing_file(
             let mut last_pause = Instant::now();
             add_dir_to_tar(
                 &mut builder,
+                &src_fs_path,
                 &src_fs_path,
                 &filename_clone,
                 &mut skipped,

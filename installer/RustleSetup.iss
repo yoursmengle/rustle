@@ -3,13 +3,7 @@
 ; `installer\VC_redist.x64.exe` (or allow the installer to download it from Microsoft).
 ; Build with Inno Setup (ISCC.exe) or use command-line tools.
 
-#define AppVersion "0.0.0"
-#expr LoadStringFromFile(SourcePath + "..\\src\\main.rs", MainRs)
-#expr Tail = Copy(MainRs, Pos('APP_VERSION', MainRs), Length(MainRs))
-#expr Quote1 = Pos('"', Tail)
-#expr Tail2 = Copy(Tail, Quote1 + 1, Length(Tail))
-#expr Quote2 = Pos('"', Tail2)
-#expr AppVersion = Copy(Tail2, 1, Quote2 - 1)
+#define AppVersion GetFileVersion(SourcePath + "..\\target\\release\\rustle.exe")
 
 [Setup]
 AppName=Rustle
