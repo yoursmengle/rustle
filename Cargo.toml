@@ -25,6 +25,7 @@ rfd = "0.14"
 tar = "0.4.44"
 open = "5.3.3"
 image = "0.25"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
 
 [build-dependencies]
 winres = "0.1"
