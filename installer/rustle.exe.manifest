@@ -3,8 +3,8 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <!-- Run with the current user's token to avoid UAC prompts; elevate only when OS policy/UAC allows asInvoker. -->
-        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+        <!-- Always request administrator privileges via UAC when launching. -->
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>
