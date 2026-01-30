@@ -13,11 +13,20 @@ pub fn sync_system_time_at_startup() {
 
     for server in servers {
         match query_ntp_time(server) {
-            Ok(system_time) => {
-                if let Err(err) = set_system_time_utc(system_time) {
-                    crate::debug_println!("Time sync: failed to set system time from {server}: {err}");
+            Ok(ntp_time) => {
+                let local_time = SystemTime::now();
+                
+                // 计算时间差异
+                let time_diff = match ntp_time.duration_since(local_time) {
+                    Ok(duration) => duration.as_secs_f64(),
+                    Err(err) => -err.duration().as_secs_f64(),
+                };
+                
+                // 只提示时间差异，不进行同步（避免需要管理员权限）
+                if time_diff.abs() < 5.0 {
+                    crate::debug_println!("Time sync: time difference is {:.2}s, no sync needed", time_diff);
                 } else {
-                    crate::debug_println!("Time sync: system time updated from {server}");
+                    crate::debug_println!("Time sync: time difference is {:.2}s (consider syncing manually if needed)", time_diff);
                 }
                 return;
             }
@@ -58,31 +67,4 @@ fn parse_ntp_response(response: &[u8; 48]) -> io::Result<SystemTime> {
 
     let nanos = (frac as u128 * 1_000_000_000u128) / 4_294_967_296u128;
     Ok(UNIX_EPOCH + Duration::new(unix_secs as u64, nanos as u32))
-}
-
-#[cfg(windows)]
-fn set_system_time_utc(time: SystemTime) -> io::Result<()> {
-    use chrono::{DateTime, Datelike, Timelike, Utc};
-    use windows::Win32::Foundation::SYSTEMTIME;
-    use windows::Win32::System::SystemInformation::SetSystemTime;
-
-    let dt: DateTime<Utc> = time.into();
-    let st = SYSTEMTIME {
-        wYear: dt.year() as u16,
-        wMonth: dt.month() as u16,
-        wDayOfWeek: 0,
-        wDay: dt.day() as u16,
-        wHour: dt.hour() as u16,
-        wMinute: dt.minute() as u16,
-        wSecond: dt.second() as u16,
-        wMilliseconds: dt.timestamp_subsec_millis() as u16,
-    };
-
-    unsafe { SetSystemTime(&st) }
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err}")))
-}
-
-#[cfg(not(windows))]
-fn set_system_time_utc(_time: SystemTime) -> io::Result<()> {
-    Ok(())
 }

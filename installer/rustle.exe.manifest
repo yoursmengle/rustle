@@ -3,8 +3,8 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <!-- Always request administrator privileges via UAC when launching. -->
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <!-- Run with current user privileges, no UAC elevation required. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>
