@@ -91,10 +91,18 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
 
     eprintln!("[rx] header from {addr} id={sender_id} name={filename} is_dir={is_dir} size={total_size}");
 
-    let initial_status = if total_size > 0 {
-        format!("正在接收 0% / {}", human_size(total_size))
+    let initial_status = if is_sync {
+        if total_size > 0 {
+            format!("待同步 - 准备接收 {} / {}", human_size(0), human_size(total_size))
+        } else {
+            "待同步 - 准备接收".to_string()
+        }
     } else {
-        "正在接收...".to_string()
+        if total_size > 0 {
+            format!("准备接收 {} / {}", human_size(0), human_size(total_size))
+        } else {
+            "准备接收".to_string()
+        }
     };
 
     let _ = peer_tx.send(PeerEvent::FileProgress {
@@ -167,12 +175,21 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
                             let now = Instant::now();
                             let elapsed_ms = now.duration_since(last_report_instant).as_millis();
                             if (progress - last_progress >= 0.05 && elapsed_ms >= 200) || last_report_bytes == 0 {
-                                let status = format!(
+                            let status = if is_sync {
+                                format!(
+                                    "正在同步 {:.0}% / {} ({})",
+                                    progress * 100.0,
+                                    human_size(total_size),
+                                    format_speed(received - last_report_bytes, now.duration_since(last_report_instant)),
+                                )
+                            } else {
+                                format!(
                                     "正在接收 {:.0}% / {} ({})",
                                     progress * 100.0,
                                     human_size(total_size),
                                     format_speed(received - last_report_bytes, now.duration_since(last_report_instant)),
-                                );
+                                )
+                            };
                                 let _ = peer_tx.send(PeerEvent::FileProgress {
                                     peer_id: Some(sender_id.clone()),
                                     file_name: filename.clone(),
@@ -285,13 +302,25 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
 
     let completed_size = if total_size > 0 { total_size } else { final_received };
     let status = if success {
-        if completed_size > 0 {
-            format!("接收完成 ({})", human_size(completed_size))
+        if is_sync {
+            if completed_size > 0 {
+                format!("同步完成 ({})", human_size(completed_size))
+            } else {
+                "同步完成".to_string()
+            }
         } else {
-            "接收完成".to_string()
+            if completed_size > 0 {
+                format!("接收完成 ({})", human_size(completed_size))
+            } else {
+                "接收完成".to_string()
+            }
         }
     } else {
-        "接收失败".to_string()
+        if is_sync {
+            "同步失败".to_string()
+        } else {
+            "接收失败".to_string()
+        }
     };
     if success {
         let mut map = load_receive_map();
@@ -503,11 +532,16 @@ pub async fn handle_outgoing_file(
 
     if let Ok(mut socket) = socket {
         let _ = socket.set_nodelay(true);
+        let initial_status = if is_sync {
+            format!("待同步 - 准备发送 {} / {}", human_size(0), human_size(declared_size))
+        } else {
+            format!("准备发送 {} / {}", human_size(0), human_size(declared_size))
+        };
         let _ = peer_tx.send(PeerEvent::FileProgress {
             peer_id: Some(peer_id.clone()),
             file_name: filename.clone(),
             progress: 0.0,
-            status: "发送中...".to_string(),
+            status: initial_status,
             is_incoming: false,
             is_dir,
             local_path: Some(path.to_string_lossy().to_string()),
@@ -557,12 +591,21 @@ pub async fn handle_outgoing_file(
                                     let elapsed = now.duration_since(last_report_instant);
                                     let elapsed_ms = elapsed.as_millis();
                                     if (progress - last_progress >= 0.05 && elapsed_ms >= 200) || last_report_bytes == 0 {
-                                        let status = format!(
-                                            "发送中 {:.0}% / {} ({})",
-                                            progress * 100.0,
-                                            human_size(declared_size),
-                                            format_speed(sent_total - last_report_bytes, elapsed),
-                                        );
+                                        let status = if is_sync {
+                                            format!(
+                                                "正在同步 {:.0}% / {} ({})",
+                                                progress * 100.0,
+                                                human_size(declared_size),
+                                                format_speed(sent_total - last_report_bytes, elapsed),
+                                            )
+                                        } else {
+                                            format!(
+                                                "正在发送 {:.0}% / {} ({})",
+                                                progress * 100.0,
+                                                human_size(declared_size),
+                                                format_speed(sent_total - last_report_bytes, elapsed),
+                                            )
+                                        };
                                         let _ = peer_tx.send(PeerEvent::FileProgress {
                                             peer_id: Some(peer_id.clone()),
                                             file_name: filename.clone(),
@@ -603,9 +646,17 @@ pub async fn handle_outgoing_file(
                     };
 
                     let status_text = if send_ok && (declared_size == 0 || sent_total >= declared_size) {
-                        "发送完成".to_string()
+                        if is_sync {
+                            "同步完成".to_string()
+                        } else {
+                            "发送完成".to_string()
+                        }
                     } else {
-                        "发送失败".to_string()
+                        if is_sync {
+                            "同步失败".to_string()
+                        } else {
+                            "发送失败".to_string()
+                        }
                     };
 
                     let _ = peer_tx.send(PeerEvent::FileProgress {
