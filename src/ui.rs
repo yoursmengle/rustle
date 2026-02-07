@@ -5,8 +5,8 @@ use crate::model::{
 };
 use crate::net::spawn_network_worker;
 use crate::storage::{
-    data_path, file_mtime_seconds, load_or_init_node_id, load_settings, load_sync_tree,
-    peer_history_path, save_settings, save_sync_tree, sha256_file, AppSettings,
+    data_path, default_download_dir, file_mtime_seconds, load_or_init_node_id, load_settings,
+    load_sync_tree, peer_history_path, save_settings, save_sync_tree, sha256_file, AppSettings,
 };
 use chrono::{Duration as ChronoDuration, Local};
 use eframe::egui;
@@ -1045,6 +1045,44 @@ impl RustleApp {
                 if matches_from && matches_file {
                     val["recv_ts"] = serde_json::Value::String(recv_ts.to_string());
                     val["is_pending"] = serde_json::Value::Bool(false);
+                    lines.push(val.to_string());
+                    updated = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+        if updated {
+            let _ = fs::write(&path, lines.join("\n") + "\n");
+        }
+    }
+
+    fn update_history_file_path(
+        &self,
+        peer_id: &str,
+        file_name: &str,
+        new_path: &str,
+        from_me: bool,
+    ) {
+        let path = peer_history_path(peer_id);
+        let Ok(content) = fs::read_to_string(&path) else {
+            return;
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let mut updated = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
+                let matches_from = val.get("from_me").and_then(|v| v.as_bool()) == Some(from_me);
+                let matches_file = val
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p == file_name || p.ends_with(file_name))
+                    .unwrap_or(false);
+                if matches_from && matches_file {
+                    val["file_path"] = serde_json::Value::String(new_path.to_string());
                     lines.push(val.to_string());
                     updated = true;
                     continue;
@@ -2556,6 +2594,7 @@ impl eframe::App for RustleApp {
                             let mut pending_log: Option<(String, String, String)> = None;
                             let mut pending_sync: Option<(String, String, bool)> = None;
                             let mut pending_file_done: Option<(String, String, bool)> = None;
+                            let mut pending_path_update: Option<(String, String)> = None;
                             if let Some(msgs) = self.messages.get_mut(&pid) {
                                 if is_incoming {
                                     if is_sync {
@@ -2630,6 +2669,10 @@ impl eframe::App for RustleApp {
                                             }
 
                                             if progress >= 1.0 {
+                                                if let Some(path) = local_path.as_deref() {
+                                                    pending_path_update =
+                                                        Some((file_name.clone(), path.to_string()));
+                                                }
                                                 let ts = msg.recv_ts.clone().unwrap_or_else(|| {
                                                     Local::now()
                                                         .format("%Y-%m-%d %H:%M:%S")
@@ -2685,6 +2728,9 @@ impl eframe::App for RustleApp {
                                     false,
                                     is_sync,
                                 );
+                            }
+                            if let Some((file_name, path)) = pending_path_update {
+                                self.update_history_file_path(&pid, &file_name, &path, false);
                             }
                             if let Some((path, ts, from_me)) = pending_sync {
                                 self.update_history_sync(&pid, &path, &ts, from_me);
@@ -3256,11 +3302,16 @@ impl eframe::App for RustleApp {
                                                     ui.horizontal(|ui| {
                                                         if ui.link("📂 打开所在目录").clicked()
                                                         {
-                                                            if let Some(parent) =
-                                                                std::path::Path::new(path).parent()
-                                                            {
-                                                                let _ = open::that(parent);
-                                                            }
+                                                            let candidate = Path::new(path);
+                                                            let target = if candidate.is_absolute() {
+                                                                candidate
+                                                                    .parent()
+                                                                    .map(|p| p.to_path_buf())
+                                                                    .unwrap_or_else(default_download_dir)
+                                                            } else {
+                                                                default_download_dir()
+                                                            };
+                                                            let _ = open::that(target);
                                                         }
                                                     });
                                                 }

@@ -176,9 +176,16 @@ pub fn default_download_dir() -> PathBuf {
     let settings = load_settings();
     if let Some(dir) = settings.recv_dir.as_ref() {
         if !dir.trim().is_empty() {
-            let custom = PathBuf::from(dir.trim());
-            let _ = fs::create_dir_all(&custom);
-            return custom;
+            let raw = PathBuf::from(dir.trim());
+            let resolved = if raw.is_absolute() {
+                raw
+            } else {
+                // Avoid resolving relative paths under the app working directory.
+                data_dir().join(raw)
+            };
+            if fs::create_dir_all(&resolved).is_ok() {
+                return resolved;
+            }
         }
     }
     #[cfg(target_os = "windows")]
