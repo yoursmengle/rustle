@@ -675,8 +675,9 @@ pub fn spawn_network_worker(
                 last_discover_tick = Instant::now();
                 let now = Instant::now();
                 let mut removed: Vec<String> = Vec::new();
+                // 增加超时时间到30秒，减少网络抖动导致的在线/离线跳动
                 for (peer_id, last_seen) in last_from_peer.iter() {
-                    if now.duration_since(*last_seen) > Duration::from_secs(15) {
+                    if now.duration_since(*last_seen) > Duration::from_secs(30) {
                         removed.push(peer_id.clone());
                     }
                 }

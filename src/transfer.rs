@@ -362,16 +362,41 @@ pub async fn handle_outgoing_file(
     ) -> std::io::Result<TcpStream> {
         let addr_str = format!("{}:{}", peer_ip, port);
         if let Some(via_ip) = via {
+            eprintln!("[tx] attempting to connect to {} via interface {}", addr_str, via_ip);
             match tokio::net::TcpSocket::new_v4() {
                 Ok(s) => {
                     if let Ok(bind_addr) = format!("{}:0", via_ip).parse::<SocketAddr>() {
-                        let _ = s.bind(bind_addr);
+                        match s.bind(bind_addr) {
+                            Ok(_) => {
+                                eprintln!("[tx] successfully bound to {}", bind_addr);
+                                match s.connect(addr_str.parse().unwrap()).await {
+                                    Ok(stream) => {
+                                        eprintln!("[tx] successfully connected to {} via {}", addr_str, via_ip);
+                                        Ok(stream)
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[tx] connect failed via {}: {}", via_ip, e);
+                                        Err(e)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[tx] bind to {} failed: {}, trying direct connect", bind_addr, e);
+                                TcpStream::connect(&addr_str).await
+                            }
+                        }
+                    } else {
+                        eprintln!("[tx] invalid bind address for via {}, trying direct connect", via_ip);
+                        TcpStream::connect(&addr_str).await
                     }
-                    s.connect(addr_str.parse().unwrap()).await
                 }
-                Err(_) => TcpStream::connect(&addr_str).await,
+                Err(e) => {
+                    eprintln!("[tx] failed to create socket: {}, trying direct connect", e);
+                    TcpStream::connect(&addr_str).await
+                }
             }
         } else {
+            eprintln!("[tx] connecting directly to {}", addr_str);
             TcpStream::connect(&addr_str).await
         }
     }

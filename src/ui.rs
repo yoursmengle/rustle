@@ -24,6 +24,37 @@ use std::time::{Duration, Instant};
 use sysinfo::{NetworkExt, SystemExt};
 use uuid::Uuid;
 
+// Theme colors for professional UI
+mod theme {
+    use eframe::egui;
+
+    pub const PRIMARY: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);          // #2563eb
+    pub const PRIMARY_LIGHT: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);    // #3b82f6
+    pub const SECONDARY: egui::Color32 = egui::Color32::from_rgb(8, 145, 178);         // #0891b2
+    pub const SECONDARY_LIGHT: egui::Color32 = egui::Color32::from_rgb(6, 182, 212);   // #06b6d4
+    
+    pub const BG_PRIMARY: egui::Color32 = egui::Color32::from_rgb(248, 250, 252);      // #f8fafc
+    pub const BG_HOVER: egui::Color32 = egui::Color32::from_rgb(241, 245, 249);        // #f1f5f9
+    pub const BG_SELECTED: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);     // #e2e8f0
+    
+    pub const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(30, 41, 59);       // #1e293b
+    pub const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(71, 85, 105);    // #475569
+    pub const TEXT_LIGHT: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);      // #94a3b8
+    
+    pub const BORDER: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);          // #e2e8f0
+    pub const BORDER_LIGHT: egui::Color32 = egui::Color32::from_rgb(241, 245, 249);    // #f1f5f9
+    
+    pub const MSG_SENT_BG: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);       // #2563eb (blue)
+    pub const MSG_SENT_TEXT: egui::Color32 = egui::Color32::WHITE;
+    pub const MSG_RECV_BG: egui::Color32 = egui::Color32::WHITE;
+    pub const MSG_RECV_TEXT: egui::Color32 = egui::Color32::from_rgb(30, 41, 59);      // Same as TEXT_PRIMARY
+    pub const MSG_RECV_BORDER: egui::Color32 = egui::Color32::from_rgb(226, 232, 240); // Same as BORDER
+    
+    pub const STATUS_ONLINE: egui::Color32 = egui::Color32::from_rgb(6, 182, 212);     // #06b6d4 (cyan)
+    pub const STATUS_OFFLINE: egui::Color32 = egui::Color32::from_rgb(203, 213, 225);  // #cbd5e1 (gray)
+    pub const STATUS_UNREAD: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);    // #3b82f6 (blue)
+}
+
 pub fn run() -> eframe::Result<()> {
     // 加载图标
     let icon_data = match image::load_from_memory(include_bytes!("../rustle.ico")) {
@@ -1783,8 +1814,12 @@ impl RustleApp {
         }
 
         // 如果首选接口失败，尝试所有可用接口
+        // 优先尝试同网段接口，然后尝试其他接口
         let mut sent = false;
-        for bound_ip in &self.bound_interfaces.clone() {
+        let bound_list: Vec<String> = self.bound_interfaces.iter().cloned().collect();
+        
+        // 第一轮：尝试同网段接口
+        for bound_ip in &bound_list {
             if Self::same_lan(bound_ip, ip) {
                 if tx
                     .send(NetCmd::SendChat {
@@ -1802,6 +1837,30 @@ impl RustleApp {
                 }
             }
         }
+        
+        // 第二轮：如果同网段失败，尝试所有其他接口
+        if !sent {
+            eprintln!("[发送] 未找到同网段接口 -> {}, 尝试所有可用接口", ip);
+            for bound_ip in &bound_list {
+                if !Self::same_lan(bound_ip, ip) {
+                    if tx
+                        .send(NetCmd::SendChat {
+                            ip: ip.to_string(),
+                            text: text.to_string(),
+                            ts: ts.to_string(),
+                            via: Some(bound_ip.clone()),
+                            msg_id: msg_id.to_string(),
+                            local_ip: self.local_ip.clone(),
+                        })
+                        .is_ok()
+                    {
+                        eprintln!("[发送] 使用跨网段接口 {} -> {} 发送成功", bound_ip, ip);
+                        sent = true;
+                        break;
+                    }
+                }
+            }
+        }
 
         if sent {
             // 添加到待确认列表
@@ -1810,14 +1869,21 @@ impl RustleApp {
                 .entry(peer_id.to_string())
                 .or_default()
                 .push((msg_id.to_string(), deadline));
-        } else if let Some(msgs) = self.messages.get_mut(peer_id) {
-            if let Some(m) = msgs
-                .iter_mut()
-                .rev()
-                .find(|m| m.msg_id.as_deref() == Some(msg_id))
-            {
-                m.transfer_status = Some("未送达".to_string());
-                m.is_pending = true;
+        } else {
+            eprintln!(
+                "[发送失败] 无可用接口发送到 {} (绑定接口数: {})",
+                ip,
+                self.bound_interfaces.len()
+            );
+            if let Some(msgs) = self.messages.get_mut(peer_id) {
+                if let Some(m) = msgs
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.msg_id.as_deref() == Some(msg_id))
+                {
+                    m.transfer_status = Some("未送达".to_string());
+                    m.is_pending = true;
+                }
             }
         }
     }
@@ -3094,12 +3160,17 @@ impl eframe::App for RustleApp {
         egui::SidePanel::left("contacts")
             .resizable(false)
             .default_width(280.0)
+            .frame(egui::Frame::default().fill(theme::BG_PRIMARY))
             .show(ctx, |ui| {
-                ui.heading("联系人");
-                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("📞 联系人")
+                        .heading()
+                        .color(theme::TEXT_PRIMARY)
+                );
+                ui.add_space(10.0);
 
                 if self.users.is_empty() {
-                    ui.label(egui::RichText::new("暂无联系人").weak());
+                    ui.label(egui::RichText::new("暂无联系人").weak().color(theme::TEXT_LIGHT));
                 } else {
                     let mut online_users: Vec<User> = self
                         .users
@@ -3120,25 +3191,25 @@ impl eframe::App for RustleApp {
                         let selected = this.selected_user_id.as_deref() == Some(&user.id);
 
                         let mut label_text = user.name.clone();
-                        if !user.online {
-                            label_text = format!("{} (离线)", label_text);
-                        }
                         if user.has_unread {
-                            label_text.push_str(" *");
+                            label_text.push(' ');
+                            label_text.push_str("●");
                         }
 
                         let text_color = if selected {
-                            egui::Color32::WHITE
+                            theme::MSG_SENT_TEXT
                         } else if user.has_unread {
-                            egui::Color32::BLACK
+                            theme::STATUS_UNREAD
                         } else if user.online {
-                            egui::Color32::from_rgb(34, 197, 94)
+                            theme::SECONDARY_LIGHT
                         } else {
-                            egui::Color32::from_gray(140)
+                            theme::TEXT_LIGHT
                         };
 
-                        let bg_color = if user.has_unread {
-                            egui::Color32::from_rgb(255, 255, 0)
+                        let bg_color = if selected {
+                            theme::PRIMARY_LIGHT
+                        } else if user.has_unread {
+                            theme::BG_SELECTED
                         } else {
                             egui::Color32::TRANSPARENT
                         };
@@ -3149,18 +3220,22 @@ impl eframe::App for RustleApp {
                             egui::RichText::new(label_text).color(text_color)
                         };
 
-                        let resp = egui::Frame::none()
+                        let mut frame = egui::Frame::none()
                             .fill(bg_color)
-                            .inner_margin(2.0)
-                            .rounding(2.0)
-                            .show(ui, |ui| {
-                                ui.push_id(&user.id, |ui| {
-                                    ui.add(egui::SelectableLabel::new(selected, text))
-                                })
-                                .inner
+                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                            .rounding(6.0);
+                        
+                        if selected {
+                            frame = frame.stroke(egui::Stroke::new(2.0, theme::PRIMARY));
+                        }
+                        
+                        let resp = frame.show(ui, |ui| {
+                            ui.push_id(&user.id, |ui| {
+                                ui.add(egui::SelectableLabel::new(selected, text))
                             })
-                            .inner;
-
+                            .inner
+                        })
+                        .inner;
                         if resp.clicked() {
                             this.selected_user_id = Some(user.id.clone());
                             if let Some(u) = this.users.iter_mut().find(|u| u.id == user.id) {
@@ -3190,7 +3265,14 @@ impl eframe::App for RustleApp {
                     let online_height = (avail * 0.5).max(120.0).min(avail);
                     let offline_height = (avail - online_height - 12.0).max(80.0);
 
-                    ui.label(egui::RichText::new("在线").strong());
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("🟢 在线")
+                                .strong()
+                                .color(theme::SECONDARY_LIGHT)
+                        );
+                    });
                     egui::ScrollArea::vertical()
                         .id_salt("online_users")
                         .max_height(online_height)
@@ -3200,11 +3282,18 @@ impl eframe::App for RustleApp {
                             }
                         });
 
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     ui.separator();
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
 
-                    ui.label(egui::RichText::new("离线").strong());
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("⚪ 离线")
+                                .strong()
+                                .color(theme::TEXT_LIGHT)
+                        );
+                    });
                     egui::ScrollArea::vertical()
                         .id_salt("offline_users")
                         .max_height(offline_height)
@@ -3262,9 +3351,16 @@ impl eframe::App for RustleApp {
             self.show_ip_dialog = None;
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(theme::BG_PRIMARY))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(self.selected_user_name());
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(self.selected_user_name())
+                        .heading()
+                        .color(theme::TEXT_PRIMARY)
+                );
             });
             ui.separator();
 
@@ -3311,56 +3407,53 @@ impl eframe::App for RustleApp {
                                         if let Some(s) = &msg.last_sync_ts {
                                             meta.push_str(&format!("  |  同步: {}", s));
                                         }
-                                        ui.label(egui::RichText::new(meta).small().weak());
+                                        ui.label(egui::RichText::new(meta).small().color(theme::TEXT_LIGHT).weak());
 
-                                        let bg = if msg.from_me {
+                                        let (bg, border_color, fg) = if msg.from_me {
                                             if msg.transfer_status.as_deref() == Some("未送达") {
-                                                egui::Color32::from_gray(200)
+                                                (theme::BG_HOVER, theme::BORDER, theme::TEXT_PRIMARY)
                                             } else {
-                                                egui::Color32::from_rgb(149, 236, 105)
+                                                (theme::MSG_SENT_BG, theme::PRIMARY, theme::MSG_SENT_TEXT)
                                             }
                                         } else {
-                                            egui::Color32::WHITE
+                                            (theme::MSG_RECV_BG, theme::MSG_RECV_BORDER, theme::MSG_RECV_TEXT)
                                         };
-                                        let fg = egui::Color32::BLACK;
 
                                         egui::Frame::none()
                                             .fill(bg)
-                                            .stroke(egui::Stroke::new(
-                                                1.0,
-                                                egui::Color32::from_gray(220),
-                                            ))
-                                            .rounding(egui::Rounding::same(6.0))
-                                            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                            .stroke(egui::Stroke::new(1.5, border_color))
+                                            .rounding(egui::Rounding::same(10.0))
+                                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                                             .show(ui, |ui| {
                                                 ui.label(egui::RichText::new(&msg.text).color(fg));
 
                                                 if let Some(status) = &msg.transfer_status {
-                                                    ui.separator();
+                                                    ui.add_space(4.0);
                                                     ui.label(
                                                         egui::RichText::new(format!(
-                                                            "状态: {}",
+                                                            "⚡ {}",
                                                             status
                                                         ))
                                                         .small()
-                                                        .color(fg),
+                                                        .italics()
+                                                        .color(if msg.from_me { theme::TEXT_LIGHT } else { theme::STATUS_UNREAD }),
                                                     );
                                                 }
 
                                                 if msg.file_path.is_some() {
                                                     let status_label = if msg.needs_sync {
-                                                        Some("需同步")
+                                                        Some("🔄 需同步")
                                                     } else if msg.last_sync_ts.is_some() {
-                                                        Some("已经同步")
+                                                        Some("✓ 已同步")
                                                     } else {
                                                         None
                                                     };
                                                     if let Some(label) = status_label {
-                                                        ui.separator();
+                                                        ui.add_space(4.0);
                                                         ui.label(
                                                             egui::RichText::new(label)
                                                                 .small()
-                                                                .color(fg),
+                                                                .color(if msg.from_me { theme::TEXT_LIGHT } else { theme::SECONDARY_LIGHT }),
                                                         );
                                                     }
                                                 }
@@ -3406,7 +3499,7 @@ impl eframe::App for RustleApp {
                                 if i == msgs.len() - 1 {
                                     last_msg_resp = Some(resp);
                                 }
-                                ui.add_space(6.0);
+                                ui.add_space(10.0);
                             }
 
                             if self.scroll_to_bottom {
@@ -3435,46 +3528,43 @@ impl eframe::App for RustleApp {
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.set_height(bottom_height);
-                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.spacing_mut().item_spacing.y = 8.0;
 
                     ui.horizontal(|ui| {
                         ui.horizontal(|ui| {
-                            if ui
-                                .add_sized(
-                                    [100.0, 36.0],
-                                    egui::Button::new(egui::RichText::new("📁 文件").size(16.0)),
-                                )
-                                .clicked()
-                            {
+                            let btn_file = egui::Button::new(egui::RichText::new("📁 文件").size(14.0).color(theme::TEXT_PRIMARY))
+                                .fill(theme::BG_HOVER)
+                                .stroke(egui::Stroke::new(1.5, theme::BORDER))
+                                .min_size(egui::vec2(100.0, 36.0));
+                            if ui.add(btn_file).clicked() {
                                 self.pick_and_send(false);
                             }
-                            ui.add_space(4.0);
-                            if ui
-                                .add_sized(
-                                    [120.0, 36.0],
-                                    egui::Button::new(egui::RichText::new("📂 文件夹").size(16.0)),
-                                )
-                                .clicked()
-                            {
+                            ui.add_space(6.0);
+                            
+                            let btn_folder = egui::Button::new(egui::RichText::new("📂 文件夹").size(14.0).color(theme::TEXT_PRIMARY))
+                                .fill(theme::BG_HOVER)
+                                .stroke(egui::Stroke::new(1.5, theme::BORDER))
+                                .min_size(egui::vec2(120.0, 36.0));
+                            if ui.add(btn_folder).clicked() {
                                 self.pick_and_send(true);
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(12.0);
                             ui.label(
                                 egui::RichText::new("支持拖放文件/文件夹到窗口")
                                     .weak()
-                                    .small(),
+                                    .small()
+                                    .color(theme::TEXT_LIGHT),
                             );
                         });
 
                         ui.add_space(8.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(8.0);
-                            if ui
-                                .add_sized(
-                                    [100.0, 36.0],
-                                    egui::Button::new(egui::RichText::new("🚀 发送").size(16.0)),
-                                )
-                                .clicked()
+                            let btn_send = egui::Button::new(egui::RichText::new("🚀 发送").size(14.0).color(theme::MSG_SENT_TEXT))
+                                .fill(theme::PRIMARY)
+                                .stroke(egui::Stroke::new(1.5, theme::PRIMARY))
+                                .min_size(egui::vec2(100.0, 36.0));
+                            if ui.add(btn_send).clicked()
                                 || ctx.input(|i| i.key_pressed(egui::Key::Enter))
                             {
                                 self.send_current();
@@ -3482,7 +3572,7 @@ impl eframe::App for RustleApp {
                         });
                     });
 
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
 
                     let input_height = ui.available_height();
                     ui.add(
