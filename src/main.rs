@@ -15,16 +15,18 @@ macro_rules! debug_println {
     ($($arg:tt)*) => {};
 }
 
+mod metadata;
 mod model;
-mod storage;
-mod transfer;
 mod net;
-mod ui;
+mod storage;
 mod time_sync;
+mod transfer;
+mod ui;
 
 pub const APP_VERSION: &str = "v1.2.0";
 
 fn main() -> eframe::Result<()> {
     time_sync::sync_system_time_at_startup();
+
     ui::run()
 }

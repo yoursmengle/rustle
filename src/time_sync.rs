@@ -15,16 +15,19 @@ pub fn sync_system_time_at_startup() {
         match query_ntp_time(server) {
             Ok(ntp_time) => {
                 let local_time = SystemTime::now();
-                
+
                 // 计算时间差异
                 let time_diff = match ntp_time.duration_since(local_time) {
                     Ok(duration) => duration.as_secs_f64(),
                     Err(err) => -err.duration().as_secs_f64(),
                 };
-                
+
                 // 只提示时间差异，不进行同步（避免需要管理员权限）
                 if time_diff.abs() < 5.0 {
-                    crate::debug_println!("Time sync: time difference is {:.2}s, no sync needed", time_diff);
+                    crate::debug_println!(
+                        "Time sync: time difference is {:.2}s, no sync needed",
+                        time_diff
+                    );
                 } else {
                     crate::debug_println!("Time sync: time difference is {:.2}s (consider syncing manually if needed)", time_diff);
                 }
@@ -67,4 +70,34 @@ fn parse_ntp_response(response: &[u8; 48]) -> io::Result<SystemTime> {
 
     let nanos = (frac as u128 * 1_000_000_000u128) / 4_294_967_296u128;
     Ok(UNIX_EPOCH + Duration::new(unix_secs as u64, nanos as u32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn parse_ntp_response_valid() {
+        // 2021-01-01T00:00:00Z
+        let unix_secs: i64 = 1609459200;
+        let secs = (NTP_UNIX_EPOCH_DIFF_SECS + unix_secs) as u32;
+        let mut resp = [0u8; 48];
+        resp[40..44].copy_from_slice(&secs.to_be_bytes());
+        resp[44..48].copy_from_slice(&0u32.to_be_bytes());
+        let t = parse_ntp_response(&resp).expect("parse");
+        let dur = t.duration_since(UNIX_EPOCH).unwrap();
+        assert_eq!(dur.as_secs(), unix_secs as u64);
+    }
+
+    #[test]
+    fn parse_ntp_response_before_unix_epoch() {
+        // NTP seconds smaller than diff -> error
+        let secs = (NTP_UNIX_EPOCH_DIFF_SECS - 1) as u32;
+        let mut resp = [0u8; 48];
+        resp[40..44].copy_from_slice(&secs.to_be_bytes());
+        resp[44..48].copy_from_slice(&0u32.to_be_bytes());
+        let res = parse_ntp_response(&resp);
+        assert!(res.is_err());
+    }
 }

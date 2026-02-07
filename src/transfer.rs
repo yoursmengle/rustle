@@ -1,3 +1,4 @@
+use crate::metadata::{Metadata, MetadataStore};
 use crate::model::{PeerEvent, TCP_DIR_PORT, TCP_FILE_PORT};
 use crate::storage::{default_download_dir, load_receive_map, save_receive_map, windows_long_path};
 use chrono::Local;
@@ -36,10 +37,19 @@ fn format_speed(bytes: u64, elapsed: Duration) -> String {
 }
 
 fn receive_map_key(sender_id: &str, is_dir: bool, filename: &str) -> String {
-    format!("{}|{}|{}", sender_id, if is_dir { "dir" } else { "file" }, filename)
+    format!(
+        "{}|{}|{}",
+        sender_id,
+        if is_dir { "dir" } else { "file" },
+        filename
+    )
 }
 
-pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_tx: Sender<PeerEvent>) {
+pub async fn handle_incoming_file(
+    mut socket: TcpStream,
+    addr: SocketAddr,
+    peer_tx: Sender<PeerEvent>,
+) {
     let _ = socket.set_nodelay(true);
     let mut type_buf = [0u8; 1];
     if socket.read_exact(&mut type_buf).await.is_err() {
@@ -89,7 +99,9 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
     }
     let total_size = u64::from_be_bytes(size_buf);
 
-    eprintln!("[rx] header from {addr} id={sender_id} name={filename} is_dir={is_dir} size={total_size}");
+    eprintln!(
+        "[rx] header from {addr} id={sender_id} name={filename} is_dir={is_dir} size={total_size}"
+    );
 
     let initial_status = if total_size > 0 {
         format!("正在接收 0% / {}", human_size(total_size))
@@ -120,7 +132,10 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
 
     let (sub_dir, save_path) = if let Some(mapped) = mapped_path {
         if is_dir {
-            let parent = mapped.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| base_dir.clone());
+            let parent = mapped
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| base_dir.clone());
             let _ = fs::create_dir_all(&parent);
             let _ = fs::create_dir_all(&mapped);
             (parent, mapped)
@@ -128,7 +143,10 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
             if let Some(parent) = mapped.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            let parent = mapped.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| base_dir.clone());
+            let parent = mapped
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| base_dir.clone());
             (parent, mapped)
         }
     } else {
@@ -166,12 +184,17 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
                             let progress = (received as f32 / total_size as f32).min(1.0);
                             let now = Instant::now();
                             let elapsed_ms = now.duration_since(last_report_instant).as_millis();
-                            if (progress - last_progress >= 0.05 && elapsed_ms >= 200) || last_report_bytes == 0 {
+                            if (progress - last_progress >= 0.05 && elapsed_ms >= 200)
+                                || last_report_bytes == 0
+                            {
                                 let status = format!(
                                     "正在接收 {:.0}% / {} ({})",
                                     progress * 100.0,
                                     human_size(total_size),
-                                    format_speed(received - last_report_bytes, now.duration_since(last_report_instant)),
+                                    format_speed(
+                                        received - last_report_bytes,
+                                        now.duration_since(last_report_instant)
+                                    ),
                                 );
                                 let _ = peer_tx.send(PeerEvent::FileProgress {
                                     peer_id: Some(sender_id.clone()),
@@ -239,12 +262,17 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
                         let progress = (received as f32 / total_size as f32).min(1.0);
                         let now = Instant::now();
                         let elapsed_ms = now.duration_since(last_report_instant).as_millis();
-                        if (progress - last_progress >= 0.05 && elapsed_ms >= 200) || last_report_bytes == 0 {
+                        if (progress - last_progress >= 0.05 && elapsed_ms >= 200)
+                            || last_report_bytes == 0
+                        {
                             let status = format!(
                                 "正在接收 {:.0}% / {} ({})",
                                 progress * 100.0,
                                 human_size(total_size),
-                                format_speed(received - last_report_bytes, now.duration_since(last_report_instant)),
+                                format_speed(
+                                    received - last_report_bytes,
+                                    now.duration_since(last_report_instant)
+                                ),
                             );
                             let _ = peer_tx.send(PeerEvent::FileProgress {
                                 peer_id: Some(sender_id.clone()),
@@ -283,7 +311,11 @@ pub async fn handle_incoming_file(mut socket: TcpStream, addr: SocketAddr, peer_
         eprintln!("[rx] failed to create file at {:?}", save_path);
     }
 
-    let completed_size = if total_size > 0 { total_size } else { final_received };
+    let completed_size = if total_size > 0 {
+        total_size
+    } else {
+        final_received
+    };
     let status = if success {
         if completed_size > 0 {
             format!("接收完成 ({})", human_size(completed_size))
@@ -359,7 +391,11 @@ pub async fn handle_outgoing_file(
 
     let addr_str = format!("{}:{}", peer_ip, used_port);
 
-    let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let filename = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let declared_size: u64;
     let mut send_path = path.clone();
     let mut cleanup_path: Option<PathBuf> = None;
@@ -402,7 +438,11 @@ pub async fn handle_outgoing_file(
                         if builder.append_dir(&tar_path, &path).is_err() {
                             *skipped += 1;
                         }
-                        if add_dir_to_tar(builder, root, &path, base_name, skipped, processed, last_pause).is_err() {
+                        if add_dir_to_tar(
+                            builder, root, &path, base_name, skipped, processed, last_pause,
+                        )
+                        .is_err()
+                        {
                             *skipped += 1;
                         }
                     } else if path.is_file() {
@@ -438,7 +478,10 @@ pub async fn handle_outgoing_file(
                 &mut last_pause,
             )?;
             if skipped > 0 {
-                eprintln!("[tx] tar build skipped {} entries due to read/permission errors", skipped);
+                eprintln!(
+                    "[tx] tar build skipped {} entries due to read/permission errors",
+                    skipped
+                );
             }
             builder.finish()?;
             Ok::<(), std::io::Error>(())
@@ -520,6 +563,39 @@ pub async fn handle_outgoing_file(
         let id_len = id_bytes.len() as u8;
 
         let mut header = Vec::new();
+        // create metadata record for this outgoing transfer
+        let meta_id = Uuid::new_v4().to_string();
+        let abs_path = path.to_string_lossy().to_string();
+        let modified_time = crate::storage::file_mtime_seconds(&path).unwrap_or(0);
+        let sha = match tokio::task::spawn_blocking({
+            let send_path = send_path.clone();
+            move || crate::storage::sha256_file(&send_path)
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => None,
+        };
+        let meta = Metadata {
+            id: meta_id.clone(),
+            peer_id: Some(peer_id.clone()),
+            peer_ip: Some(peer_ip.clone()),
+            abs_path: abs_path.clone(),
+            rel_path: None,
+            filename: filename.clone(),
+            size: declared_size,
+            is_dir,
+            modified_time,
+            sha256: sha.clone(),
+            last_synced_sha256: None,
+            last_synced_time: None,
+            sync_status: crate::model::SyncStatus::ReadyToSend,
+            auto_sync_enabled: crate::storage::load_settings().auto_sync_on_send,
+        };
+        if let Ok(store) = MetadataStore::open_default() {
+            let _ = store.insert(&meta);
+        }
+
         header.push(if is_dir { 1 } else { 0 });
         header.push(if is_sync { 1 } else { 0 });
         header.push(id_len);
@@ -552,11 +628,14 @@ pub async fn handle_outgoing_file(
                                 sent_total += n as u64;
 
                                 if declared_size > 0 {
-                                    let progress = (sent_total as f32 / declared_size as f32).min(1.0);
+                                    let progress =
+                                        (sent_total as f32 / declared_size as f32).min(1.0);
                                     let now = Instant::now();
                                     let elapsed = now.duration_since(last_report_instant);
                                     let elapsed_ms = elapsed.as_millis();
-                                    if (progress - last_progress >= 0.05 && elapsed_ms >= 200) || last_report_bytes == 0 {
+                                    if (progress - last_progress >= 0.05 && elapsed_ms >= 200)
+                                        || last_report_bytes == 0
+                                    {
                                         let status = format!(
                                             "发送中 {:.0}% / {} ({})",
                                             progress * 100.0,
@@ -602,11 +681,12 @@ pub async fn handle_outgoing_file(
                         0.0
                     };
 
-                    let status_text = if send_ok && (declared_size == 0 || sent_total >= declared_size) {
-                        "发送完成".to_string()
-                    } else {
-                        "发送失败".to_string()
-                    };
+                    let status_text =
+                        if send_ok && (declared_size == 0 || sent_total >= declared_size) {
+                            "发送完成".to_string()
+                        } else {
+                            "发送失败".to_string()
+                        };
 
                     let _ = peer_tx.send(PeerEvent::FileProgress {
                         peer_id: Some(peer_id),
