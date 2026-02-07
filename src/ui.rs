@@ -1851,17 +1851,10 @@ impl RustleApp {
 
             let target_tcp_port = if is_dir { TCP_DIR_PORT } else { TCP_FILE_PORT };
 
-            let icon = if is_dir { "📁" } else { "📄" };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
 
             self.track_sync_source(&id, path);
 
-            if is_dir {
-                let prep_text = format!("对方有一个文件夹（{}）正在准备发送", name);
-                self.send_message_internal(&id, prep_text);
-            }
-
-            let text = format!("{} {}", icon, name);
             let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
             let mut sent = false;
@@ -1893,46 +1886,13 @@ impl RustleApp {
                     .entry(id.clone())
                     .or_default()
                     .push(QueuedMsg {
-                        text: text.clone(),
+                        text: String::new(),
                         send_ts: ts.clone(),
                         msg_id: None,
                         file_path: Some(path.clone()),
                         is_dir,
                     });
             }
-
-            let msgs = self.messages.entry(id.clone()).or_default();
-            let needs_sync = self.settings.auto_sync_on_send;
-            msgs.push(ChatMessage {
-                from_me: true,
-                text: text.clone(),
-                send_ts: ts.clone(),
-                recv_ts: None,
-                last_sync_ts: None,
-                file_path: Some(path.to_string_lossy().to_string()),
-                transfer_status: Some(if sent {
-                    "发送中...".to_string()
-                } else {
-                    "等待对方上线...".to_string()
-                }),
-                msg_id: None,
-                is_read: true,
-                is_pending: !sent,
-                needs_sync,
-            });
-
-            self.log_history(
-                &id,
-                true,
-                &text,
-                &ts,
-                None,
-                Some(&path.to_string_lossy()),
-                None,
-                None,
-                !sent,
-                needs_sync,
-            );
         }
     }
 
