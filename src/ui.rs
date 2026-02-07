@@ -1436,7 +1436,7 @@ impl RustleApp {
         }
         let elapsed_ok = self
             .last_sync_scan
-            .map(|t| t.elapsed() >= Duration::from_secs(30 * 60))
+            .map(|t| t.elapsed() >= Duration::from_secs(5 * 60))
             .unwrap_or(true);
         if !elapsed_ok {
             return;
@@ -2756,6 +2756,12 @@ impl eframe::App for RustleApp {
                                             Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                                         msg.last_sync_ts = Some(ts.clone());
                                         msg.is_pending = false;
+                                        if is_sync {
+                                            msg.transfer_status = Some(format!(
+                                                "已同步，最后同步时间： {}",
+                                                ts
+                                            ));
+                                        }
                                         if let Some(path) = msg.file_path.clone() {
                                             pending_sync = Some((path.clone(), ts.clone(), true));
                                             pending_file_done = Some((path, ts, true));
