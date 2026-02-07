@@ -3297,8 +3297,13 @@ impl eframe::App for RustleApp {
                                 } else {
                                     egui::Align::LEFT
                                 };
+                                let max_bubble_width = ui.available_width() * 0.7;
                                 let resp = ui
-                                    .with_layout(egui::Layout::top_down(align), |ui| {
+                                    .allocate_ui_with_layout(
+                                        egui::vec2(ui.available_width(), 0.0),
+                                        egui::Layout::top_down(align),
+                                        |ui| {
+                                            ui.set_max_width(max_bubble_width);
                                         let mut meta = format!("发送: {}", msg.send_ts);
                                         if let Some(r) = &msg.recv_ts {
                                             meta.push_str(&format!("  |  接收: {}", r));
@@ -3381,7 +3386,8 @@ impl eframe::App for RustleApp {
                                                     });
                                                 }
                                             });
-                                    })
+                                        },
+                                    )
                                     .response;
 
                                 if !msg.from_me && !msg.is_read {
