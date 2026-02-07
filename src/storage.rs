@@ -286,31 +286,6 @@ pub fn load_or_init_node_id() -> String {
     }
 }
 
-fn remove_history_entry_file(path: &std::path::Path, msg_id: &str) -> bool {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let mut lines: Vec<String> = Vec::new();
-    let mut removed = false;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if val.get("msg_id").and_then(|v| v.as_str()) == Some(msg_id) {
-                removed = true;
-                continue;
-            }
-        }
-        lines.push(line.to_string());
-    }
-    if removed {
-        let _ = fs::write(path, lines.join("\n") + "\n");
-    }
-    removed
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,30 +362,5 @@ mod tests {
         assert_eq!(s.auto_check_update, s2.auto_check_update);
         assert_eq!(s.preferred_interface, s2.preferred_interface);
         assert_eq!(s.recv_dir.is_none(), s2.recv_dir.is_none());
-    }
-
-    #[test]
-    fn remove_history_entry_file_works() {
-        use std::fs::File;
-        use std::io::Write;
-        use uuid::Uuid;
-
-        let base = std::env::temp_dir().join(format!("rustle_history_{}", Uuid::new_v4()));
-        let path = base.with_extension("jsonl");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut f = File::create(&path).unwrap();
-        let line1 = serde_json::json!({"peer_id":"p","from_me":false,"text":"t1","send_ts":"s","msg_id":"m1"}).to_string();
-        let line2 = serde_json::json!({"peer_id":"p","from_me":false,"text":"t2","send_ts":"s","msg_id":"m2"}).to_string();
-        writeln!(f, "{}", line1).unwrap();
-        writeln!(f, "{}", line2).unwrap();
-        drop(f);
-
-        // helper to be implemented
-        assert!(remove_history_entry_file(&path, "m1"));
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("m2"));
-        assert!(!content.contains("m1"));
     }
 }

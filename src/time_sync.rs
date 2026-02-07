@@ -33,8 +33,8 @@ pub fn sync_system_time_at_startup() {
                 }
                 return;
             }
-            Err(err) => {
-                crate::debug_println!("Time sync: failed to query {server}: {err}");
+            Err(_err) => {
+                crate::debug_println!("Time sync: failed to query {server}: {_err}");
             }
         }
     }

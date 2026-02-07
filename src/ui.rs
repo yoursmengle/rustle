@@ -1057,6 +1057,44 @@ impl RustleApp {
         }
     }
 
+    fn update_history_needs_sync(
+        &self,
+        peer_id: &str,
+        file_path: &str,
+        needs_sync: bool,
+        from_me: bool,
+    ) {
+        let path = peer_history_path(peer_id);
+        let Ok(content) = fs::read_to_string(&path) else {
+            return;
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let mut updated = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
+                let matches_from = val.get("from_me").and_then(|v| v.as_bool()) == Some(from_me);
+                let matches_file = val
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p == file_path || p.ends_with(file_path) || file_path.ends_with(p))
+                    .unwrap_or(false);
+                if matches_from && matches_file {
+                    val["needs_sync"] = serde_json::Value::Bool(needs_sync);
+                    lines.push(val.to_string());
+                    updated = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+        if updated {
+            let _ = fs::write(&path, lines.join("\n") + "\n");
+        }
+    }
+
     fn update_history_file_path(
         &self,
         peer_id: &str,
@@ -2237,25 +2275,25 @@ impl eframe::App for RustleApp {
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("meta_grid").striped(true).show(ui, |ui| {
-                    ui.label("文件名");
-                    ui.label("类型");
-                    ui.label("路径");
-                    ui.label("Peer");
-                    ui.label("大小");
-                    ui.label("状态");
-                    ui.label("自动");
-                    ui.label("");
+                        ui.label("文件名");
+                        ui.label("类型");
+                        ui.label("路径");
+                        ui.label("Peer");
+                        ui.label("大小");
+                        ui.label("状态");
+                        ui.label("自动");
+                        ui.label("");
                         ui.end_row();
 
                         let snapshot = self.meta_list.clone();
                         for m in snapshot.iter() {
-                        ui.label(&m.filename);
-                        ui.label(if m.is_dir { "目录" } else { "文件" });
-                        ui.label(&m.abs_path);
-                        let peer_label = m.peer_id.clone().unwrap_or_else(|| "-".to_string());
-                        ui.label(peer_label);
-                        ui.label(format!("{}", m.size));
-                        ui.label(&m.status);
+                            ui.label(&m.filename);
+                            ui.label(if m.is_dir { "目录" } else { "文件" });
+                            ui.label(&m.abs_path);
+                            let peer_label = m.peer_id.clone().unwrap_or_else(|| "-".to_string());
+                            ui.label(peer_label);
+                            ui.label(format!("{}", m.size));
+                            ui.label(&m.status);
                             let mut auto = m.auto_sync_enabled;
                             if ui.add(egui::Checkbox::new(&mut auto, "")).changed() {
                                 self.set_meta_auto(&m.id, auto);
@@ -2595,6 +2633,7 @@ impl eframe::App for RustleApp {
                             let mut pending_sync: Option<(String, String, bool)> = None;
                             let mut pending_file_done: Option<(String, String, bool)> = None;
                             let mut pending_path_update: Option<(String, String)> = None;
+                            let mut pending_needs_sync_update: Option<(String, bool)> = None;
                             if let Some(msgs) = self.messages.get_mut(&pid) {
                                 if is_incoming {
                                     if is_sync {
@@ -2700,6 +2739,15 @@ impl eframe::App for RustleApp {
                                             .map(|p| p.ends_with(&file_name))
                                             .unwrap_or(false)
                                 }) {
+                                    let new_needs_sync = progress < 1.0;
+                                    if msg.needs_sync != new_needs_sync {
+                                        msg.needs_sync = new_needs_sync;
+                                        if let Some(path) = msg.file_path.clone() {
+                                            pending_needs_sync_update =
+                                                Some((path, new_needs_sync));
+                                        }
+                                    }
+
                                     if !is_sync {
                                         msg.transfer_status = Some(status.clone());
                                     }
@@ -2714,6 +2762,10 @@ impl eframe::App for RustleApp {
                                         }
                                     }
                                 }
+                            }
+
+                            if let Some((path, needs_sync)) = pending_needs_sync_update.take() {
+                                self.update_history_needs_sync(&pid, &path, needs_sync, true);
                             }
                             if let Some((text, ts, path)) = pending_log {
                                 self.log_history(
@@ -3289,13 +3341,22 @@ impl eframe::App for RustleApp {
                                                     );
                                                 }
 
-                                                if msg.needs_sync {
-                                                    ui.separator();
-                                                    ui.label(
-                                                        egui::RichText::new("需同步")
-                                                            .small()
-                                                            .color(fg),
-                                                    );
+                                                if msg.file_path.is_some() {
+                                                    let status_label = if msg.needs_sync {
+                                                        Some("需同步")
+                                                    } else if msg.last_sync_ts.is_some() {
+                                                        Some("已经同步")
+                                                    } else {
+                                                        None
+                                                    };
+                                                    if let Some(label) = status_label {
+                                                        ui.separator();
+                                                        ui.label(
+                                                            egui::RichText::new(label)
+                                                                .small()
+                                                                .color(fg),
+                                                        );
+                                                    }
                                                 }
 
                                                 if let Some(path) = &msg.file_path {
@@ -3303,11 +3364,14 @@ impl eframe::App for RustleApp {
                                                         if ui.link("📂 打开所在目录").clicked()
                                                         {
                                                             let candidate = Path::new(path);
-                                                            let target = if candidate.is_absolute() {
+                                                            let target = if candidate.is_absolute()
+                                                            {
                                                                 candidate
                                                                     .parent()
                                                                     .map(|p| p.to_path_buf())
-                                                                    .unwrap_or_else(default_download_dir)
+                                                                    .unwrap_or_else(
+                                                                        default_download_dir,
+                                                                    )
                                                             } else {
                                                                 default_download_dir()
                                                             };
