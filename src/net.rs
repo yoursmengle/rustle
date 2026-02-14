@@ -3,7 +3,7 @@ use crate::model::{
     HeartbeatPayload, HelloMsg, NameUpdatePayload, NetCmd, PeerBrief, PeerEvent, PeerSnapshot,
     SyncPayload, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT, UDP_MESSAGE_PORT,
 };
-use crate::storage::load_or_init_node_id;
+use crate::storage::{load_or_init_node_id, load_settings};
 use crate::transfer::{handle_incoming_file, handle_outgoing_file};
 use chrono::Local;
 use get_if_addrs::get_if_addrs;
@@ -43,16 +43,28 @@ pub fn spawn_network_worker(
         let my_id = load_or_init_node_id();
         let my_id_clone = my_id.clone();
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let settings = load_settings();
+        let peer_timeout_secs = settings.peer_timeout_secs;
+        let peer_timeout = Duration::from_secs(peer_timeout_secs);
+
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime, please check system resources");
         let (file_cmd_tx, mut file_cmd_rx) = tokio::sync::mpsc::channel::<FileCmd>(32);
 
-        let tcp_file_listener = rt
-            .block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, TCP_FILE_PORT)).await })
-            .expect("Failed to bind TCP file listener");
+        let tcp_file_listener = match rt.block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, TCP_FILE_PORT)).await }) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("Failed to bind TCP file listener on port {}: {}. File transfer may not work.", TCP_FILE_PORT, e);
+                panic!("Cannot continue without TCP file listener");
+            }
+        };
 
-        let tcp_dir_listener = rt
-            .block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, TCP_DIR_PORT)).await })
-            .expect("Failed to bind TCP directory listener");
+        let tcp_dir_listener = match rt.block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, TCP_DIR_PORT)).await }) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("Failed to bind TCP directory listener on port {}: {}. Directory transfer may not work.", TCP_DIR_PORT, e);
+                panic!("Cannot continue without TCP directory listener");
+            }
+        };
 
         let peer_tx_clone = peer_tx.clone();
         rt.spawn(async move {
@@ -737,9 +749,9 @@ pub fn spawn_network_worker(
                 last_discover_tick = Instant::now();
                 let now = Instant::now();
                 let mut removed: Vec<String> = Vec::new();
-                // 增加超时时间到30秒，减少网络抖动导致的在线/离线跳动
+                // 使用配置的超时时间
                 for (peer_id, last_seen) in last_from_peer.iter() {
-                    if now.duration_since(*last_seen) > Duration::from_secs(30) {
+                    if now.duration_since(*last_seen) > peer_timeout {
                         removed.push(peer_id.clone());
                     }
                 }

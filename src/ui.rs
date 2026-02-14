@@ -1,3 +1,4 @@
+use crate::debug_println;
 use crate::model::{
     ChatMessage, HistoryEntry, KnownPeer, NetCmd, Peer, PeerEvent, QueuedMsg, SyncNode, SyncStatus,
     SyncTree, User, KNOWN_PEERS_FILE, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT,
@@ -24,35 +25,45 @@ use std::time::{Duration, Instant};
 use sysinfo::{NetworkExt, SystemExt};
 use uuid::Uuid;
 
-// Theme colors for professional UI
+// Theme colors for professional UI - Modern elegant design
+#[allow(dead_code)]
 mod theme {
     use eframe::egui;
 
-    pub const PRIMARY: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);          // #2563eb
-    pub const PRIMARY_LIGHT: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);    // #3b82f6
-    pub const SECONDARY: egui::Color32 = egui::Color32::from_rgb(8, 145, 178);         // #0891b2
-    pub const SECONDARY_LIGHT: egui::Color32 = egui::Color32::from_rgb(6, 182, 212);   // #06b6d4
-    
-    pub const BG_PRIMARY: egui::Color32 = egui::Color32::from_rgb(248, 250, 252);      // #f8fafc
-    pub const BG_HOVER: egui::Color32 = egui::Color32::from_rgb(241, 245, 249);        // #f1f5f9
-    pub const BG_SELECTED: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);     // #e2e8f0
-    
-    pub const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(30, 41, 59);       // #1e293b
-    pub const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(71, 85, 105);    // #475569
-    pub const TEXT_LIGHT: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);      // #94a3b8
-    
-    pub const BORDER: egui::Color32 = egui::Color32::from_rgb(226, 232, 240);          // #e2e8f0
-    pub const BORDER_LIGHT: egui::Color32 = egui::Color32::from_rgb(241, 245, 249);    // #f1f5f9
-    
-    pub const MSG_SENT_BG: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);       // #2563eb (blue)
+    // Primary colors - Deep blue gradient palette
+    pub const PRIMARY: egui::Color32 = egui::Color32::from_rgb(30, 64, 175); // #1e40af (deep blue)
+    pub const PRIMARY_LIGHT: egui::Color32 = egui::Color32::from_rgb(59, 130, 246); // #3b82f6 (bright blue)
+    pub const SECONDARY: egui::Color32 = egui::Color32::from_rgb(20, 184, 166); // #14b8a6 (teal)
+    pub const SECONDARY_LIGHT: egui::Color32 = egui::Color32::from_rgb(45, 212, 191); // #2dd4bf
+
+    // Background colors - Clean modern palette
+    pub const BG_PRIMARY: egui::Color32 = egui::Color32::from_rgb(249, 250, 251); // #fafafa
+    pub const BG_SECONDARY: egui::Color32 = egui::Color32::from_rgb(243, 244, 246); // #f3f4f6
+    pub const BG_HOVER: egui::Color32 = egui::Color32::from_rgb(229, 231, 235); // #e5e7eb
+    pub const BG_SELECTED: egui::Color32 = egui::Color32::from_rgb(224, 231, 255); // #e0e7ff
+
+    // Text colors - Professional hierarchy
+    pub const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(17, 24, 39); // #111827
+    pub const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(75, 85, 99); // #4b5563
+    pub const TEXT_TERTIARY: egui::Color32 = egui::Color32::from_rgb(156, 163, 175); // #9ca3af
+    pub const TEXT_LIGHT: egui::Color32 = egui::Color32::from_rgb(209, 213, 219); // #d1d5db
+
+    // Border colors
+    pub const BORDER: egui::Color32 = egui::Color32::from_rgb(209, 213, 219); // #d1d5db
+    pub const BORDER_LIGHT: egui::Color32 = egui::Color32::from_rgb(229, 231, 235); // #e5e7eb
+
+    // Message bubble colors
+    pub const MSG_SENT_BG: egui::Color32 = egui::Color32::from_rgb(59, 130, 246); // #3b82f6 (blue)
     pub const MSG_SENT_TEXT: egui::Color32 = egui::Color32::WHITE;
     pub const MSG_RECV_BG: egui::Color32 = egui::Color32::WHITE;
-    pub const MSG_RECV_TEXT: egui::Color32 = egui::Color32::from_rgb(30, 41, 59);      // Same as TEXT_PRIMARY
-    pub const MSG_RECV_BORDER: egui::Color32 = egui::Color32::from_rgb(226, 232, 240); // Same as BORDER
-    
-    pub const STATUS_ONLINE: egui::Color32 = egui::Color32::from_rgb(6, 182, 212);     // #06b6d4 (cyan)
-    pub const STATUS_OFFLINE: egui::Color32 = egui::Color32::from_rgb(203, 213, 225);  // #cbd5e1 (gray)
-    pub const STATUS_UNREAD: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);    // #3b82f6 (blue)
+    pub const MSG_RECV_TEXT: egui::Color32 = egui::Color32::from_rgb(17, 24, 39); // #111827
+    pub const MSG_RECV_BORDER: egui::Color32 = egui::Color32::from_rgb(229, 231, 235);
+
+    // Status colors
+    pub const STATUS_ONLINE: egui::Color32 = egui::Color32::from_rgb(16, 185, 129); // #10b981 (green)
+    pub const STATUS_OFFLINE: egui::Color32 = egui::Color32::from_rgb(156, 163, 175); // #9ca3af
+    pub const STATUS_UNREAD: egui::Color32 = egui::Color32::from_rgb(239, 68, 68);
+    // #ef4444 (red)
 }
 
 pub fn run() -> eframe::Result<()> {
@@ -1790,6 +1801,16 @@ impl RustleApp {
     ) {
         let Some(tx) = &self.net_cmd_tx else { return };
 
+        let mut mark_pending_ack = |peer_id: &str, msg_id: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let list = self.pending_acks.entry(peer_id.to_string()).or_default();
+            if let Some((_, existing_deadline)) = list.iter_mut().find(|(mid, _)| mid == msg_id) {
+                *existing_deadline = deadline;
+            } else {
+                list.push((msg_id.to_string(), deadline));
+            }
+        };
+
         // 首先尝试使用首选接口发送
         if let Some(via) = preferred_via {
             if tx
@@ -1803,12 +1824,8 @@ impl RustleApp {
                 })
                 .is_ok()
             {
-                // 添加到待确认列表，延长超时时间到5秒
-                let deadline = Instant::now() + Duration::from_secs(5);
-                self.pending_acks
-                    .entry(peer_id.to_string())
-                    .or_default()
-                    .push((msg_id.to_string(), deadline));
+                // 添加到待确认列表（同一 msg_id 去重并刷新超时）
+                mark_pending_ack(peer_id, msg_id);
                 return;
             }
         }
@@ -1817,7 +1834,7 @@ impl RustleApp {
         // 优先尝试同网段接口，然后尝试其他接口
         let mut sent = false;
         let bound_list: Vec<String> = self.bound_interfaces.iter().cloned().collect();
-        
+
         // 第一轮：尝试同网段接口
         for bound_ip in &bound_list {
             if Self::same_lan(bound_ip, ip) {
@@ -1837,7 +1854,7 @@ impl RustleApp {
                 }
             }
         }
-        
+
         // 第二轮：如果同网段失败，尝试所有其他接口
         if !sent {
             eprintln!("[发送] 未找到同网段接口 -> {}, 尝试所有可用接口", ip);
@@ -1863,12 +1880,8 @@ impl RustleApp {
         }
 
         if sent {
-            // 添加到待确认列表
-            let deadline = Instant::now() + Duration::from_secs(5);
-            self.pending_acks
-                .entry(peer_id.to_string())
-                .or_default()
-                .push((msg_id.to_string(), deadline));
+            // 添加到待确认列表（同一 msg_id 去重并刷新超时）
+            mark_pending_ack(peer_id, msg_id);
         } else {
             eprintln!(
                 "[发送失败] 无可用接口发送到 {} (绑定接口数: {})",
@@ -1998,13 +2011,20 @@ impl RustleApp {
     }
 
     fn pick_and_send(&mut self, pick_folder: bool) {
-        let selection = if pick_folder {
-            FileDialog::new().pick_folder()
-        } else {
-            FileDialog::new().pick_file()
-        };
+        use std::sync::mpsc;
 
-        if let Some(path) = selection {
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let selection = if pick_folder {
+                FileDialog::new().pick_folder()
+            } else {
+                FileDialog::new().pick_file()
+            };
+            let _ = tx.send(selection);
+        });
+
+        if let Ok(Some(path)) = rx.recv() {
             let is_dir = path.is_dir();
             self.append_file_message(&path, is_dir);
         }
@@ -2138,8 +2158,18 @@ impl eframe::App for RustleApp {
                         if resp.changed() {
                             changed = true;
                         }
+                        let mut pending_folder_select = false;
                         if ui.button("选择...").clicked() {
-                            if let Some(path) = FileDialog::new().pick_folder() {
+                            pending_folder_select = true;
+                        }
+                        if pending_folder_select {
+                            use std::sync::mpsc;
+                            let (tx, rx) = mpsc::channel();
+                            std::thread::spawn(move || {
+                                let path = FileDialog::new().pick_folder();
+                                let _ = tx.send(path);
+                            });
+                            if let Ok(Some(path)) = rx.recv() {
                                 self.settings_recv_dir_input = path.to_string_lossy().to_string();
                                 changed = true;
                             }
@@ -2818,10 +2848,8 @@ impl eframe::App for RustleApp {
                                         msg.last_sync_ts = Some(ts.clone());
                                         msg.is_pending = false;
                                         if is_sync {
-                                            msg.transfer_status = Some(format!(
-                                                "已同步，最后同步时间： {}",
-                                                ts
-                                            ));
+                                            msg.transfer_status =
+                                                Some(format!("已同步，最后同步时间： {}", ts));
                                         }
                                         if let Some(path) = msg.file_path.clone() {
                                             pending_sync = Some((path.clone(), ts.clone(), true));
@@ -3165,12 +3193,16 @@ impl eframe::App for RustleApp {
                 ui.label(
                     egui::RichText::new("📞 联系人")
                         .heading()
-                        .color(theme::TEXT_PRIMARY)
+                        .color(theme::TEXT_PRIMARY),
                 );
                 ui.add_space(10.0);
 
                 if self.users.is_empty() {
-                    ui.label(egui::RichText::new("暂无联系人").weak().color(theme::TEXT_LIGHT));
+                    ui.label(
+                        egui::RichText::new("暂无联系人")
+                            .weak()
+                            .color(theme::TEXT_LIGHT),
+                    );
                 } else {
                     let mut online_users: Vec<User> = self
                         .users
@@ -3224,18 +3256,19 @@ impl eframe::App for RustleApp {
                             .fill(bg_color)
                             .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                             .rounding(6.0);
-                        
+
                         if selected {
                             frame = frame.stroke(egui::Stroke::new(2.0, theme::PRIMARY));
                         }
-                        
-                        let resp = frame.show(ui, |ui| {
-                            ui.push_id(&user.id, |ui| {
-                                ui.add(egui::SelectableLabel::new(selected, text))
+
+                        let resp = frame
+                            .show(ui, |ui| {
+                                ui.push_id(&user.id, |ui| {
+                                    ui.add(egui::SelectableLabel::new(selected, text))
+                                })
+                                .inner
                             })
-                            .inner
-                        })
-                        .inner;
+                            .inner;
                         if resp.clicked() {
                             this.selected_user_id = Some(user.id.clone());
                             if let Some(u) = this.users.iter_mut().find(|u| u.id == user.id) {
@@ -3270,7 +3303,7 @@ impl eframe::App for RustleApp {
                         ui.label(
                             egui::RichText::new("🟢 在线")
                                 .strong()
-                                .color(theme::SECONDARY_LIGHT)
+                                .color(theme::SECONDARY_LIGHT),
                         );
                     });
                     egui::ScrollArea::vertical()
@@ -3291,7 +3324,7 @@ impl eframe::App for RustleApp {
                         ui.label(
                             egui::RichText::new("⚪ 离线")
                                 .strong()
-                                .color(theme::TEXT_LIGHT)
+                                .color(theme::TEXT_LIGHT),
                         );
                     });
                     egui::ScrollArea::vertical()
@@ -3354,236 +3387,288 @@ impl eframe::App for RustleApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG_PRIMARY))
             .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(self.selected_user_name())
-                        .heading()
-                        .color(theme::TEXT_PRIMARY)
-                );
-            });
-            ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(self.selected_user_name())
+                            .heading()
+                            .color(theme::TEXT_PRIMARY),
+                    );
+                });
+                ui.separator();
 
-            let total_height = ui.available_height();
-            let top_height = total_height * 0.75;
+                let total_height = ui.available_height();
+                let top_height = total_height * 0.75;
 
-            // 上部区域：消息显示（3/4）
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), top_height),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    ui.set_height(top_height);
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let msgs: &[ChatMessage] = self
-                                .selected_user_id
-                                .as_ref()
-                                .and_then(|id| self.messages.get(id))
-                                .map(|v| v.as_slice())
-                                .unwrap_or(&[]);
+                // 上部区域：消息显示（3/4）
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), top_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_height(top_height);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let msgs: &[ChatMessage] = self
+                                    .selected_user_id
+                                    .as_ref()
+                                    .and_then(|id| self.messages.get(id))
+                                    .map(|v| v.as_slice())
+                                    .unwrap_or(&[]);
 
-                            let mut last_msg_resp = None;
-                            let mut first_unread_resp = None;
-                            let now = Instant::now();
+                                let mut last_msg_resp = None;
+                                let mut first_unread_resp = None;
+                                let now = Instant::now();
 
-                            for (i, msg) in msgs.iter().enumerate() {
-                                let align = if msg.from_me {
-                                    egui::Align::RIGHT
-                                } else {
-                                    egui::Align::LEFT
-                                };
-                                let max_bubble_width = ui.available_width() * 0.7;
-                                let resp = ui
-                                    .allocate_ui_with_layout(
-                                        egui::vec2(ui.available_width(), 0.0),
-                                        egui::Layout::top_down(align),
-                                        |ui| {
-                                            ui.set_max_width(max_bubble_width);
-                                        let mut meta = format!("发送: {}", msg.send_ts);
-                                        if let Some(r) = &msg.recv_ts {
-                                            meta.push_str(&format!("  |  接收: {}", r));
-                                        }
-                                        if let Some(s) = &msg.last_sync_ts {
-                                            meta.push_str(&format!("  |  同步: {}", s));
-                                        }
-                                        ui.label(egui::RichText::new(meta).small().color(theme::TEXT_LIGHT).weak());
-
-                                        let (bg, border_color, fg) = if msg.from_me {
-                                            if msg.transfer_status.as_deref() == Some("未送达") {
-                                                (theme::BG_HOVER, theme::BORDER, theme::TEXT_PRIMARY)
-                                            } else {
-                                                (theme::MSG_SENT_BG, theme::PRIMARY, theme::MSG_SENT_TEXT)
-                                            }
-                                        } else {
-                                            (theme::MSG_RECV_BG, theme::MSG_RECV_BORDER, theme::MSG_RECV_TEXT)
-                                        };
-
-                                        egui::Frame::none()
-                                            .fill(bg)
-                                            .stroke(egui::Stroke::new(1.5, border_color))
-                                            .rounding(egui::Rounding::same(10.0))
-                                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                                            .show(ui, |ui| {
-                                                ui.label(egui::RichText::new(&msg.text).color(fg));
-
-                                                if let Some(status) = &msg.transfer_status {
-                                                    ui.add_space(4.0);
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "⚡ {}",
-                                                            status
-                                                        ))
+                                for (i, msg) in msgs.iter().enumerate() {
+                                    let align = if msg.from_me {
+                                        egui::Align::RIGHT
+                                    } else {
+                                        egui::Align::LEFT
+                                    };
+                                    let max_bubble_width = ui.available_width() * 0.7;
+                                    let resp = ui
+                                        .allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width(), 0.0),
+                                            egui::Layout::top_down(align),
+                                            |ui| {
+                                                ui.set_max_width(max_bubble_width);
+                                                let mut meta = format!("发送: {}", msg.send_ts);
+                                                if let Some(r) = &msg.recv_ts {
+                                                    meta.push_str(&format!("  |  接收: {}", r));
+                                                }
+                                                if let Some(s) = &msg.last_sync_ts {
+                                                    meta.push_str(&format!("  |  同步: {}", s));
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(meta)
                                                         .small()
-                                                        .italics()
-                                                        .color(if msg.from_me { theme::TEXT_LIGHT } else { theme::STATUS_UNREAD }),
-                                                    );
-                                                }
+                                                        .color(theme::TEXT_LIGHT)
+                                                        .weak(),
+                                                );
 
-                                                if msg.file_path.is_some() {
-                                                    let status_label = if msg.needs_sync {
-                                                        Some("🔄 需同步")
-                                                    } else if msg.last_sync_ts.is_some() {
-                                                        Some("✓ 已同步")
+                                                let (bg, border_color, fg) = if msg.from_me {
+                                                    if msg.transfer_status.as_deref()
+                                                        == Some("未送达")
+                                                    {
+                                                        (
+                                                            theme::BG_HOVER,
+                                                            theme::BORDER,
+                                                            theme::TEXT_PRIMARY,
+                                                        )
                                                     } else {
-                                                        None
-                                                    };
-                                                    if let Some(label) = status_label {
-                                                        ui.add_space(4.0);
-                                                        ui.label(
-                                                            egui::RichText::new(label)
-                                                                .small()
-                                                                .color(if msg.from_me { theme::TEXT_LIGHT } else { theme::SECONDARY_LIGHT }),
-                                                        );
+                                                        (
+                                                            theme::MSG_SENT_BG,
+                                                            theme::PRIMARY,
+                                                            theme::MSG_SENT_TEXT,
+                                                        )
                                                     }
-                                                }
+                                                } else {
+                                                    (
+                                                        theme::MSG_RECV_BG,
+                                                        theme::MSG_RECV_BORDER,
+                                                        theme::MSG_RECV_TEXT,
+                                                    )
+                                                };
 
-                                                if let Some(path) = &msg.file_path {
-                                                    ui.horizontal(|ui| {
-                                                        if ui.link("📂 打开所在目录").clicked()
-                                                        {
-                                                            let candidate = Path::new(path);
-                                                            let target = if candidate.is_absolute()
-                                                            {
-                                                                candidate
+                                                egui::Frame::none()
+                                                    .fill(bg)
+                                                    .stroke(egui::Stroke::new(1.5, border_color))
+                                                    .rounding(egui::Rounding::same(10.0))
+                                                    .inner_margin(egui::Margin::symmetric(
+                                                        12.0, 10.0,
+                                                    ))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(&msg.text)
+                                                                .color(fg),
+                                                        );
+
+                                                        if let Some(status) = &msg.transfer_status {
+                                                            ui.add_space(4.0);
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "⚡ {}",
+                                                                    status
+                                                                ))
+                                                                .small()
+                                                                .italics()
+                                                                .color(if msg.from_me {
+                                                                    theme::TEXT_LIGHT
+                                                                } else {
+                                                                    theme::STATUS_UNREAD
+                                                                }),
+                                                            );
+                                                        }
+
+                                                        if msg.file_path.is_some() {
+                                                            let status_label = if msg.needs_sync {
+                                                                Some("🔄 需同步")
+                                                            } else if msg.last_sync_ts.is_some() {
+                                                                Some("✓ 已同步")
+                                                            } else {
+                                                                None
+                                                            };
+                                                            if let Some(label) = status_label {
+                                                                ui.add_space(4.0);
+                                                                ui.label(
+                                                                    egui::RichText::new(label)
+                                                                        .small()
+                                                                        .color(if msg.from_me {
+                                                                            theme::TEXT_LIGHT
+                                                                        } else {
+                                                                            theme::SECONDARY_LIGHT
+                                                                        }),
+                                                                );
+                                                            }
+                                                        }
+
+                                                        if let Some(path) = &msg.file_path {
+                                                            ui.horizontal(|ui| {
+                                                                if ui
+                                                                    .link("📂 打开所在目录")
+                                                                    .clicked()
+                                                                {
+                                                                    let candidate = Path::new(path);
+                                                                    let target = if candidate
+                                                                        .is_absolute()
+                                                                    {
+                                                                        candidate
                                                                     .parent()
                                                                     .map(|p| p.to_path_buf())
                                                                     .unwrap_or_else(
                                                                         default_download_dir,
                                                                     )
-                                                            } else {
-                                                                default_download_dir()
-                                                            };
-                                                            let _ = open::that(target);
+                                                                    } else {
+                                                                        default_download_dir()
+                                                                    };
+                                                                    let _ = open::that(target);
+                                                                }
+                                                            });
                                                         }
                                                     });
-                                                }
-                                            });
-                                        },
-                                    )
-                                    .response;
+                                            },
+                                        )
+                                        .response;
 
-                                if !msg.from_me && !msg.is_read {
-                                    if first_unread_resp.is_none() {
-                                        first_unread_resp = Some(resp.clone());
-                                    }
+                                    if !msg.from_me && !msg.is_read {
+                                        if first_unread_resp.is_none() {
+                                            first_unread_resp = Some(resp.clone());
+                                        }
 
-                                    if ui.clip_rect().intersects(resp.rect) {
-                                        if let Some(peer_id) = &self.selected_user_id {
-                                            let key = (peer_id.clone(), i);
-                                            self.message_visible_since.entry(key).or_insert(now);
+                                        if ui.clip_rect().intersects(resp.rect) {
+                                            if let Some(peer_id) = &self.selected_user_id {
+                                                let key = (peer_id.clone(), i);
+                                                self.message_visible_since
+                                                    .entry(key)
+                                                    .or_insert(now);
+                                            }
                                         }
                                     }
+
+                                    if i == msgs.len() - 1 {
+                                        last_msg_resp = Some(resp);
+                                    }
+                                    ui.add_space(10.0);
                                 }
 
-                                if i == msgs.len() - 1 {
-                                    last_msg_resp = Some(resp);
+                                if self.scroll_to_bottom {
+                                    if let Some(resp) = last_msg_resp {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                        self.scroll_to_bottom = false;
+                                    }
+                                } else if self.scroll_to_first_unread {
+                                    if let Some(resp) = first_unread_resp {
+                                        resp.scroll_to_me(Some(egui::Align::TOP));
+                                    } else if let Some(resp) = last_msg_resp {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    self.scroll_to_first_unread = false;
                                 }
-                                ui.add_space(10.0);
-                            }
+                            });
+                    },
+                );
 
-                            if self.scroll_to_bottom {
-                                if let Some(resp) = last_msg_resp {
-                                    resp.scroll_to_me(Some(egui::Align::Center));
-                                    self.scroll_to_bottom = false;
-                                }
-                            } else if self.scroll_to_first_unread {
-                                if let Some(resp) = first_unread_resp {
-                                    resp.scroll_to_me(Some(egui::Align::TOP));
-                                } else if let Some(resp) = last_msg_resp {
-                                    resp.scroll_to_me(Some(egui::Align::Center));
-                                }
-                                self.scroll_to_first_unread = false;
-                            }
-                        });
-                },
-            );
+                ui.separator();
 
-            ui.separator();
+                // 下部区域：输入和按钮（剩余空间，约 1/4）
+                let bottom_height = ui.available_height();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), bottom_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_height(bottom_height);
+                        ui.spacing_mut().item_spacing.y = 8.0;
 
-            // 下部区域：输入和按钮（剩余空间，约 1/4）
-            let bottom_height = ui.available_height();
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), bottom_height),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    ui.set_height(bottom_height);
-                    ui.spacing_mut().item_spacing.y = 8.0;
-
-                    ui.horizontal(|ui| {
                         ui.horizontal(|ui| {
-                            let btn_file = egui::Button::new(egui::RichText::new("📁 文件").size(14.0).color(theme::TEXT_PRIMARY))
+                            ui.horizontal(|ui| {
+                                let btn_file = egui::Button::new(
+                                    egui::RichText::new("📁 文件")
+                                        .size(14.0)
+                                        .color(theme::TEXT_PRIMARY),
+                                )
                                 .fill(theme::BG_HOVER)
                                 .stroke(egui::Stroke::new(1.5, theme::BORDER))
                                 .min_size(egui::vec2(100.0, 36.0));
-                            if ui.add(btn_file).clicked() {
-                                self.pick_and_send(false);
-                            }
-                            ui.add_space(6.0);
-                            
-                            let btn_folder = egui::Button::new(egui::RichText::new("📂 文件夹").size(14.0).color(theme::TEXT_PRIMARY))
+                                if ui.add(btn_file).clicked() {
+                                    self.pick_and_send(false);
+                                }
+                                ui.add_space(6.0);
+
+                                let btn_folder = egui::Button::new(
+                                    egui::RichText::new("📂 文件夹")
+                                        .size(14.0)
+                                        .color(theme::TEXT_PRIMARY),
+                                )
                                 .fill(theme::BG_HOVER)
                                 .stroke(egui::Stroke::new(1.5, theme::BORDER))
                                 .min_size(egui::vec2(120.0, 36.0));
-                            if ui.add(btn_folder).clicked() {
-                                self.pick_and_send(true);
-                            }
-                            ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new("支持拖放文件/文件夹到窗口")
-                                    .weak()
-                                    .small()
-                                    .color(theme::TEXT_LIGHT),
+                                if ui.add(btn_folder).clicked() {
+                                    self.pick_and_send(true);
+                                }
+                                ui.add_space(12.0);
+                                ui.label(
+                                    egui::RichText::new("支持拖放文件/文件夹到窗口")
+                                        .weak()
+                                        .small()
+                                        .color(theme::TEXT_LIGHT),
+                                );
+                            });
+
+                            ui.add_space(8.0);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(8.0);
+                                    let btn_send = egui::Button::new(
+                                        egui::RichText::new("🚀 发送")
+                                            .size(14.0)
+                                            .color(theme::MSG_SENT_TEXT),
+                                    )
+                                    .fill(theme::PRIMARY)
+                                    .stroke(egui::Stroke::new(1.5, theme::PRIMARY))
+                                    .min_size(egui::vec2(100.0, 36.0));
+                                    if ui.add(btn_send).clicked()
+                                        || ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                                    {
+                                        self.send_current();
+                                    }
+                                },
                             );
                         });
 
                         ui.add_space(8.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(8.0);
-                            let btn_send = egui::Button::new(egui::RichText::new("🚀 发送").size(14.0).color(theme::MSG_SENT_TEXT))
-                                .fill(theme::PRIMARY)
-                                .stroke(egui::Stroke::new(1.5, theme::PRIMARY))
-                                .min_size(egui::vec2(100.0, 36.0));
-                            if ui.add(btn_send).clicked()
-                                || ctx.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                self.send_current();
-                            }
-                        });
-                    });
 
-                    ui.add_space(8.0);
-
-                    let input_height = ui.available_height();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.input)
-                            .hint_text("输入消息...")
-                            .desired_width(f32::INFINITY)
-                            .min_size(egui::vec2(0.0, input_height)),
-                    );
-                },
-            );
-        });
+                        let input_height = ui.available_height();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.input)
+                                .hint_text("输入消息...")
+                                .desired_width(f32::INFINITY)
+                                .min_size(egui::vec2(0.0, input_height)),
+                        );
+                    },
+                );
+            });
 
         if self.show_name_dialog {
             egui::Window::new("欢迎使用 Rustle (如梭)")
@@ -3732,16 +3817,19 @@ impl eframe::App for RustleApp {
                 }
 
                 if let Some((text, send_ts)) = offline_data {
-                    self.offline_msgs
-                        .entry(peer.clone())
-                        .or_default()
-                        .push(QueuedMsg {
+                    let queue = self.offline_msgs.entry(peer.clone()).or_default();
+                    let exists = queue
+                        .iter()
+                        .any(|q| q.msg_id.as_deref() == Some(msg_id.as_str()));
+                    if !exists {
+                        queue.push(QueuedMsg {
                             text,
                             send_ts,
                             msg_id: Some(msg_id.clone()),
                             file_path: None,
                             is_dir: false,
                         });
+                    }
                     self.update_history_pending(peer, msg_id, true);
                 }
 

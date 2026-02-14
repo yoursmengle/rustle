@@ -1,3 +1,5 @@
+use crate::debug_println;
+#[allow(unused_imports)]
 use crate::metadata::{Metadata, MetadataStore};
 use crate::model::{PeerEvent, TCP_DIR_PORT, TCP_FILE_PORT};
 use crate::storage::{default_download_dir, load_receive_map, save_receive_map, windows_long_path};
@@ -146,8 +148,33 @@ pub async fn handle_incoming_file(
     }
     let total_size = u64::from_be_bytes(size_buf);
 
+    // 读取 SHA256 校验码（可选）
+    // 协议兼容：旧版本发送端没有该字段，避免误吞首字节 payload。
+    let mut leading_payload: Vec<u8> = Vec::new();
+    let mut sha256_present_buf = [0u8; 1];
+    let expected_sha256: Option<String> = if socket.read_exact(&mut sha256_present_buf).await.is_ok() {
+        match sha256_present_buf[0] {
+            1 => {
+                let mut sha256_buf = [0u8; 32];
+                if socket.read_exact(&mut sha256_buf).await.is_ok() {
+                    Some(hex::encode(sha256_buf))
+                } else {
+                    None
+                }
+            }
+            0 => None,
+            legacy_first_byte => {
+                leading_payload.push(legacy_first_byte);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     eprintln!(
-        "[rx] header from {addr} id={sender_id} name={filename} is_dir={is_dir} size={total_size}"
+        "[rx] header from {addr} id={sender_id} name={filename} is_dir={is_dir} size={total_size} sha256={:?}",
+        expected_sha256.as_ref().map(|s| &s[..8])
     );
 
     let initial_status = if total_size > 0 {
@@ -216,6 +243,17 @@ pub async fn handle_incoming_file(
         if let Ok(mut file) = tokio::fs::File::create(&tar_path).await {
             let mut buf = vec![0u8; 64 * 1024];
             let mut received: u64 = 0;
+            if !leading_payload.is_empty() {
+                if file.write_all(&leading_payload).await.is_err() {
+                    eprintln!("[rx] dir failed to write legacy leading payload byte");
+                } else {
+                    received = leading_payload.len() as u64;
+                    eprintln!(
+                        "[rx] legacy stream detected, prepended {} payload byte(s)",
+                        leading_payload.len()
+                    );
+                }
+            }
             loop {
                 match socket.read(&mut buf).await {
                     Ok(0) => {
@@ -312,6 +350,17 @@ pub async fn handle_incoming_file(
     } else if let Ok(mut file) = tokio::fs::File::create(&save_path).await {
         let mut buf = vec![0u8; 64 * 1024];
         let mut received: u64 = 0;
+        if !leading_payload.is_empty() {
+            if file.write_all(&leading_payload).await.is_err() {
+                eprintln!("[rx] file failed to write legacy leading payload byte");
+            } else {
+                received = leading_payload.len() as u64;
+                eprintln!(
+                    "[rx] legacy stream detected, prepended {} payload byte(s)",
+                    leading_payload.len()
+                );
+            }
+        }
         loop {
             match socket.read(&mut buf).await {
                 Ok(0) => {
@@ -381,8 +430,33 @@ pub async fn handle_incoming_file(
     } else {
         final_received
     };
+    
+    // 验证文件完整性
+    let sha256_valid = if success && expected_sha256.is_some() && !is_dir {
+        let received_sha256 = crate::storage::sha256_file(&save_path);
+        let expected = expected_sha256.as_ref();
+        match (received_sha256, expected) {
+            (Some(received), Some(exp)) if received == *exp => {
+                eprintln!("[rx] SHA256 verification passed for {:?}", save_path);
+                true
+            }
+            (Some(received), Some(_)) => {
+                eprintln!("[rx] SHA256 verification FAILED! expected={:?} got={}", expected, &received[..8]);
+                false
+            }
+            _ => {
+                eprintln!("[rx] SHA256 calculation failed, cannot verify");
+                false
+            }
+        }
+    } else {
+        true // Skip for dirs or no SHA256 expected
+    };
+    
     let status = if success {
-        if completed_size > 0 {
+        if !sha256_valid {
+            "接收完成(校验失败)".to_string()
+        } else if completed_size > 0 {
             format!("接收完成 ({})", human_size(completed_size))
         } else {
             "接收完成".to_string()
@@ -467,14 +541,50 @@ pub async fn handle_outgoing_file(
     }
 
     let mut used_port = tcp_port;
-    let mut socket = connect_with_via(&peer_ip, tcp_port, &via).await;
+    let settings = crate::storage::load_settings();
+    let max_retries = settings.transfer_retry_count;
+    
+    let mut socket;
+    let mut retry_count = 0;
+    
+    loop {
+        socket = connect_with_via(&peer_ip, tcp_port, &via).await;
+        
+        if socket.is_ok() {
+            break;
+        }
+        
+        retry_count += 1;
+        
+        if retry_count >= max_retries || max_retries == 0 {
+            break;
+        }
+        
+        eprintln!("[tx] connection failed (attempt {}/{}), retrying...", retry_count, max_retries);
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+    
     if socket.is_err() && is_dir && tcp_port == TCP_DIR_PORT {
         let alt_port = TCP_FILE_PORT;
         if alt_port != tcp_port {
-            socket = connect_with_via(&peer_ip, alt_port, &via).await;
-            if socket.is_ok() {
-                used_port = alt_port;
-                eprintln!("[tx] dir connect fallback to file port {}", used_port);
+            retry_count = 0;
+            loop {
+                socket = connect_with_via(&peer_ip, alt_port, &via).await;
+                
+                if socket.is_ok() {
+                    used_port = alt_port;
+                    eprintln!("[tx] dir connect fallback to file port {}", used_port);
+                    break;
+                }
+                
+                retry_count += 1;
+                
+                if retry_count >= max_retries || max_retries == 0 {
+                    break;
+                }
+                
+                eprintln!("[tx] dir connection failed (attempt {}/{}), retrying...", retry_count, max_retries);
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         }
     }
@@ -693,6 +803,15 @@ pub async fn handle_outgoing_file(
         header.extend_from_slice(&name_len.to_be_bytes());
         header.extend_from_slice(name_bytes);
         header.extend_from_slice(&declared_size.to_be_bytes());
+        
+        // 添加 SHA256 校验码（如果有）
+        if let Some(ref sha_str) = sha {
+            header.push(1); // SHA256 present
+            let sha_bytes = hex::decode(sha_str).unwrap_or_default();
+            header.extend_from_slice(&sha_bytes); // 32 bytes, padded with zeros if needed
+        } else {
+            header.push(0); // No SHA256
+        }
 
         eprintln!("[tx] sending header to {addr_str} id={my_id} peer={peer_id} name={filename} is_dir={is_dir} size={declared_size}");
 

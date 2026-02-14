@@ -1,4 +1,5 @@
 use crate::model::{SyncTree, RECEIVE_MAP_FILE, SYNC_TREE_FILE};
+use chrono::{Duration as ChronoDuration, Local};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -10,6 +11,24 @@ use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 
 const SETTINGS_FILE: &str = "settings.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum LogLevel {
+    #[serde(rename = "debug")]
+    Debug,
+    #[serde(rename = "info")]
+    Info,
+    #[serde(rename = "warn")]
+    Warn,
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl Default for LogLevel {
+    fn default() -> Self {
+        LogLevel::Info
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -23,6 +42,16 @@ pub struct AppSettings {
     pub auto_check_update: bool,
     #[serde(default)]
     pub preferred_interface: Option<String>,
+    #[serde(default = "default_peer_timeout_secs")]
+    pub peer_timeout_secs: u64,
+    #[serde(default = "default_log_level")]
+    pub log_level: LogLevel,
+    #[serde(default = "default_log_max_size_mb")]
+    pub log_max_size_mb: u64,
+    #[serde(default = "default_transfer_retry_count")]
+    pub transfer_retry_count: u32,
+    #[serde(default = "default_minimize_to_tray")]
+    pub minimize_to_tray: bool,
 }
 
 fn default_history_days() -> i64 {
@@ -37,6 +66,26 @@ fn default_auto_check_update() -> bool {
     true
 }
 
+fn default_peer_timeout_secs() -> u64 {
+    30
+}
+
+fn default_log_level() -> LogLevel {
+    LogLevel::Info
+}
+
+fn default_log_max_size_mb() -> u64 {
+    10
+}
+
+fn default_transfer_retry_count() -> u32 {
+    3
+}
+
+fn default_minimize_to_tray() -> bool {
+    true
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -45,6 +94,11 @@ impl Default for AppSettings {
             auto_sync_on_send: default_auto_sync_on_send(),
             auto_check_update: default_auto_check_update(),
             preferred_interface: None,
+            peer_timeout_secs: default_peer_timeout_secs(),
+            log_level: default_log_level(),
+            log_max_size_mb: default_log_max_size_mb(),
+            transfer_retry_count: default_transfer_retry_count(),
+            minimize_to_tray: default_minimize_to_tray(),
         }
     }
 }
@@ -84,6 +138,20 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
+pub fn logs_dir() -> PathBuf {
+    let mut dir = data_dir();
+    dir.push("logs");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+pub fn current_log_path() -> PathBuf {
+    let mut path = logs_dir();
+    let date = Local::now().format("%Y%m%d");
+    path.push(format!("rustle_{}.log", date));
+    path
+}
+
 pub fn data_path(name: &str) -> PathBuf {
     let mut p = data_dir();
     p.push(name);
@@ -104,11 +172,6 @@ pub fn peer_history_path(peer_id: &str) -> PathBuf {
 }
 
 fn sync_tree_path() -> PathBuf {
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            return dir.join(SYNC_TREE_FILE);
-        }
-    }
     data_path(SYNC_TREE_FILE)
 }
 
@@ -180,7 +243,6 @@ pub fn default_download_dir() -> PathBuf {
             let resolved = if raw.is_absolute() {
                 raw
             } else {
-                // Avoid resolving relative paths under the app working directory.
                 data_dir().join(raw)
             };
             if fs::create_dir_all(&resolved).is_ok() {
@@ -188,9 +250,26 @@ pub fn default_download_dir() -> PathBuf {
             }
         }
     }
+
+    // 优先使用系统下载目录
     #[cfg(target_os = "windows")]
     {
-        // Prefer D: if present; otherwise fallback to C:
+        if let Some(downloads) = dirs::download_dir() {
+            let rustle_downloads = downloads.join("Rustle");
+            if fs::create_dir_all(&rustle_downloads).is_ok() {
+                return rustle_downloads;
+            }
+        }
+
+        // 回退到用户目录
+        if let Some(user_dir) = dirs::home_dir() {
+            let rustle_downloads = user_dir.join("Downloads").join("Rustle");
+            if fs::create_dir_all(&rustle_downloads).is_ok() {
+                return rustle_downloads;
+            }
+        }
+
+        // 最后回退到 D 盘或 C 盘
         let has_d = Path::new("D:\\").exists();
         let base = if has_d {
             PathBuf::from("D:/rustle_downloads")
@@ -200,8 +279,15 @@ pub fn default_download_dir() -> PathBuf {
         let _ = fs::create_dir_all(&base);
         base
     }
+
     #[cfg(not(target_os = "windows"))]
     {
+        if let Some(home) = dirs::home_dir() {
+            let downloads = home.join("Downloads").join("Rustle");
+            if fs::create_dir_all(&downloads).is_ok() {
+                return downloads;
+            }
+        }
         let mut p = data_dir();
         p.push("downloads");
         let _ = fs::create_dir_all(&p);
@@ -283,6 +369,103 @@ pub fn load_or_init_node_id() -> String {
         hw_uuid
     } else {
         Uuid::new_v4().to_string()
+    }
+}
+
+pub fn write_log(level: &str, message: &str) {
+    let settings = load_settings();
+
+    let should_log = match (&settings.log_level, level) {
+        (LogLevel::Debug, _) => true,
+        (LogLevel::Info, "DEBUG") => false,
+        (LogLevel::Info, _) => true,
+        (LogLevel::Warn, "DEBUG") => false,
+        (LogLevel::Warn, "INFO") => false,
+        (LogLevel::Warn, _) => true,
+        (LogLevel::Error, "DEBUG") => false,
+        (LogLevel::Error, "INFO") => false,
+        (LogLevel::Error, "WARN") => false,
+        (LogLevel::Error, _) => true,
+    };
+
+    if !should_log {
+        return;
+    }
+
+    let log_path = current_log_path();
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let log_line = format!("[{}] [{}] {}\n", timestamp, level, message);
+
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        use std::io::Write;
+
+        if let Ok(metadata) = file.metadata() {
+            let max_size = settings.log_max_size_mb * 1024 * 1024;
+            if metadata.len() > max_size {
+                drop(file);
+                let _ = rotate_log(&log_path);
+                if let Ok(mut new_file) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = new_file.write_all(log_line.as_bytes());
+                }
+                return;
+            }
+        }
+
+        let _ = file.write_all(log_line.as_bytes());
+    }
+}
+
+fn rotate_log(original_path: &PathBuf) -> std::io::Result<()> {
+    if let Some(parent) = original_path.parent() {
+        let stem = original_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rustle");
+        let ext = original_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("log");
+        let rotated_name = format!("{}_{}.{}", stem, Local::now().format("%Y%m%d_%H%M%S"), ext);
+        let rotated_path = parent.join(rotated_name);
+        fs::rename(original_path, rotated_path)?;
+    }
+    Ok(())
+}
+
+pub fn cleanup_old_logs(days: i64) {
+    let logs_dir = logs_dir();
+    if let Ok(entries) = fs::read_dir(&logs_dir) {
+        let cutoff = Local::now() - ChronoDuration::days(days);
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("rustle_") && name.ends_with(".log") {
+                    if let Ok(metadata) = entry.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            let modified_ts = modified
+                                .duration_since(UNIX_EPOCH)
+                                .ok()
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            let modified_dt =
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(modified_ts, 0)
+                                    .map(|dt| dt.with_timezone(&Local))
+                                    .unwrap_or_default();
+                            if modified_dt < cutoff {
+                                let _ = fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
