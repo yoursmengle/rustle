@@ -11,6 +11,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
+const MAX_ID_LEN: usize = 64;
+const MAX_NAME_LEN: usize = 255;
+
 fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
@@ -45,6 +48,41 @@ fn receive_map_key(sender_id: &str, is_dir: bool, filename: &str) -> String {
     )
 }
 
+fn sanitize_filename(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "unnamed".to_string();
+    }
+    let candidate = Path::new(trimmed)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut cleaned = String::with_capacity(candidate.len());
+    for c in candidate.chars() {
+        if c.is_control()
+            || c == '/'
+            || c == '\\'
+            || c == ':'
+            || c == '*'
+            || c == '?'
+            || c == '"'
+            || c == '<'
+            || c == '>'
+            || c == '|'
+        {
+            cleaned.push('_');
+        } else {
+            cleaned.push(c);
+        }
+    }
+    let cleaned = cleaned.trim().trim_end_matches(&[' ', '.'][..]).to_string();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
+}
+
 pub async fn handle_incoming_file(
     mut socket: TcpStream,
     addr: SocketAddr,
@@ -70,6 +108,10 @@ pub async fn handle_incoming_file(
         return;
     }
     let id_len = id_len_buf[0] as usize;
+    if id_len == 0 || id_len > MAX_ID_LEN {
+        eprintln!("[rx] invalid id_len {id_len} from {addr}");
+        return;
+    }
 
     let mut id_buf = vec![0u8; id_len];
     if socket.read_exact(&mut id_buf).await.is_err() {
@@ -84,6 +126,10 @@ pub async fn handle_incoming_file(
         return;
     }
     let name_len = u16::from_be_bytes(len_buf) as usize;
+    if name_len == 0 || name_len > MAX_NAME_LEN {
+        eprintln!("[rx] invalid name_len {name_len} from {addr}");
+        return;
+    }
 
     let mut name_buf = vec![0u8; name_len];
     if socket.read_exact(&mut name_buf).await.is_err() {
@@ -91,6 +137,7 @@ pub async fn handle_incoming_file(
         return;
     }
     let filename = String::from_utf8_lossy(&name_buf).to_string();
+    let safe_filename = sanitize_filename(&filename);
 
     let mut size_buf = [0u8; 8];
     if socket.read_exact(&mut size_buf).await.is_err() {
@@ -151,10 +198,10 @@ pub async fn handle_incoming_file(
         }
     } else {
         // 无论文件还是文件夹，都创建一个独立的子目录
-        let sub_dir_name = format!("rustle_{}_{}", filename, Local::now().format("%H%M%S"));
+        let sub_dir_name = format!("rustle_{}_{}", safe_filename, Local::now().format("%H%M%S"));
         let sub_dir = base_dir.join(sub_dir_name);
         let _ = fs::create_dir_all(&sub_dir);
-        let save_path = sub_dir.join(&filename);
+        let save_path = sub_dir.join(&safe_filename);
         (sub_dir, save_path)
     };
 
@@ -229,15 +276,33 @@ pub async fn handle_incoming_file(
             if success || (total_size == 0 && received > 0) {
                 let tar_path_clone = tar_path.clone();
                 let unpack_dst = sub_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let unpacked = tokio::task::spawn_blocking(move || -> bool {
                     if let Ok(f) = std::fs::File::open(&tar_path_clone) {
                         let mut ar = tar::Archive::new(f);
-                        let _ = ar.unpack(&unpack_dst);
+                        if let Ok(entries) = ar.entries() {
+                            for entry in entries {
+                                let mut entry = match entry {
+                                    Ok(e) => e,
+                                    Err(_) => return false,
+                                };
+                                if entry.unpack_in(&unpack_dst).is_err() {
+                                    return false;
+                                }
+                            }
+                            return true;
+                        }
                     }
+                    false
                 })
-                .await;
-                success = true;
-                eprintln!("[rx] dir unpacked into {:?}", save_path);
+                .await
+                .unwrap_or(false);
+                if unpacked {
+                    success = true;
+                    eprintln!("[rx] dir unpacked into {:?}", save_path);
+                } else {
+                    success = false;
+                    eprintln!("[rx] dir unpack failed for {:?}", tar_path);
+                }
             }
             final_received = received;
             let _ = tokio::fs::remove_file(&tar_path).await;
@@ -788,5 +853,17 @@ mod tests {
     fn format_speed_formats() {
         let s = format_speed(1024 * 1024, Duration::from_secs(1));
         assert!(s.contains("MB/s"));
+    }
+
+    #[test]
+    fn sanitize_filename_strips_paths() {
+        assert_eq!(sanitize_filename("dir/evil.txt"), "evil.txt");
+        assert_eq!(sanitize_filename(r"..\evil.txt"), "evil.txt");
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_empty() {
+        assert_eq!(sanitize_filename("  "), "unnamed");
+        assert_eq!(sanitize_filename(".."), "unnamed");
     }
 }

@@ -16,6 +16,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
+struct BoundSocket {
+    sock: UdpSocket,
+    ip: Ipv4Addr,
+    netmask: Ipv4Addr,
+}
+
+fn same_subnet(local: Ipv4Addr, target: Ipv4Addr, netmask: Ipv4Addr) -> bool {
+    let local_u32 = u32::from(local);
+    let target_u32 = u32::from(target);
+    let mask_u32 = u32::from(netmask);
+    (local_u32 & mask_u32) == (target_u32 & mask_u32)
+}
+
+fn is_specific_netmask(netmask: Ipv4Addr) -> bool {
+    u32::from(netmask) != 0
+}
+
 pub fn spawn_network_worker(
     peer_tx: Sender<PeerEvent>,
     cmd_rx: Receiver<NetCmd>,
@@ -93,8 +110,8 @@ pub fn spawn_network_worker(
             }
         });
 
-        let mut discovery_sockets: Vec<(UdpSocket, Ipv4Addr)> = Vec::new();
-        let mut chat_sockets: Vec<(UdpSocket, Ipv4Addr)> = Vec::new();
+        let mut discovery_sockets: Vec<BoundSocket> = Vec::new();
+        let mut chat_sockets: Vec<BoundSocket> = Vec::new();
 
         if let Ok(ifaces) = get_if_addrs() {
             for iface in ifaces {
@@ -114,7 +131,11 @@ pub fn spawn_network_worker(
                         Ok(sock) => {
                             let _ = sock.set_broadcast(true);
                             let _ = sock.set_nonblocking(true);
-                            discovery_sockets.push((sock, ipv4));
+                            discovery_sockets.push(BoundSocket {
+                                sock,
+                                ip: ipv4,
+                                netmask: v4.netmask,
+                            });
                             eprintln!("Net discovery: bound discovery interface {ipv4}:{UDP_DISCOVERY_PORT}");
                             let _ = peer_tx.send(PeerEvent::LocalBound {
                                 ip: ipv4.to_string(),
@@ -137,7 +158,11 @@ pub fn spawn_network_worker(
                     match UdpSocket::bind((ipv4, UDP_MESSAGE_PORT)) {
                         Ok(sock) => {
                             let _ = sock.set_nonblocking(true);
-                            chat_sockets.push((sock, ipv4));
+                            chat_sockets.push(BoundSocket {
+                                sock,
+                                ip: ipv4,
+                                netmask: v4.netmask,
+                            });
                             eprintln!(
                                 "Net discovery: bound chat interface {ipv4}:{UDP_MESSAGE_PORT}"
                             );
@@ -167,7 +192,11 @@ pub fn spawn_network_worker(
                 Ok(sock) => {
                     let _ = sock.set_broadcast(true);
                     let _ = sock.set_nonblocking(true);
-                    discovery_sockets.push((sock, Ipv4Addr::UNSPECIFIED));
+                    discovery_sockets.push(BoundSocket {
+                        sock,
+                        ip: Ipv4Addr::UNSPECIFIED,
+                        netmask: Ipv4Addr::new(0, 0, 0, 0),
+                    });
                     eprintln!(
                         "Net discovery: bound fallback discovery 0.0.0.0:{UDP_DISCOVERY_PORT}"
                     );
@@ -189,7 +218,11 @@ pub fn spawn_network_worker(
             match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, UDP_MESSAGE_PORT)) {
                 Ok(sock) => {
                     let _ = sock.set_nonblocking(true);
-                    chat_sockets.push((sock, Ipv4Addr::UNSPECIFIED));
+                    chat_sockets.push(BoundSocket {
+                        sock,
+                        ip: Ipv4Addr::UNSPECIFIED,
+                        netmask: Ipv4Addr::new(0, 0, 0, 0),
+                    });
                     eprintln!("Net discovery: bound fallback chat 0.0.0.0:{UDP_MESSAGE_PORT}");
                     let _ = peer_tx.send(PeerEvent::LocalBound {
                         ip: Ipv4Addr::UNSPECIFIED.to_string(),
@@ -210,7 +243,7 @@ pub fn spawn_network_worker(
         } else {
             let summary: Vec<String> = discovery_sockets
                 .iter()
-                .map(|(_, ip)| format!("{}:{}", ip, UDP_DISCOVERY_PORT))
+                .map(|s| format!("{}:{}", s.ip, UDP_DISCOVERY_PORT))
                 .collect();
             eprintln!(
                 "Net discovery: discovery UDP sockets -> {}",
@@ -222,7 +255,7 @@ pub fn spawn_network_worker(
         } else {
             let summary: Vec<String> = chat_sockets
                 .iter()
-                .map(|(_, ip)| format!("{}:{}", ip, UDP_MESSAGE_PORT))
+                .map(|s| format!("{}:{}", s.ip, UDP_MESSAGE_PORT))
                 .collect();
             eprintln!("Net discovery: chat UDP sockets -> {}", summary.join(", "));
         }
@@ -291,7 +324,7 @@ pub fn spawn_network_worker(
                         Ipv4Addr::new(oct[0], oct[1], oct[2], 255)
                     }
 
-                    let bcast_ip = heuristic_broadcast(ipv4);
+                    let bcast_ip = v4.broadcast.unwrap_or_else(|| heuristic_broadcast(ipv4));
                     base_targets.push(SocketAddr::new(IpAddr::V4(bcast_ip), UDP_DISCOVERY_PORT));
                 }
             }
@@ -327,16 +360,16 @@ pub fn spawn_network_worker(
             if let Some(ip) = &peer.ip {
                 if let Ok(ipaddr) = ip.parse::<IpAddr>() {
                     let target = SocketAddr::new(ipaddr, UDP_DISCOVERY_PORT);
-                    for (sock, _ip) in &discovery_sockets {
-                        send_hello(sock, target, &our_name, &my_id, startup_list_hash, false);
+                    for s in &discovery_sockets {
+                        send_hello(&s.sock, target, &our_name, &my_id, startup_list_hash, false);
                     }
                 }
             }
         }
 
-        for (sock, _ip) in &discovery_sockets {
+        for s in &discovery_sockets {
             for addr in &base_targets {
-                send_hello(sock, *addr, &our_name, &my_id, startup_list_hash, true);
+                send_hello(&s.sock, *addr, &our_name, &my_id, startup_list_hash, true);
             }
         }
 
@@ -491,9 +524,9 @@ pub fn spawn_network_worker(
                     NetCmd::ChangeName(new_name) => {
                         our_name = new_name;
                         let list_hash = compute_list_hash(&peer_snapshots, &my_id);
-                        for (sock, _ip) in &discovery_sockets {
+                        for s in &discovery_sockets {
                             for addr in &base_targets {
-                                send_hello(sock, *addr, &our_name, &my_id, list_hash, true);
+                                send_hello(&s.sock, *addr, &our_name, &my_id, list_hash, true);
                             }
                         }
                     }
@@ -528,26 +561,49 @@ pub fn spawn_network_worker(
                     }
                     NetCmd::ProbePeer { ip, via } => {
                         if let Ok(ipaddr) = ip.parse::<IpAddr>() {
-                            if let IpAddr::V4(v4) = ipaddr {
-                                let send_ok = discovery_sockets.iter().any(|(_, lip)| {
-                                    let lp = lip.octets();
-                                    let vp = v4.octets();
-                                    lp[0] == vp[0] && lp[1] == vp[1] && lp[2] == vp[2]
-                                });
-                                if !send_ok {
-                                    continue;
-                                }
-                            }
                             let target = SocketAddr::new(ipaddr, UDP_DISCOVERY_PORT);
                             eprintln!("Probing known peer {}", target);
                             let list_hash = compute_list_hash(&peer_snapshots, &my_id);
-                            for (sock, _ip) in &discovery_sockets {
-                                if let Some(v) = &via {
-                                    if _ip.to_string() != *v {
+                            if let Some(v) = &via {
+                                for s in &discovery_sockets {
+                                    if s.ip.to_string() != *v {
                                         continue;
                                     }
+                                    send_hello(&s.sock, target, &our_name, &my_id, list_hash, false);
                                 }
-                                send_hello(sock, target, &our_name, &my_id, list_hash, false);
+                            } else if let IpAddr::V4(target_v4) = ipaddr {
+                                let mut sent = false;
+                                for s in &discovery_sockets {
+                                    if is_specific_netmask(s.netmask)
+                                        && same_subnet(s.ip, target_v4, s.netmask)
+                                    {
+                                        send_hello(
+                                            &s.sock,
+                                            target,
+                                            &our_name,
+                                            &my_id,
+                                            list_hash,
+                                            false,
+                                        );
+                                        sent = true;
+                                    }
+                                }
+                                if !sent {
+                                    for s in &discovery_sockets {
+                                        send_hello(
+                                            &s.sock,
+                                            target,
+                                            &our_name,
+                                            &my_id,
+                                            list_hash,
+                                            false,
+                                        );
+                                    }
+                                }
+                            } else {
+                                for s in &discovery_sockets {
+                                    send_hello(&s.sock, target, &our_name, &my_id, list_hash, false);
+                                }
                             }
                         }
                     }
@@ -570,7 +626,7 @@ pub fn spawn_network_worker(
                             },
                             from_ip: local_ip.clone().or_else(|| {
                                 via.clone()
-                                    .or_else(|| chat_sockets.first().map(|(_, ip)| ip.to_string()))
+                                    .or_else(|| chat_sockets.first().map(|s| s.ip.to_string()))
                             }),
                             text: text.clone(),
                             timestamp: ts.clone(),
@@ -583,27 +639,33 @@ pub fn spawn_network_worker(
 
                             let mut sent = false;
                             if let Some(v) = &via {
-                                for (sock, _ip) in &chat_sockets {
-                                    if _ip.to_string() == *v {
-                                        let _ = sock.send_to(&data, target);
+                                for s in &chat_sockets {
+                                    if s.ip.to_string() == *v {
+                                        let _ = s.sock.send_to(&data, target);
                                         sent = true;
                                         break;
                                     }
                                 }
-                            } else {
-                                for (sock, _ip) in &chat_sockets {
-                                    let local_octets = _ip.octets();
-                                    if let IpAddr::V4(target_v4) = target.ip() {
-                                        let target_octets = target_v4.octets();
-                                        if local_octets[0] == target_octets[0]
-                                            && local_octets[1] == target_octets[1]
-                                            && local_octets[2] == target_octets[2]
-                                        {
-                                            let _ = sock.send_to(&data, target);
-                                            sent = true;
-                                        }
+                            } else if let IpAddr::V4(target_v4) = target.ip() {
+                                for s in &chat_sockets {
+                                    if is_specific_netmask(s.netmask)
+                                        && same_subnet(s.ip, target_v4, s.netmask)
+                                    {
+                                        let _ = s.sock.send_to(&data, target);
+                                        sent = true;
                                     }
                                 }
+                                if !sent {
+                                    for s in &chat_sockets {
+                                        let _ = s.sock.send_to(&data, target);
+                                    }
+                                    sent = true;
+                                }
+                            } else {
+                                for s in &chat_sockets {
+                                    let _ = s.sock.send_to(&data, target);
+                                }
+                                sent = true;
                             }
 
                             if !sent {
@@ -632,15 +694,15 @@ pub fn spawn_network_worker(
                                 Err(_) => continue,
                             };
                             if let Some(v) = &via {
-                                for (sock, _ip) in &chat_sockets {
-                                    if _ip.to_string() == *v {
-                                        let _ = sock.send_to(&data, target);
+                                for s in &chat_sockets {
+                                    if s.ip.to_string() == *v {
+                                        let _ = s.sock.send_to(&data, target);
                                         break;
                                     }
                                 }
                             } else {
-                                for (sock, _ip) in &chat_sockets {
-                                    let _ = sock.send_to(&data, target);
+                                for s in &chat_sockets {
+                                    let _ = s.sock.send_to(&data, target);
                                 }
                             }
                         }
@@ -655,10 +717,10 @@ pub fn spawn_network_worker(
                 let online_count_u32 = peer_snapshots.values().filter(|p| p.online).count() as u32;
                 let offline_count_u32 =
                     peer_snapshots.values().filter(|p| !p.online).count() as u32;
-                for (sock, _ip) in &discovery_sockets {
+                for s in &discovery_sockets {
                     for addr in &base_targets {
                         send_heartbeat(
-                            sock,
+                            &s.sock,
                             *addr,
                             &my_id,
                             &our_name,
@@ -699,19 +761,19 @@ pub fn spawn_network_worker(
             if online_count == 0 && last_broadcast.elapsed() >= Duration::from_secs(3) {
                 last_broadcast = Instant::now();
                 let list_hash = compute_list_hash(&peer_snapshots, &my_id);
-                for (sock, _ip) in &discovery_sockets {
+                for s in &discovery_sockets {
                     for addr in &base_targets {
-                        send_hello(sock, *addr, &our_name, &my_id, list_hash, true);
+                        send_hello(&s.sock, *addr, &our_name, &my_id, list_hash, true);
                     }
                 }
             }
 
-            for (sock, _ip) in discovery_sockets.iter().chain(chat_sockets.iter()) {
+            for s in discovery_sockets.iter().chain(chat_sockets.iter()) {
                 loop {
-                    match sock.recv_from(&mut buf) {
+                    match s.sock.recv_from(&mut buf) {
                         Ok((n, src)) => {
                             if src.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
-                                || src.ip().to_string() == _ip.to_string()
+                                || src.ip().to_string() == s.ip.to_string()
                             {
                                 continue;
                             }
@@ -764,7 +826,7 @@ pub fn spawn_network_worker(
                                                         let _ =
                                                             peer_tx.send(PeerEvent::Discovered(
                                                                 peer,
-                                                                _ip.to_string(),
+                                                                s.ip.to_string(),
                                                             ));
 
                                                         let recently_active = last_from_peer
@@ -803,7 +865,7 @@ pub fn spawn_network_worker(
                                                             if let Ok(reply_data) =
                                                                 serde_json::to_vec(&reply)
                                                             {
-                                                                if let Err(e) = sock
+                                                                if let Err(e) = s.sock
                                                                     .send_to(&reply_data, target)
                                                                 {
                                                                     eprintln!("Net discovery: failed to send hello reply to {} - {}", target, e);
@@ -827,9 +889,11 @@ pub fn spawn_network_worker(
                                                                 &my_id,
                                                                 &our_name,
                                                             );
-                                                            for (sock, _ip) in &discovery_sockets {
+                                                            for s in &discovery_sockets {
                                                                 send_sync(
-                                                                    sock, target, &my_id,
+                                                                    &s.sock,
+                                                                    target,
+                                                                    &my_id,
                                                                     &sync_list,
                                                                 );
                                                             }
@@ -902,9 +966,12 @@ pub fn spawn_network_worker(
                                                             &my_id,
                                                             &our_name,
                                                         );
-                                                        for (sock, _ip) in &discovery_sockets {
+                                                        for s in &discovery_sockets {
                                                             send_sync(
-                                                                sock, target, &my_id, &sync_list,
+                                                                &s.sock,
+                                                                target,
+                                                                &my_id,
+                                                                &sync_list,
                                                             );
                                                         }
                                                     }
@@ -1007,7 +1074,7 @@ pub fn spawn_network_worker(
                                                         } else {
                                                             Some(our_name.clone())
                                                         },
-                                                        from_ip: sock
+                                                        from_ip: s.sock
                                                             .local_addr()
                                                             .ok()
                                                             .map(|a| a.ip().to_string()),
@@ -1017,9 +1084,9 @@ pub fn spawn_network_worker(
                                                             src.ip(),
                                                             UDP_MESSAGE_PORT,
                                                         );
-                                                        let _ = sock.send_to(&ack_data, src);
+                                                        let _ = s.sock.send_to(&ack_data, src);
                                                         if src.port() != UDP_MESSAGE_PORT {
-                                                            let _ = sock
+                                                            let _ = s.sock
                                                                 .send_to(&ack_data, ack_target_std);
                                                         }
                                                     }
@@ -1035,7 +1102,7 @@ pub fn spawn_network_worker(
                                                             .format("%Y-%m-%d %H:%M:%S")
                                                             .to_string(),
                                                         msg_id: c.msg_id.clone(),
-                                                        local_ip: _ip.to_string(),
+                                                        local_ip: s.ip.to_string(),
                                                     });
                                                 }
                                             }
@@ -1163,7 +1230,7 @@ pub fn spawn_network_worker(
                                                             UDP_DISCOVERY_PORT,
                                                         );
                                                         send_discover(
-                                                            sock,
+                                                            &s.sock,
                                                             target,
                                                             &my_id,
                                                             &our_name,
@@ -1258,6 +1325,25 @@ mod tests {
             heuristic_broadcast_local(ip5),
             Ipv4Addr::new(192, 0, 2, 255)
         );
+    }
+
+    #[test]
+    fn same_subnet_handles_netmask() {
+        assert!(same_subnet(
+            Ipv4Addr::new(10, 1, 2, 3),
+            Ipv4Addr::new(10, 9, 8, 7),
+            Ipv4Addr::new(255, 0, 0, 0)
+        ));
+        assert!(same_subnet(
+            Ipv4Addr::new(172, 16, 1, 10),
+            Ipv4Addr::new(172, 16, 200, 5),
+            Ipv4Addr::new(255, 255, 0, 0)
+        ));
+        assert!(!same_subnet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(192, 168, 2, 10),
+            Ipv4Addr::new(255, 255, 255, 0)
+        ));
     }
 }
 
