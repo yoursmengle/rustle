@@ -75,6 +75,65 @@ fn header_roundtrip() {
 }
 
 #[test]
+fn header_roundtrip_with_folder_manifest_extension() {
+    let manifest = serde_json::json!({
+        "root_name": "folder",
+        "entries": [
+            {"path": "nested", "entry_type": "directory", "size": 0},
+            {"path": "nested/file.txt", "entry_type": "file", "size": 5, "sha256": "abc"}
+        ],
+        "file_count": 1,
+        "dir_count": 1,
+        "total_bytes": 5
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    let mut header = Vec::new();
+    header.push(1);
+    header.push(1);
+    header.push(6);
+    header.extend_from_slice(b"sender");
+    header.extend_from_slice(&(6u16).to_be_bytes());
+    header.extend_from_slice(b"folder");
+    header.extend_from_slice(&(77u64).to_be_bytes());
+    header.push(0);
+    header.push(1);
+    header.extend_from_slice(&(manifest_bytes.len() as u32).to_be_bytes());
+    header.extend_from_slice(&manifest_bytes);
+    header.push(1);
+    header.extend_from_slice(&[7u8; 32]);
+
+    let mut i = 0usize;
+    assert_eq!(header[i], 1);
+    i += 1;
+    assert_eq!(header[i], 1);
+    i += 1;
+    let id_len = header[i] as usize;
+    i += 1;
+    assert_eq!(&header[i..i + id_len], b"sender");
+    i += id_len;
+    let name_len = u16::from_be_bytes([header[i], header[i + 1]]) as usize;
+    i += 2;
+    assert_eq!(&header[i..i + name_len], b"folder");
+    i += name_len;
+    let size = u64::from_be_bytes(header[i..i + 8].try_into().unwrap());
+    i += 8;
+    assert_eq!(size, 77);
+    assert_eq!(header[i], 0);
+    i += 1;
+    assert_eq!(header[i], 1);
+    i += 1;
+    let manifest_len = u32::from_be_bytes(header[i..i + 4].try_into().unwrap()) as usize;
+    i += 4;
+    let decoded: serde_json::Value = serde_json::from_slice(&header[i..i + manifest_len]).unwrap();
+    i += manifest_len;
+    assert_eq!(decoded["root_name"], "folder");
+    assert_eq!(header[i], 1);
+    i += 1;
+    assert_eq!(&header[i..i + 32], &[7u8; 32]);
+}
+
+#[test]
 fn tar_pack_unpack_tempdir() {
     let base = std::env::temp_dir().join(format!("rustle_test_{}", Uuid::new_v4()));
     let src = base.join("srcdir");

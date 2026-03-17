@@ -4,7 +4,11 @@ use crate::metadata::{Metadata, MetadataStore};
 use crate::model::{PeerEvent, TCP_DIR_PORT, TCP_FILE_PORT};
 use crate::storage::{default_download_dir, load_receive_map, save_receive_map, windows_long_path};
 use chrono::Local;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, ErrorKind, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -15,6 +19,395 @@ use uuid::Uuid;
 
 const MAX_ID_LEN: usize = 64;
 const MAX_NAME_LEN: usize = 255;
+const FLAG_SYNC: u8 = 0x01;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FolderManifestEntryType {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FolderManifestEntry {
+    path: String,
+    entry_type: FolderManifestEntryType,
+    size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FolderManifest {
+    root_name: String,
+    entries: Vec<FolderManifestEntry>,
+    file_count: usize,
+    dir_count: usize,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct FolderPackage {
+    manifest: FolderManifest,
+    tar_sha256: String,
+}
+
+fn emit_progress(
+    peer_tx: &Sender<PeerEvent>,
+    peer_id: Option<String>,
+    file_name: String,
+    progress: f32,
+    status: String,
+    is_incoming: bool,
+    is_dir: bool,
+    local_path: Option<String>,
+    is_sync: bool,
+    is_final: bool,
+    succeeded: bool,
+) {
+    let _ = peer_tx.send(PeerEvent::FileProgress {
+        peer_id,
+        file_name,
+        progress,
+        status,
+        is_incoming,
+        is_dir,
+        local_path,
+        is_sync,
+        is_final,
+        succeeded,
+    });
+}
+
+fn normalize_relative_path(path: &Path) -> io::Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => {
+                let text = part.to_string_lossy();
+                if text.is_empty() {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "empty path segment"));
+                }
+                parts.push(text.replace('\\', "/"));
+            }
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::ParentDir => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unsafe relative path: {:?}", path),
+                ));
+            }
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn normalized_path_to_buf(path: &str) -> PathBuf {
+    let mut buf = PathBuf::new();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        buf.push(part);
+    }
+    buf
+}
+
+fn path_collision_key(path: &str) -> String {
+    if cfg!(windows) {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
+fn sha256_reader<R: Read>(mut reader: R) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn tar_archive_path(root_name: &str, rel: &str) -> PathBuf {
+    let mut path = PathBuf::from(root_name);
+    if !rel.is_empty() {
+        path.push(normalized_path_to_buf(rel));
+    }
+    path
+}
+
+fn collect_folder_manifest(root: &Path, root_name: &str) -> io::Result<Vec<(PathBuf, FolderManifestEntry)>> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut collected = Vec::new();
+
+    while let Some(current_dir) = stack.pop() {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(current_dir.as_path())? {
+            entries.push(entry?);
+        }
+        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        for entry in entries {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "failed to strip folder root"))?;
+            let rel_norm = normalize_relative_path(rel)?;
+            let meta = std::fs::metadata(&path)?;
+
+            if meta.is_dir() {
+                collected.push((
+                    path.clone(),
+                    FolderManifestEntry {
+                        path: rel_norm,
+                        entry_type: FolderManifestEntryType::Directory,
+                        size: 0,
+                        sha256: None,
+                    },
+                ));
+                stack.push(path);
+            } else if meta.is_file() {
+                let sha256 = crate::storage::sha256_file(&path).ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("failed to hash folder file {:?}", path),
+                    )
+                })?;
+                collected.push((
+                    path,
+                    FolderManifestEntry {
+                        path: rel_norm,
+                        entry_type: FolderManifestEntryType::File,
+                        size: meta.len(),
+                        sha256: Some(sha256),
+                    },
+                ));
+            } else {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unsupported folder entry under {}", root_name),
+                ));
+            }
+        }
+    }
+
+    collected.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+    Ok(collected)
+}
+
+fn build_folder_package(source_dir: &Path, tar_path: &Path, root_name: &str) -> io::Result<FolderPackage> {
+    let entries = collect_folder_manifest(source_dir, root_name)?;
+    let tar_fs_path = windows_long_path(tar_path);
+    let src_fs_path = windows_long_path(source_dir);
+
+    let file = std::fs::File::create(&tar_fs_path)?;
+    let mut builder = tar::Builder::new(file);
+    builder.append_dir(root_name, &src_fs_path)?;
+
+    let mut manifest_entries = Vec::new();
+    let mut file_count = 0usize;
+    let mut dir_count = 0usize;
+    let mut total_bytes = 0u64;
+
+    for (path, manifest_entry) in entries {
+        let archive_path = tar_archive_path(root_name, &manifest_entry.path);
+        match manifest_entry.entry_type {
+            FolderManifestEntryType::Directory => {
+                builder.append_dir(&archive_path, windows_long_path(&path))?;
+                dir_count += 1;
+            }
+            FolderManifestEntryType::File => {
+                builder.append_path_with_name(windows_long_path(&path), &archive_path)?;
+                file_count += 1;
+                total_bytes += manifest_entry.size;
+            }
+        }
+        manifest_entries.push(manifest_entry);
+    }
+
+    builder.finish()?;
+
+    let tar_sha256 = sha256_reader(std::fs::File::open(&tar_fs_path)?)?;
+    Ok(FolderPackage {
+        manifest: FolderManifest {
+            root_name: root_name.to_string(),
+            entries: manifest_entries,
+            file_count,
+            dir_count,
+            total_bytes,
+        },
+        tar_sha256,
+    })
+}
+
+fn decode_folder_manifest(bytes: &[u8]) -> io::Result<FolderManifest> {
+    serde_json::from_slice(bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
+}
+
+fn normalize_archive_member_path(path: &Path, expected_root: &str) -> io::Result<Option<String>> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::ParentDir => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unsafe archive path {:?}", path),
+                ));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(io::Error::new(ErrorKind::InvalidData, "archive entry has empty path"));
+    }
+    if parts[0] != expected_root {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("archive root mismatch: expected {}, got {}", expected_root, parts[0]),
+        ));
+    }
+    if parts.len() == 1 {
+        return Ok(None);
+    }
+    let mut rel_buf = PathBuf::new();
+    for part in &parts[1..] {
+        rel_buf.push(part);
+    }
+    normalize_relative_path(&rel_buf).map(Some)
+}
+
+fn unpack_folder_archive(
+    tar_path: &Path,
+    extraction_root: &Path,
+    manifest: &FolderManifest,
+) -> io::Result<PathBuf> {
+    let final_root = extraction_root.join(&manifest.root_name);
+    std::fs::create_dir_all(&final_root)?;
+    let mut archive = tar::Archive::new(std::fs::File::open(tar_path)?);
+    let mut seen = HashSet::new();
+
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let entry_path = entry.path()?.to_path_buf();
+        let rel = normalize_archive_member_path(&entry_path, &manifest.root_name)?;
+        let header_type = entry.header().entry_type();
+        if header_type.is_symlink() || header_type.is_hard_link() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unsupported archive link entry {:?}", entry_path),
+            ));
+        }
+
+        let destination = match rel {
+            Some(ref rel_path) => {
+                let collision = path_collision_key(rel_path);
+                if !seen.insert(collision) {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("archive path collision for {}", rel_path),
+                    ));
+                }
+                final_root.join(normalized_path_to_buf(rel_path))
+            }
+            None => final_root.clone(),
+        };
+
+        if header_type.is_dir() {
+            std::fs::create_dir_all(&destination)?;
+            continue;
+        }
+        if !header_type.is_file() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unsupported archive entry type for {:?}", entry_path),
+            ));
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        entry.unpack(&destination)?;
+    }
+
+    Ok(final_root)
+}
+
+fn enumerate_extracted_entries(root: &Path) -> io::Result<HashMap<String, FolderManifestEntry>> {
+    let mut result = HashMap::new();
+    for (path, entry) in collect_folder_manifest(root, root.file_name().and_then(|n| n.to_str()).unwrap_or("folder"))? {
+        let _ = path;
+        result.insert(entry.path.clone(), entry);
+    }
+    Ok(result)
+}
+
+fn validate_extracted_folder(root: &Path, manifest: &FolderManifest) -> io::Result<()> {
+    if !root.exists() || !root.is_dir() {
+        return Err(io::Error::new(ErrorKind::NotFound, "validated folder root is missing"));
+    }
+
+    let actual = enumerate_extracted_entries(root)?;
+    let mut expected = HashMap::new();
+    for entry in &manifest.entries {
+        expected.insert(entry.path.clone(), entry.clone());
+    }
+
+    for (path, entry) in &expected {
+        let Some(actual_entry) = actual.get(path) else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("validated folder is missing {}", path),
+            ));
+        };
+        if actual_entry.entry_type != entry.entry_type {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("validated folder type mismatch for {}", path),
+            ));
+        }
+        if actual_entry.size != entry.size {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("validated folder size mismatch for {}", path),
+            ));
+        }
+        if actual_entry.sha256 != entry.sha256 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("validated folder digest mismatch for {}", path),
+            ));
+        }
+    }
+
+    for extra in actual.keys() {
+        if !expected.contains_key(extra) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("validated folder has unexpected entry {}", extra),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn promote_staged_folder(staged_root: &Path, final_root: &Path) -> io::Result<()> {
+    if let Some(parent) = final_root.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if final_root.exists() {
+        std::fs::remove_dir_all(final_root)?;
+    }
+    std::fs::rename(staged_root, final_root)
+}
 
 fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
@@ -91,6 +484,29 @@ pub async fn handle_incoming_file(
     peer_tx: Sender<PeerEvent>,
 ) {
     let _ = socket.set_nodelay(true);
+
+    let fail_and_emit = |peer_tx: &Sender<PeerEvent>,
+                         sender_id: &str,
+                         filename: &str,
+                         is_dir: bool,
+                         is_sync: bool,
+                         local_path: Option<String>,
+                         status: String| {
+        emit_progress(
+            peer_tx,
+            Some(sender_id.to_string()),
+            filename.to_string(),
+            1.0,
+            status,
+            true,
+            is_dir,
+            local_path,
+            is_sync,
+            true,
+            false,
+        );
+    };
+
     let mut type_buf = [0u8; 1];
     if socket.read_exact(&mut type_buf).await.is_err() {
         debug_println!("[rx] failed to read type from {addr}");
@@ -102,7 +518,7 @@ pub async fn handle_incoming_file(
         return;
     }
     let is_dir = type_buf[0] == 1;
-    let is_sync = (flag_buf[0] & 0x01) == 0x01;
+    let is_sync = (flag_buf[0] & FLAG_SYNC) == FLAG_SYNC;
 
     let mut id_len_buf = [0u8; 1];
     if socket.read_exact(&mut id_len_buf).await.is_err() {
@@ -148,8 +564,6 @@ pub async fn handle_incoming_file(
     }
     let total_size = u64::from_be_bytes(size_buf);
 
-    // 读取 SHA256 校验码（可选）
-    // 协议兼容：旧版本发送端没有该字段，避免误吞首字节 payload。
     let mut leading_payload: Vec<u8> = Vec::new();
     let mut sha256_present_buf = [0u8; 1];
     let expected_sha256: Option<String> = if socket.read_exact(&mut sha256_present_buf).await.is_ok() {
@@ -172,315 +586,462 @@ pub async fn handle_incoming_file(
         None
     };
 
+    let mut expected_manifest: Option<FolderManifest> = None;
+    let mut expected_tar_sha256: Option<String> = None;
+    if is_dir {
+        if !leading_payload.is_empty() {
+            fail_and_emit(
+                &peer_tx,
+                &sender_id,
+                &filename,
+                true,
+                is_sync,
+                None,
+                "接收失败：发送方不支持可靠目录校验".to_string(),
+            );
+            return;
+        }
+
+        let mut manifest_present_buf = [0u8; 1];
+        if socket.read_exact(&mut manifest_present_buf).await.is_err() {
+            fail_and_emit(
+                &peer_tx,
+                &sender_id,
+                &filename,
+                true,
+                is_sync,
+                None,
+                "接收失败：目录元数据缺失".to_string(),
+            );
+            return;
+        }
+        if manifest_present_buf[0] != 1 {
+            fail_and_emit(
+                &peer_tx,
+                &sender_id,
+                &filename,
+                true,
+                is_sync,
+                None,
+                "接收失败：发送方未提供目录校验清单".to_string(),
+            );
+            return;
+        }
+        let mut manifest_len_buf = [0u8; 4];
+        if socket.read_exact(&mut manifest_len_buf).await.is_err() {
+            fail_and_emit(
+                &peer_tx,
+                &sender_id,
+                &filename,
+                true,
+                is_sync,
+                None,
+                "接收失败：目录清单读取失败".to_string(),
+            );
+            return;
+        }
+        let manifest_len = u32::from_be_bytes(manifest_len_buf) as usize;
+        let mut manifest_buf = vec![0u8; manifest_len];
+        if socket.read_exact(&mut manifest_buf).await.is_err() {
+            fail_and_emit(
+                &peer_tx,
+                &sender_id,
+                &filename,
+                true,
+                is_sync,
+                None,
+                "接收失败：目录清单不完整".to_string(),
+            );
+            return;
+        }
+        match decode_folder_manifest(&manifest_buf) {
+            Ok(manifest) => expected_manifest = Some(manifest),
+            Err(err) => {
+                fail_and_emit(
+                    &peer_tx,
+                    &sender_id,
+                    &filename,
+                    true,
+                    is_sync,
+                    None,
+                    format!("接收失败：目录清单无效 ({err})"),
+                );
+                return;
+            }
+        }
+
+        let mut tar_sha_present = [0u8; 1];
+        if socket.read_exact(&mut tar_sha_present).await.is_err() {
+            fail_and_emit(
+                &peer_tx,
+                &sender_id,
+                &filename,
+                true,
+                is_sync,
+                None,
+                "接收失败：目录归档校验缺失".to_string(),
+            );
+            return;
+        }
+        if tar_sha_present[0] == 1 {
+            let mut tar_sha_buf = [0u8; 32];
+            if socket.read_exact(&mut tar_sha_buf).await.is_err() {
+                fail_and_emit(
+                    &peer_tx,
+                    &sender_id,
+                    &filename,
+                    true,
+                    is_sync,
+                    None,
+                    "接收失败：目录归档校验读取失败".to_string(),
+                );
+                return;
+            }
+            expected_tar_sha256 = Some(hex::encode(tar_sha_buf));
+        }
+    }
+
     eprintln!(
-        "[rx] header from {addr} id={sender_id} name={filename} is_dir={is_dir} size={total_size} sha256={:?}",
-        expected_sha256.as_ref().map(|s| &s[..8])
+        "[rx] header from {addr} id={sender_id} name={filename} is_dir={is_dir} size={total_size} sha256={:?} manifest={}",
+        expected_sha256.as_ref().map(|s| &s[..8]),
+        expected_manifest.is_some()
     );
 
-    let initial_status = if total_size > 0 {
+    let initial_status = if is_dir {
+        "正在接收目录...".to_string()
+    } else if total_size > 0 {
         format!("正在接收 0% / {}", human_size(total_size))
     } else {
         "正在接收...".to_string()
     };
-
-    let _ = peer_tx.send(PeerEvent::FileProgress {
-        peer_id: Some(sender_id.clone()),
-        file_name: filename.clone(),
-        progress: 0.0,
-        status: initial_status,
-        is_incoming: true,
+    emit_progress(
+        &peer_tx,
+        Some(sender_id.clone()),
+        filename.clone(),
+        0.0,
+        initial_status,
+        true,
         is_dir,
-        local_path: None,
+        None,
         is_sync,
-    });
+        false,
+        false,
+    );
 
     let base_dir = default_download_dir();
-    let mut mapped_path: Option<PathBuf> = None;
-    if is_sync {
+    let mapped_path = if is_sync {
         let map = load_receive_map();
         let key = receive_map_key(&sender_id, is_dir, &filename);
-        if let Some(p) = map.get(&key) {
-            mapped_path = Some(PathBuf::from(p));
-        }
-    }
-
-    let (sub_dir, save_path) = if let Some(mapped) = mapped_path {
-        if is_dir {
-            let parent = mapped
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| base_dir.clone());
-            let _ = fs::create_dir_all(&parent);
-            let _ = fs::create_dir_all(&mapped);
-            (parent, mapped)
-        } else {
-            if let Some(parent) = mapped.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let parent = mapped
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| base_dir.clone());
-            (parent, mapped)
-        }
+        map.get(&key).map(PathBuf::from)
     } else {
-        // 无论文件还是文件夹，都创建一个独立的子目录
-        let sub_dir_name = format!("rustle_{}_{}", safe_filename, Local::now().format("%H%M%S"));
-        let sub_dir = base_dir.join(sub_dir_name);
-        let _ = fs::create_dir_all(&sub_dir);
-        let save_path = sub_dir.join(&safe_filename);
-        (sub_dir, save_path)
+        None
+    };
+
+    let transfer_root = if is_dir {
+        mapped_path
+            .as_ref()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| {
+                let sub_dir_name = format!(
+                    "rustle_{}_{}",
+                    safe_filename,
+                    Local::now().format("%H%M%S")
+                );
+                base_dir.join(sub_dir_name)
+            })
+    } else {
+        mapped_path
+            .as_ref()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| {
+                let sub_dir_name = format!(
+                    "rustle_{}_{}",
+                    safe_filename,
+                    Local::now().format("%H%M%S")
+                );
+                base_dir.join(sub_dir_name)
+            })
+    };
+    let _ = fs::create_dir_all(&transfer_root);
+
+    let final_save_path = if let Some(mapped) = mapped_path.clone() {
+        mapped
+    } else {
+        transfer_root.join(&safe_filename)
     };
 
     let mut success = false;
-    let mut last_progress = 0.0f32;
+    let mut final_local_path = final_save_path.clone();
     let mut final_received: u64 = 0;
+    let mut last_progress = 0.0f32;
     let mut last_report_instant = Instant::now();
     let mut last_report_bytes: u64 = 0;
+    let mut failure_reason: Option<String> = None;
 
     if is_dir {
-        let tar_path = save_path.with_extension("tar");
-        if let Ok(mut file) = tokio::fs::File::create(&tar_path).await {
+        let staging_root = transfer_root.join(format!(".staging-{}", Uuid::new_v4()));
+        let archive_path = staging_root.join("incoming.tar");
+        let extract_root = staging_root.join("extract");
+        let _ = fs::create_dir_all(&extract_root);
+
+        if let Ok(mut file) = tokio::fs::File::create(&archive_path).await {
             let mut buf = vec![0u8; 64 * 1024];
-            let mut received: u64 = 0;
-            if !leading_payload.is_empty() {
-                if file.write_all(&leading_payload).await.is_err() {
-                    eprintln!("[rx] dir failed to write legacy leading payload byte");
-                } else {
-                    received = leading_payload.len() as u64;
-                    eprintln!(
-                        "[rx] legacy stream detected, prepended {} payload byte(s)",
-                        leading_payload.len()
-                    );
-                }
-            }
+            let mut received = 0u64;
             loop {
                 match socket.read(&mut buf).await {
-                    Ok(0) => {
-                        eprintln!("[rx] dir EOF after {received} bytes (target {total_size})");
-                        break;
-                    }
+                    Ok(0) => break,
                     Ok(n) => {
                         if file.write_all(&buf[..n]).await.is_err() {
+                            failure_reason = Some("接收失败：写入目录归档失败".to_string());
                             break;
                         }
                         received += n as u64;
                         if total_size > 0 {
                             let progress = (received as f32 / total_size as f32).min(1.0);
                             let now = Instant::now();
-                            let elapsed_ms = now.duration_since(last_report_instant).as_millis();
-                            if (progress - last_progress >= 0.05 && elapsed_ms >= 200)
+                            if (progress - last_progress >= 0.05
+                                && now.duration_since(last_report_instant).as_millis() >= 200)
                                 || last_report_bytes == 0
                             {
-                                let status = format!(
-                                    "正在接收 {:.0}% / {} ({})",
-                                    progress * 100.0,
-                                    human_size(total_size),
-                                    format_speed(
-                                        received - last_report_bytes,
-                                        now.duration_since(last_report_instant)
-                                    ),
-                                );
-                                let _ = peer_tx.send(PeerEvent::FileProgress {
-                                    peer_id: Some(sender_id.clone()),
-                                    file_name: filename.clone(),
+                                emit_progress(
+                                    &peer_tx,
+                                    Some(sender_id.clone()),
+                                    filename.clone(),
                                     progress,
-                                    status,
-                                    is_incoming: true,
-                                    is_dir,
-                                    local_path: None,
+                                    format!(
+                                        "正在接收目录 {:.0}% / {} ({})",
+                                        progress * 100.0,
+                                        human_size(total_size),
+                                        format_speed(
+                                            received - last_report_bytes,
+                                            now.duration_since(last_report_instant)
+                                        )
+                                    ),
+                                    true,
+                                    true,
+                                    None,
                                     is_sync,
-                                });
+                                    false,
+                                    false,
+                                );
                                 last_progress = progress;
                                 last_report_instant = now;
                                 last_report_bytes = received;
                             }
-                            if received >= total_size {
-                                eprintln!("[rx] dir reached declared size {received}/{total_size}");
-                                success = true;
-                                break;
-                            }
-                        } else if received % (8 * 1024 * 1024) == 0 {
-                            eprintln!("[rx] dir received {received} bytes (size unknown)");
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[rx] dir read error after {received}: {e}");
+                    Err(err) => {
+                        failure_reason = Some(format!("接收失败：目录数据读取失败 ({err})"));
                         break;
                     }
                 }
             }
+            final_received = received;
 
-            if success || (total_size == 0 && received > 0) {
-                let tar_path_clone = tar_path.clone();
-                let unpack_dst = sub_dir.clone();
-                let unpacked = tokio::task::spawn_blocking(move || -> bool {
-                    if let Ok(f) = std::fs::File::open(&tar_path_clone) {
-                        let mut ar = tar::Archive::new(f);
-                        if let Ok(entries) = ar.entries() {
-                            for entry in entries {
-                                let mut entry = match entry {
-                                    Ok(e) => e,
-                                    Err(_) => return false,
-                                };
-                                if entry.unpack_in(&unpack_dst).is_err() {
-                                    return false;
-                                }
-                            }
-                            return true;
+            if failure_reason.is_none() && total_size > 0 && received != total_size {
+                failure_reason = Some(format!(
+                    "接收失败：目录数据不完整（{received}/{total_size}）"
+                ));
+            }
+
+            if failure_reason.is_none() {
+                emit_progress(
+                    &peer_tx,
+                    Some(sender_id.clone()),
+                    filename.clone(),
+                    1.0,
+                    "正在解压目录...".to_string(),
+                    true,
+                    true,
+                    None,
+                    is_sync,
+                    false,
+                    false,
+                );
+
+                let archive_path_clone = archive_path.clone();
+                let extract_root_clone = extract_root.clone();
+                let manifest = expected_manifest.clone().unwrap();
+                let expected_tar_sha = expected_tar_sha256.clone();
+                let unpack_result = tokio::task::spawn_blocking(move || -> io::Result<PathBuf> {
+                    if let Some(expected) = expected_tar_sha {
+                        let actual = sha256_reader(std::fs::File::open(&archive_path_clone)?)?;
+                        if actual != expected {
+                            return Err(io::Error::new(
+                                ErrorKind::InvalidData,
+                                "directory archive digest mismatch",
+                            ));
                         }
                     }
-                    false
+                    unpack_folder_archive(&archive_path_clone, &extract_root_clone, &manifest)
                 })
-                .await
-                .unwrap_or(false);
-                if unpacked {
-                    success = true;
-                    eprintln!("[rx] dir unpacked into {:?}", save_path);
-                } else {
-                    success = false;
-                    eprintln!("[rx] dir unpack failed for {:?}", tar_path);
+                .await;
+
+                match unpack_result {
+                    Ok(Ok(staged_root)) => {
+                        emit_progress(
+                            &peer_tx,
+                            Some(sender_id.clone()),
+                            filename.clone(),
+                            1.0,
+                            "正在校验目录...".to_string(),
+                            true,
+                            true,
+                            None,
+                            is_sync,
+                            false,
+                            false,
+                        );
+                        let manifest = expected_manifest.clone().unwrap();
+                        let final_path = final_save_path.clone();
+                        let validate_result = tokio::task::spawn_blocking(move || -> io::Result<()> {
+                            validate_extracted_folder(&staged_root, &manifest)?;
+                            promote_staged_folder(&staged_root, &final_path)
+                        })
+                        .await;
+
+                        match validate_result {
+                            Ok(Ok(())) => {
+                                success = true;
+                                final_local_path = final_save_path.clone();
+                            }
+                            Ok(Err(err)) => {
+                                failure_reason = Some(format!("接收失败：目录校验失败 ({err})"));
+                            }
+                            Err(err) => {
+                                failure_reason = Some(format!("接收失败：目录校验任务失败 ({err})"));
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        failure_reason = Some(format!("接收失败：目录解压失败 ({err})"));
+                    }
+                    Err(err) => {
+                        failure_reason = Some(format!("接收失败：目录解压任务失败 ({err})"));
+                    }
                 }
             }
-            final_received = received;
-            let _ = tokio::fs::remove_file(&tar_path).await;
         } else {
-            eprintln!("[rx] failed to create tar temp file at {:?}", tar_path);
+            failure_reason = Some("接收失败：无法创建目录暂存文件".to_string());
         }
-    } else if let Ok(mut file) = tokio::fs::File::create(&save_path).await {
+
+        let _ = tokio::fs::remove_dir_all(&staging_root).await;
+        if !success {
+            let _ = tokio::fs::remove_dir_all(&final_save_path).await;
+        }
+    } else if let Ok(mut file) = tokio::fs::File::create(&final_save_path).await {
         let mut buf = vec![0u8; 64 * 1024];
         let mut received: u64 = 0;
         if !leading_payload.is_empty() {
             if file.write_all(&leading_payload).await.is_err() {
-                eprintln!("[rx] file failed to write legacy leading payload byte");
+                failure_reason = Some("接收失败：文件预写入失败".to_string());
             } else {
                 received = leading_payload.len() as u64;
-                eprintln!(
-                    "[rx] legacy stream detected, prepended {} payload byte(s)",
-                    leading_payload.len()
-                );
             }
         }
-        loop {
+        while failure_reason.is_none() {
             match socket.read(&mut buf).await {
-                Ok(0) => {
-                    eprintln!("[rx] file EOF after {received} bytes (target {total_size})");
-                    break;
-                }
+                Ok(0) => break,
                 Ok(n) => {
                     if file.write_all(&buf[..n]).await.is_err() {
+                        failure_reason = Some("接收失败：写入文件失败".to_string());
                         break;
                     }
                     received += n as u64;
                     if total_size > 0 {
                         let progress = (received as f32 / total_size as f32).min(1.0);
                         let now = Instant::now();
-                        let elapsed_ms = now.duration_since(last_report_instant).as_millis();
-                        if (progress - last_progress >= 0.05 && elapsed_ms >= 200)
+                        if (progress - last_progress >= 0.05
+                            && now.duration_since(last_report_instant).as_millis() >= 200)
                             || last_report_bytes == 0
                         {
-                            let status = format!(
-                                "正在接收 {:.0}% / {} ({})",
-                                progress * 100.0,
-                                human_size(total_size),
-                                format_speed(
-                                    received - last_report_bytes,
-                                    now.duration_since(last_report_instant)
-                                ),
-                            );
-                            let _ = peer_tx.send(PeerEvent::FileProgress {
-                                peer_id: Some(sender_id.clone()),
-                                file_name: filename.clone(),
+                            emit_progress(
+                                &peer_tx,
+                                Some(sender_id.clone()),
+                                filename.clone(),
                                 progress,
-                                status,
-                                is_incoming: true,
-                                is_dir,
-                                local_path: None,
+                                format!(
+                                    "正在接收 {:.0}% / {} ({})",
+                                    progress * 100.0,
+                                    human_size(total_size),
+                                    format_speed(
+                                        received - last_report_bytes,
+                                        now.duration_since(last_report_instant)
+                                    )
+                                ),
+                                true,
+                                false,
+                                None,
                                 is_sync,
-                            });
+                                false,
+                                false,
+                            );
                             last_progress = progress;
                             last_report_instant = now;
                             last_report_bytes = received;
                         }
-                        if received >= total_size {
-                            eprintln!("[rx] file reached declared size {received}/{total_size}");
-                            success = true;
-                            break;
-                        }
-                    } else if received % (8 * 1024 * 1024) == 0 {
-                        eprintln!("[rx] file received {received} bytes (size unknown)");
                     }
                 }
-                Err(e) => {
-                    eprintln!("[rx] file read error after {received}: {e}");
-                    break;
+                Err(err) => {
+                    failure_reason = Some(format!("接收失败：文件读取失败 ({err})"));
                 }
             }
         }
-        if total_size == 0 && received > 0 {
-            success = true;
-        }
         final_received = received;
+        if failure_reason.is_none() && total_size > 0 && received != total_size {
+            failure_reason = Some(format!("接收失败：文件大小不匹配（{received}/{total_size}）"));
+        }
+        if failure_reason.is_none() && expected_sha256.is_some() {
+            let received_sha256 = crate::storage::sha256_file(&final_save_path);
+            if received_sha256 != expected_sha256 {
+                failure_reason = Some("接收失败：文件校验失败".to_string());
+            }
+        }
+        success = failure_reason.is_none();
     } else {
-        eprintln!("[rx] failed to create file at {:?}", save_path);
+        failure_reason = Some("接收失败：无法创建目标文件".to_string());
     }
 
-    let completed_size = if total_size > 0 {
-        total_size
-    } else {
-        final_received
-    };
-    
-    // 验证文件完整性
-    let sha256_valid = if success && expected_sha256.is_some() && !is_dir {
-        let received_sha256 = crate::storage::sha256_file(&save_path);
-        let expected = expected_sha256.as_ref();
-        match (received_sha256, expected) {
-            (Some(received), Some(exp)) if received == *exp => {
-                eprintln!("[rx] SHA256 verification passed for {:?}", save_path);
-                true
-            }
-            (Some(received), Some(_)) => {
-                eprintln!("[rx] SHA256 verification FAILED! expected={:?} got={}", expected, &received[..8]);
-                false
-            }
-            _ => {
-                eprintln!("[rx] SHA256 calculation failed, cannot verify");
-                false
-            }
-        }
-    } else {
-        true // Skip for dirs or no SHA256 expected
-    };
-    
-    let status = if success {
-        if !sha256_valid {
-            "接收完成(校验失败)".to_string()
+    if success {
+        let mut map = load_receive_map();
+        let key = receive_map_key(&sender_id, is_dir, &filename);
+        map.insert(
+            key,
+            final_local_path.to_string_lossy().to_string(),
+        );
+        save_receive_map(&map);
+    }
+
+    let completed_size = if total_size > 0 { total_size } else { final_received };
+    let final_status = if success {
+        if is_dir {
+            format!("目录接收完成并已校验 ({})", human_size(completed_size))
         } else if completed_size > 0 {
             format!("接收完成 ({})", human_size(completed_size))
         } else {
             "接收完成".to_string()
         }
     } else {
-        "接收失败".to_string()
+        failure_reason.unwrap_or_else(|| "接收失败".to_string())
     };
-    if success {
-        let mut map = load_receive_map();
-        let key = receive_map_key(&sender_id, is_dir, &filename);
-        map.insert(key, save_path.to_string_lossy().to_string());
-        save_receive_map(&map);
-    }
 
-    let _ = peer_tx.send(PeerEvent::FileProgress {
-        peer_id: Some(sender_id),
-        file_name: filename,
-        progress: 1.0,
-        status,
-        is_incoming: true,
+    emit_progress(
+        &peer_tx,
+        Some(sender_id),
+        filename,
+        1.0,
+        final_status,
+        true,
         is_dir,
-        local_path: Some(save_path.to_string_lossy().to_string()),
+        if success {
+            Some(final_local_path.to_string_lossy().to_string())
+        } else {
+            None
+        },
         is_sync,
-    });
+        true,
+        success,
+    );
 }
 
 pub async fn handle_outgoing_file(
@@ -599,6 +1160,8 @@ pub async fn handle_outgoing_file(
     let declared_size: u64;
     let mut send_path = path.clone();
     let mut cleanup_path: Option<PathBuf> = None;
+    let mut folder_manifest: Option<FolderManifest> = None;
+    let mut folder_archive_sha256: Option<String> = None;
 
     if is_dir {
         let temp_tar = std::env::temp_dir().join(format!("{}.tar", Uuid::new_v4()));
@@ -607,136 +1170,70 @@ pub async fn handle_outgoing_file(
         let filename_clone = filename.clone();
 
         let res = tokio::task::spawn_blocking(move || {
-            fn add_dir_to_tar(
-                builder: &mut tar::Builder<std::fs::File>,
-                root: &Path,
-                src: &Path,
-                base_name: &str,
-                skipped: &mut usize,
-                processed: &mut usize,
-                last_pause: &mut Instant,
-            ) -> std::io::Result<()> {
-                let read_dir = std::fs::read_dir(src)?;
-                for entry in read_dir {
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => {
-                            *skipped += 1;
-                            continue;
-                        }
-                    };
-                    let path = entry.path();
-                    let rel = match path.strip_prefix(root) {
-                        Ok(r) => r,
-                        Err(_) => {
-                            *skipped += 1;
-                            continue;
-                        }
-                    };
-                    let tar_path = Path::new(base_name).join(rel);
-                    if path.is_dir() {
-                        if builder.append_dir(&tar_path, &path).is_err() {
-                            *skipped += 1;
-                        }
-                        if add_dir_to_tar(
-                            builder, root, &path, base_name, skipped, processed, last_pause,
-                        )
-                        .is_err()
-                        {
-                            *skipped += 1;
-                        }
-                    } else if path.is_file() {
-                        if builder.append_path_with_name(&path, &tar_path).is_err() {
-                            *skipped += 1;
-                        }
-                    }
-
-                    *processed += 1;
-                    if *processed % 200 == 0 && last_pause.elapsed() >= Duration::from_millis(25) {
-                        std::thread::sleep(Duration::from_millis(2));
-                        *last_pause = Instant::now();
-                    }
-                }
-                Ok(())
-            }
-
-            let tar_fs_path = windows_long_path(&tar_path);
-            let src_fs_path = windows_long_path(&path_clone);
-
-            let file = std::fs::File::create(&tar_fs_path)?;
-            let mut builder = tar::Builder::new(file);
-            let mut skipped = 0usize;
-            let mut processed = 0usize;
-            let mut last_pause = Instant::now();
-            add_dir_to_tar(
-                &mut builder,
-                &src_fs_path,
-                &src_fs_path,
-                &filename_clone,
-                &mut skipped,
-                &mut processed,
-                &mut last_pause,
-            )?;
-            if skipped > 0 {
-                eprintln!(
-                    "[tx] tar build skipped {} entries due to read/permission errors",
-                    skipped
-                );
-            }
-            builder.finish()?;
-            Ok::<(), std::io::Error>(())
+            build_folder_package(&path_clone, &tar_path, &filename_clone)
         })
         .await;
 
         match res {
-            Ok(Ok(())) => {
+            Ok(Ok(package)) => {
                 if let Ok(meta) = tokio::fs::metadata(&temp_tar).await {
                     declared_size = meta.len();
                     send_path = temp_tar.clone();
                     cleanup_path = Some(temp_tar);
+                    folder_manifest = Some(package.manifest);
+                    folder_archive_sha256 = Some(package.tar_sha256);
                 } else {
                     eprintln!("[tx] tar metadata failed for {:?}", temp_tar);
-                    let _ = peer_tx.send(PeerEvent::FileProgress {
-                        peer_id: Some(peer_id),
-                        file_name: filename,
-                        progress: 0.0,
-                        status: "打包目录失败".to_string(),
-                        is_incoming: false,
+                    emit_progress(
+                        &peer_tx,
+                        Some(peer_id),
+                        filename,
+                        1.0,
+                        "目录打包失败：无法读取临时归档信息".to_string(),
+                        false,
                         is_dir,
-                        local_path: Some(path.to_string_lossy().to_string()),
+                        Some(path.to_string_lossy().to_string()),
                         is_sync,
-                    });
+                        true,
+                        false,
+                    );
                     return;
                 }
             }
             Ok(Err(e)) => {
                 eprintln!("[tx] tar build failed for {:?}: {}", path, e);
                 let _ = tokio::fs::remove_file(&temp_tar).await;
-                let _ = peer_tx.send(PeerEvent::FileProgress {
-                    peer_id: Some(peer_id),
-                    file_name: filename,
-                    progress: 0.0,
-                    status: "打包目录失败".to_string(),
-                    is_incoming: false,
+                emit_progress(
+                    &peer_tx,
+                    Some(peer_id),
+                    filename,
+                    1.0,
+                    format!("目录打包失败：{e}"),
+                    false,
                     is_dir,
-                    local_path: Some(path.to_string_lossy().to_string()),
+                    Some(path.to_string_lossy().to_string()),
                     is_sync,
-                });
+                    true,
+                    false,
+                );
                 return;
             }
             Err(join_err) => {
                 eprintln!("[tx] tar build join error for {:?}: {}", path, join_err);
                 let _ = tokio::fs::remove_file(&temp_tar).await;
-                let _ = peer_tx.send(PeerEvent::FileProgress {
-                    peer_id: Some(peer_id),
-                    file_name: filename,
-                    progress: 0.0,
-                    status: "打包目录失败".to_string(),
-                    is_incoming: false,
+                emit_progress(
+                    &peer_tx,
+                    Some(peer_id),
+                    filename,
+                    1.0,
+                    format!("目录打包失败：后台任务异常 ({join_err})"),
+                    false,
                     is_dir,
-                    local_path: Some(path.to_string_lossy().to_string()),
+                    Some(path.to_string_lossy().to_string()),
                     is_sync,
-                });
+                    true,
+                    false,
+                );
                 return;
             }
         }
@@ -746,16 +1243,23 @@ pub async fn handle_outgoing_file(
 
     if let Ok(mut socket) = socket {
         let _ = socket.set_nodelay(true);
-        let _ = peer_tx.send(PeerEvent::FileProgress {
-            peer_id: Some(peer_id.clone()),
-            file_name: filename.clone(),
-            progress: 0.0,
-            status: "发送中...".to_string(),
-            is_incoming: false,
+        emit_progress(
+            &peer_tx,
+            Some(peer_id.clone()),
+            filename.clone(),
+            0.0,
+            if is_dir {
+                "正在打包目录...".to_string()
+            } else {
+                "发送中...".to_string()
+            },
+            false,
             is_dir,
-            local_path: Some(path.to_string_lossy().to_string()),
+            Some(path.to_string_lossy().to_string()),
             is_sync,
-        });
+            false,
+            false,
+        );
 
         let name_bytes = filename.as_bytes();
         let name_len = name_bytes.len() as u16;
@@ -797,7 +1301,7 @@ pub async fn handle_outgoing_file(
         }
 
         header.push(if is_dir { 1 } else { 0 });
-        header.push(if is_sync { 1 } else { 0 });
+        header.push(if is_sync { FLAG_SYNC } else { 0 });
         header.push(id_len);
         header.extend_from_slice(id_bytes);
         header.extend_from_slice(&name_len.to_be_bytes());
@@ -811,6 +1315,65 @@ pub async fn handle_outgoing_file(
             header.extend_from_slice(&sha_bytes); // 32 bytes, padded with zeros if needed
         } else {
             header.push(0); // No SHA256
+        }
+
+        if is_dir {
+            match folder_manifest.as_ref() {
+                Some(manifest) => {
+                    let manifest_json = match serde_json::to_vec(manifest) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            if let Some(p) = cleanup_path.as_ref() {
+                                let _ = tokio::fs::remove_file(p).await;
+                            }
+                            emit_progress(
+                                &peer_tx,
+                                Some(peer_id),
+                                filename,
+                                1.0,
+                                format!("目录打包失败：无法序列化清单 ({err})"),
+                                false,
+                                true,
+                                Some(path.to_string_lossy().to_string()),
+                                is_sync,
+                                true,
+                                false,
+                            );
+                            return;
+                        }
+                    };
+                    header.push(1);
+                    header.extend_from_slice(&(manifest_json.len() as u32).to_be_bytes());
+                    header.extend_from_slice(&manifest_json);
+                }
+                None => {
+                    if let Some(p) = cleanup_path.as_ref() {
+                        let _ = tokio::fs::remove_file(p).await;
+                    }
+                    emit_progress(
+                        &peer_tx,
+                        Some(peer_id),
+                        filename,
+                        1.0,
+                        "目录打包失败：目录清单缺失".to_string(),
+                        false,
+                        true,
+                        Some(path.to_string_lossy().to_string()),
+                        is_sync,
+                        true,
+                        false,
+                    );
+                    return;
+                }
+            }
+
+            if let Some(ref sha_str) = folder_archive_sha256 {
+                header.push(1);
+                let sha_bytes = hex::decode(sha_str).unwrap_or_default();
+                header.extend_from_slice(&sha_bytes);
+            } else {
+                header.push(0);
+            }
         }
 
         eprintln!("[tx] sending header to {addr_str} id={my_id} peer={peer_id} name={filename} is_dir={is_dir} size={declared_size}");
@@ -846,21 +1409,25 @@ pub async fn handle_outgoing_file(
                                         || last_report_bytes == 0
                                     {
                                         let status = format!(
-                                            "发送中 {:.0}% / {} ({})",
+                                            "{} {:.0}% / {} ({})",
+                                            if is_dir { "正在发送目录" } else { "发送中" },
                                             progress * 100.0,
                                             human_size(declared_size),
                                             format_speed(sent_total - last_report_bytes, elapsed),
                                         );
-                                        let _ = peer_tx.send(PeerEvent::FileProgress {
-                                            peer_id: Some(peer_id.clone()),
-                                            file_name: filename.clone(),
+                                        emit_progress(
+                                            &peer_tx,
+                                            Some(peer_id.clone()),
+                                            filename.clone(),
                                             progress,
                                             status,
-                                            is_incoming: false,
+                                            false,
                                             is_dir,
-                                            local_path: Some(path.to_string_lossy().to_string()),
+                                            Some(path.to_string_lossy().to_string()),
                                             is_sync,
-                                        });
+                                            false,
+                                            false,
+                                        );
                                         last_progress = progress;
                                         last_report_instant = now;
                                         last_report_bytes = sent_total;
@@ -892,68 +1459,88 @@ pub async fn handle_outgoing_file(
 
                     let status_text =
                         if send_ok && (declared_size == 0 || sent_total >= declared_size) {
-                            "发送完成".to_string()
+                            if is_dir {
+                                "目录发送完成，等待对端校验".to_string()
+                            } else {
+                                "发送完成".to_string()
+                            }
                         } else {
-                            "发送失败".to_string()
+                            if is_dir {
+                                "目录发送失败".to_string()
+                            } else {
+                                "发送失败".to_string()
+                            }
                         };
 
-                    let _ = peer_tx.send(PeerEvent::FileProgress {
-                        peer_id: Some(peer_id),
-                        file_name: filename,
-                        progress: final_progress,
-                        status: status_text,
-                        is_incoming: false,
+                    emit_progress(
+                        &peer_tx,
+                        Some(peer_id),
+                        filename,
+                        final_progress,
+                        status_text,
+                        false,
                         is_dir,
-                        local_path: Some(path.to_string_lossy().to_string()),
+                        Some(path.to_string_lossy().to_string()),
                         is_sync,
-                    });
+                        true,
+                        send_ok && (declared_size == 0 || sent_total >= declared_size),
+                    );
                 }
                 Err(e) => {
                     eprintln!("[tx] open send_path {:?} failed: {e}", send_path);
                     if let Some(p) = cleanup_path.as_ref() {
                         let _ = tokio::fs::remove_file(p).await;
                     }
-                    let _ = peer_tx.send(PeerEvent::FileProgress {
-                        peer_id: Some(peer_id),
-                        file_name: filename,
-                        progress: 0.0,
-                        status: "发送失败".to_string(),
-                        is_incoming: false,
+                    emit_progress(
+                        &peer_tx,
+                        Some(peer_id),
+                        filename,
+                        1.0,
+                        format!("发送失败：无法读取待发送内容 ({e})"),
+                        false,
                         is_dir,
-                        local_path: Some(path.to_string_lossy().to_string()),
+                        Some(path.to_string_lossy().to_string()),
                         is_sync,
-                    });
+                        true,
+                        false,
+                    );
                 }
             }
         } else {
             if let Some(p) = cleanup_path.as_ref() {
                 let _ = tokio::fs::remove_file(p).await;
             }
-            let _ = peer_tx.send(PeerEvent::FileProgress {
-                peer_id: Some(peer_id),
-                file_name: filename,
-                progress: 0.0,
-                status: "连接失败".to_string(),
-                is_incoming: false,
+            emit_progress(
+                &peer_tx,
+                Some(peer_id),
+                filename,
+                1.0,
+                "连接失败".to_string(),
+                false,
                 is_dir,
-                local_path: Some(path.to_string_lossy().to_string()),
+                Some(path.to_string_lossy().to_string()),
                 is_sync,
-            });
+                true,
+                false,
+            );
         }
     } else {
         if let Some(p) = cleanup_path {
             let _ = tokio::fs::remove_file(p).await;
         }
-        let _ = peer_tx.send(PeerEvent::FileProgress {
-            peer_id: Some(peer_id),
-            file_name: filename,
-            progress: 0.0,
-            status: "连接失败".to_string(),
-            is_incoming: false,
+        emit_progress(
+            &peer_tx,
+            Some(peer_id),
+            filename,
+            1.0,
+            "连接失败".to_string(),
+            false,
             is_dir,
-            local_path: Some(path.to_string_lossy().to_string()),
+            Some(path.to_string_lossy().to_string()),
             is_sync,
-        });
+            true,
+            false,
+        );
     }
 }
 
@@ -984,5 +1571,81 @@ mod tests {
     fn sanitize_filename_rejects_empty() {
         assert_eq!(sanitize_filename("  "), "unnamed");
         assert_eq!(sanitize_filename(".."), "unnamed");
+    }
+
+    #[test]
+    fn folder_manifest_includes_empty_dirs_and_files() {
+        let base = std::env::temp_dir().join(format!("rustle_manifest_{}", Uuid::new_v4()));
+        let root = base.join("folder");
+        std::fs::create_dir_all(root.join("nested/empty")).unwrap();
+        std::fs::write(root.join("nested/file.txt"), b"hello").unwrap();
+
+        let entries = collect_folder_manifest(&root, "folder").unwrap();
+        let names: Vec<String> = entries.into_iter().map(|(_, e)| e.path).collect();
+
+        assert!(names.contains(&"nested".to_string()));
+        assert!(names.contains(&"nested/empty".to_string()));
+        assert!(names.contains(&"nested/file.txt".to_string()));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unpack_folder_archive_rejects_normalized_path_collision() {
+        let base = std::env::temp_dir().join(format!("rustle_unpack_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let tar_path = base.join("bad.tar");
+        let tar_file = std::fs::File::create(&tar_path).unwrap();
+        let mut builder = tar::Builder::new(tar_file);
+
+        for entry_name in ["folder/dup.txt", "folder/DUP.txt"] {
+            let mut header = tar::Header::new_gnu();
+            let data = b"oops";
+            header.set_path(entry_name).unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &data[..]).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let manifest = FolderManifest {
+            root_name: "folder".to_string(),
+            entries: vec![],
+            file_count: 0,
+            dir_count: 0,
+            total_bytes: 0,
+        };
+
+        let err = unpack_folder_archive(&tar_path, &base.join("out"), &manifest).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn validate_extracted_folder_rejects_digest_mismatch() {
+        let base = std::env::temp_dir().join(format!("rustle_validate_{}", Uuid::new_v4()));
+        let root = base.join("folder");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"actual").unwrap();
+
+        let manifest = FolderManifest {
+            root_name: "folder".to_string(),
+            entries: vec![FolderManifestEntry {
+                path: "file.txt".to_string(),
+                entry_type: FolderManifestEntryType::File,
+                size: 6,
+                sha256: Some("deadbeef".to_string()),
+            }],
+            file_count: 1,
+            dir_count: 0,
+            total_bytes: 6,
+        };
+
+        let err = validate_extracted_folder(&root, &manifest).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }

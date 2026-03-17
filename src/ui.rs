@@ -426,6 +426,14 @@ pub struct RustleApp {
 }
 
 impl RustleApp {
+    fn peer_supports_reliable_folders(&self, peer_id: &str) -> bool {
+        self.users
+            .iter()
+            .find(|u| u.id == peer_id)
+            .map(|u| u.supports_reliable_folders)
+            .unwrap_or(false)
+    }
+
     fn is_private_ipv4(ip: &str) -> bool {
         let parts: Vec<_> = ip.split('.').collect();
         if parts.len() != 4 {
@@ -672,6 +680,8 @@ impl RustleApp {
                         ip: None,
                         port: None,
                         tcp_port: None,
+                        protocol_version: None,
+                        supports_reliable_folders: false,
                         bound_interface: None,
                         best_interface: None,
                         has_unread: false,
@@ -749,6 +759,13 @@ impl RustleApp {
         if let Ok(store) = crate::metadata::MetadataStore::open_default() {
             if let Ok(items) = store.get_all() {
                 if let Some(meta) = items.into_iter().find(|m| m.id == id) {
+                    if meta.is_dir
+                        && !self.peer_supports_reliable_folders(
+                            meta.peer_id.as_deref().unwrap_or_default(),
+                        )
+                    {
+                        return;
+                    }
                     if let Some(tx) = &self.net_cmd_tx {
                         if let Some(peer_ip) = meta.peer_ip.clone() {
                             let tcp_port = if meta.is_dir {
@@ -1220,6 +1237,10 @@ impl RustleApp {
 
             for msg in drained {
                 if let Some(path) = &msg.file_path {
+                    if msg.is_dir && !self.peer_supports_reliable_folders(peer_id) {
+                        remain.push(msg);
+                        continue;
+                    }
                     let target_tcp_port = if msg.is_dir {
                         TCP_DIR_PORT
                     } else {
@@ -1297,6 +1318,10 @@ impl RustleApp {
             let mut remain = Vec::new();
             let via = self.get_best_interface_for_peer(ip);
             for item in drained {
+                if item.is_dir && !self.peer_supports_reliable_folders(peer_id) {
+                    remain.push(item);
+                    continue;
+                }
                 let target_tcp_port = if item.is_dir {
                     TCP_DIR_PORT
                 } else {
@@ -1513,6 +1538,13 @@ impl RustleApp {
                         .unwrap_or((None, false));
                     if online {
                         if let Some(ip) = ip {
+                            if change.is_dir && !self.peer_supports_reliable_folders(&peer_id) {
+                                self.offline_sync
+                                    .entry(peer_id.clone())
+                                    .or_default()
+                                    .push(change);
+                                continue;
+                            }
                             if let Some(tx) = &self.net_cmd_tx {
                                 let target_tcp_port = if change.is_dir {
                                     TCP_DIR_PORT
@@ -1590,6 +1622,8 @@ impl RustleApp {
                             ip: kp.ip.clone(),
                             port: None,
                             tcp_port: None,
+                            protocol_version: None,
+                            supports_reliable_folders: false,
                             bound_interface: kp.bound_interface.clone(),
                             best_interface: kp.bound_interface.clone(),
                             has_unread: false,
@@ -1929,6 +1963,49 @@ impl RustleApp {
             };
 
             let target_tcp_port = if is_dir { TCP_DIR_PORT } else { TCP_FILE_PORT };
+
+            if is_dir {
+                let supports_reliable = self
+                    .users
+                    .iter()
+                    .find(|u| u.id == id)
+                    .map(|u| u.supports_reliable_folders)
+                    .unwrap_or(false);
+                if !supports_reliable {
+                    let text = format!(
+                        "📁 {}",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("item")
+                    );
+                    let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    let msgs = self.messages.entry(id.clone()).or_default();
+                    msgs.push(ChatMessage {
+                        from_me: true,
+                        text: text.clone(),
+                        send_ts: ts.clone(),
+                        recv_ts: None,
+                        last_sync_ts: None,
+                        file_path: Some(path.to_string_lossy().to_string()),
+                        transfer_status: Some("发送失败：对方版本不支持可靠目录传输".to_string()),
+                        msg_id: None,
+                        is_read: true,
+                        is_pending: false,
+                        needs_sync: false,
+                    });
+                    self.log_history(
+                        &id,
+                        true,
+                        &text,
+                        &ts,
+                        None,
+                        Some(&path.to_string_lossy()),
+                        None,
+                        None,
+                        false,
+                        false,
+                    );
+                    return;
+                }
+            }
 
             let icon = if is_dir { "📁" } else { "📄" };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
@@ -2513,6 +2590,8 @@ impl eframe::App for RustleApp {
                             u.ip = Some(ip_clone.clone());
                             u.port = Some(port_clone);
                             u.tcp_port = None;
+                            u.protocol_version = Some(peer.version.clone());
+                            u.supports_reliable_folders = peer.supports_reliable_folders;
                             u.bound_interface = Some(local_ip.clone());
                             u.best_interface = Some(local_ip.clone());
                             self.known_dirty = true;
@@ -2531,6 +2610,8 @@ impl eframe::App for RustleApp {
                                 ip: Some(ip_clone.clone()),
                                 port: Some(port_clone),
                                 tcp_port: None,
+                                protocol_version: Some(peer.version.clone()),
+                                supports_reliable_folders: peer.supports_reliable_folders,
                                 bound_interface: Some(local_ip.clone()),
                                 best_interface: Some(local_ip.clone()),
                                 has_unread: false,
@@ -2644,6 +2725,8 @@ impl eframe::App for RustleApp {
                                 ip: Some(ip_clone.clone()),
                                 port: Some(port_clone),
                                 tcp_port: None,
+                                protocol_version: None,
+                                supports_reliable_folders: false,
                                 bound_interface: Some(local_ip.clone()),
                                 best_interface: Some(local_ip.clone()),
                                 has_unread: self.selected_user_id.as_deref() != Some(&key),
@@ -2718,6 +2801,8 @@ impl eframe::App for RustleApp {
                         is_dir,
                         local_path,
                         is_sync,
+                        is_final,
+                        succeeded,
                     } => {
                         if let Some(pid) = peer_id {
                             let mut pending_log: Option<(String, String, String)> = None;
@@ -2728,7 +2813,7 @@ impl eframe::App for RustleApp {
                             if let Some(msgs) = self.messages.get_mut(&pid) {
                                 if is_incoming {
                                     if is_sync {
-                                        if progress >= 1.0 {
+                                        if is_final && succeeded {
                                             if let Some(msg) = msgs.iter_mut().rev().find(|m| {
                                                 !m.from_me
                                                     && (m
@@ -2798,7 +2883,7 @@ impl eframe::App for RustleApp {
                                                 msg.file_path = Some(file_name.clone());
                                             }
 
-                                            if progress >= 1.0 {
+                                            if is_final && succeeded {
                                                 if let Some(path) = local_path.as_deref() {
                                                     pending_path_update =
                                                         Some((file_name.clone(), path.to_string()));
@@ -2830,7 +2915,7 @@ impl eframe::App for RustleApp {
                                             .map(|p| p.ends_with(&file_name))
                                             .unwrap_or(false)
                                 }) {
-                                    let new_needs_sync = progress < 1.0;
+                                    let new_needs_sync = !(is_final && succeeded);
                                     if msg.needs_sync != new_needs_sync {
                                         msg.needs_sync = new_needs_sync;
                                         if let Some(path) = msg.file_path.clone() {
@@ -2842,7 +2927,7 @@ impl eframe::App for RustleApp {
                                     if !is_sync {
                                         msg.transfer_status = Some(status.clone());
                                     }
-                                    if progress >= 1.0 {
+                                    if is_final && succeeded {
                                         let ts =
                                             Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                                         msg.last_sync_ts = Some(ts.clone());
@@ -2892,7 +2977,6 @@ impl eframe::App for RustleApp {
                                 let file_hint = file_name.clone();
                                 let peer_hint = pid.clone();
                                 let now_ts = Local::now().timestamp();
-                                let progress_val = progress;
                                 let is_sync_flag = is_sync;
                                 let _ = store.update_first_matching(|meta| {
                                     let matched = if let Some(lp) = path_hint.as_ref() {
@@ -2904,7 +2988,7 @@ impl eframe::App for RustleApp {
                                         return None;
                                     }
                                     let mut updated = meta.clone();
-                                    if progress_val >= 1.0 {
+                                    if is_final && succeeded {
                                         updated.last_synced_time = Some(now_ts);
                                         updated.sync_status = if is_sync_flag {
                                             SyncStatus::Synced
@@ -2922,7 +3006,7 @@ impl eframe::App for RustleApp {
                                 });
                             }
 
-                            if progress >= 1.0 && !is_dir {
+                            if is_final && succeeded && !is_dir {
                                 if let Some(path_for_hash) = local_path.clone() {
                                     let peer_clone = pid.clone();
                                     let file_clone = file_name.clone();
@@ -3004,6 +3088,8 @@ impl eframe::App for RustleApp {
                                 ip: Some(from_ip.clone()),
                                 port: Some(UDP_MESSAGE_PORT),
                                 tcp_port: None,
+                                protocol_version: None,
+                                supports_reliable_folders: false,
                                 bound_interface: None,
                                 best_interface: None,
                                 has_unread: false,
@@ -3060,6 +3146,8 @@ impl eframe::App for RustleApp {
                                     ip: p.ip.clone(),
                                     port: Some(UDP_MESSAGE_PORT),
                                     tcp_port: None,
+                                    protocol_version: None,
+                                    supports_reliable_folders: false,
                                     bound_interface: None,
                                     best_interface: None,
                                     has_unread: false,
@@ -3123,6 +3211,8 @@ impl eframe::App for RustleApp {
                                 ip: Some(ip.clone()),
                                 port: Some(UDP_MESSAGE_PORT),
                                 tcp_port: None,
+                                protocol_version: None,
+                                supports_reliable_folders: false,
                                 bound_interface: None,
                                 best_interface: None,
                                 has_unread: false,
@@ -3154,6 +3244,8 @@ impl eframe::App for RustleApp {
                                 ip,
                                 port: Some(UDP_MESSAGE_PORT),
                                 tcp_port: None,
+                                protocol_version: None,
+                                supports_reliable_folders: false,
                                 bound_interface: None,
                                 best_interface: None,
                                 has_unread: false,

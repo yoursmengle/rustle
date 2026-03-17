@@ -8,3 +8,4 @@
 *.lock
 *.exe
 *.log
+.github/

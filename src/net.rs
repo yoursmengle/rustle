@@ -1,5 +1,5 @@
 use crate::model::{
-    AckPayload, ByePayload, ChatPayload, DiscoverPayload, DiscoveredPeer, FileCmd,
+    AckPayload, APP_PROTOCOL_VERSION, ByePayload, ChatPayload, DiscoverPayload, DiscoveredPeer, FileCmd,
     HeartbeatPayload, HelloMsg, NameUpdatePayload, NetCmd, PeerBrief, PeerEvent, PeerSnapshot,
     SyncPayload, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT, UDP_MESSAGE_PORT,
 };
@@ -293,7 +293,8 @@ pub fn spawn_network_worker(
                 list_hash,
                 port: UDP_MESSAGE_PORT,
                 tcp_port: Some(TCP_FILE_PORT),
-                version: "0.1".to_string(),
+                version: APP_PROTOCOL_VERSION.to_string(),
+                supports_reliable_folders: true,
                 is_reply: false,
                 is_probe,
             };
@@ -834,6 +835,8 @@ pub fn spawn_network_worker(
                                                             port: UDP_MESSAGE_PORT,
                                                             tcp_port: Some(TCP_FILE_PORT),
                                                             name: h.name.clone(),
+                                                            version: h.version.clone(),
+                                                            supports_reliable_folders: h.supports_reliable_folders,
                                                         };
                                                         let _ =
                                                             peer_tx.send(PeerEvent::Discovered(
@@ -870,7 +873,8 @@ pub fn spawn_network_worker(
                                                                 ),
                                                                 port: UDP_MESSAGE_PORT,
                                                                 tcp_port: Some(TCP_FILE_PORT),
-                                                                version: "0.1".to_string(),
+                                                                version: APP_PROTOCOL_VERSION.to_string(),
+                                                                supports_reliable_folders: true,
                                                                 is_reply: true,
                                                                 is_probe: false,
                                                             };
@@ -1601,7 +1605,8 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                     },
                     port: UDP_MESSAGE_PORT,
                     tcp_port: Some(TCP_FILE_PORT),
-                    version: "0.1".to_string(),
+                    version: APP_PROTOCOL_VERSION.to_string(),
+                    supports_reliable_folders: true,
                     is_reply: false,
                     is_probe,
                 };
@@ -1974,6 +1979,8 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                             port: UDP_MESSAGE_PORT,
                                                             tcp_port: Some(TCP_FILE_PORT),
                                                             name: h.name.clone(),
+                                                            version: h.version.clone(),
+                                                            supports_reliable_folders: h.supports_reliable_folders,
                                                         };
                                                         let _ = peer_tx
                                                             .send(PeerEvent::Discovered(peer, _ip.to_string()));
@@ -2001,7 +2008,8 @@ pub fn spawn_network_worker(peer_tx: Sender<PeerEvent>, cmd_rx: Receiver<NetCmd>
                                                                 },
                                                                 port: UDP_MESSAGE_PORT,
                                                                 tcp_port: Some(TCP_FILE_PORT),
-                                                                version: "0.1".to_string(),
+                                                                version: APP_PROTOCOL_VERSION.to_string(),
+                                                                supports_reliable_folders: true,
                                                                 is_reply: true,
                                                                 is_probe: false,
                                                             };
@@ -2404,7 +2412,8 @@ use get_if_addrs::get_if_addrs;
                     },
                     port: UDP_MESSAGE_PORT,
                     tcp_port: Some(TCP_FILE_PORT),
-                    version: "0.1".to_string(),
+                    version: APP_PROTOCOL_VERSION.to_string(),
+                    supports_reliable_folders: true,
                     is_reply: false,
                     is_probe,
                 };
@@ -2719,7 +2728,8 @@ use get_if_addrs::get_if_addrs;
                             },
                             port: UDP_MESSAGE_PORT,
                             tcp_port: Some(TCP_FILE_PORT),
-                            version: "0.1".to_string(),
+                            version: APP_PROTOCOL_VERSION.to_string(),
+                            supports_reliable_folders: true,
                             is_reply: false,
                             is_probe: false,
                         };
@@ -2771,6 +2781,8 @@ use get_if_addrs::get_if_addrs;
                                                             port: UDP_MESSAGE_PORT,
                                                             tcp_port: Some(TCP_FILE_PORT),
                                                             name: h.name.clone(),
+                                                            version: h.version.clone(),
+                                                            supports_reliable_folders: h.supports_reliable_folders,
                                                         };
                                                         let _ = peer_tx
                                                             .send(PeerEvent::Discovered(peer, _ip.to_string()));
@@ -2798,7 +2810,8 @@ use get_if_addrs::get_if_addrs;
                                                                 },
                                                                 port: UDP_MESSAGE_PORT,
                                                                 tcp_port: Some(TCP_FILE_PORT),
-                                                                version: "0.1".to_string(),
+                                                                version: APP_PROTOCOL_VERSION.to_string(),
+                                                                supports_reliable_folders: true,
                                                                 is_reply: true,
                                                                 is_probe: false,
                                                             };

@@ -9,6 +9,7 @@ pub const UDP_DISCOVERY_PORT: u16 = 44517;
 pub const UDP_MESSAGE_PORT: u16 = 44518;
 pub const TCP_FILE_PORT: u16 = 44517;
 pub const TCP_DIR_PORT: u16 = 44518;
+pub const APP_PROTOCOL_VERSION: &str = "0.2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncStatus {
@@ -28,6 +29,8 @@ pub struct User {
     pub ip: Option<String>,
     pub port: Option<u16>,
     pub tcp_port: Option<u16>,
+    pub protocol_version: Option<String>,
+    pub supports_reliable_folders: bool,
     pub bound_interface: Option<String>,
     pub best_interface: Option<String>,
     pub has_unread: bool,
@@ -128,6 +131,10 @@ pub struct DiscoveredPeer {
     pub port: u16,
     pub tcp_port: Option<u16>,
     pub name: Option<String>,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub supports_reliable_folders: bool,
 }
 
 #[derive(Debug)]
@@ -197,6 +204,8 @@ pub enum PeerEvent {
         is_dir: bool,
         local_path: Option<String>,
         is_sync: bool,
+        is_final: bool,
+        succeeded: bool,
     },
     DiscoverReceived {
         from_id: String,
@@ -228,6 +237,8 @@ pub struct HelloMsg {
     pub port: u16,
     pub tcp_port: Option<u16>,
     pub version: String,
+    #[serde(default)]
+    pub supports_reliable_folders: bool,
     #[serde(default)]
     pub is_reply: bool,
     #[serde(default)]
@@ -341,7 +352,8 @@ mod tests {
             list_hash: 1234,
             port: 44518,
             tcp_port: Some(44517),
-            version: "0.1".to_string(),
+            version: APP_PROTOCOL_VERSION.to_string(),
+            supports_reliable_folders: true,
             is_reply: false,
             is_probe: true,
         };
@@ -350,6 +362,7 @@ mod tests {
         assert_eq!(h.id, h2.id);
         assert_eq!(h.name, h2.name);
         assert_eq!(h.list_hash, h2.list_hash);
+        assert!(h2.supports_reliable_folders);
     }
 
     #[test]
