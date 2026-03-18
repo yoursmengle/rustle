@@ -6,8 +6,9 @@ use crate::model::{
 };
 use crate::net::spawn_network_worker;
 use crate::storage::{
-    data_path, default_download_dir, file_mtime_seconds, load_or_init_node_id, load_settings,
-    load_sync_tree, peer_history_path, save_settings, save_sync_tree, sha256_file, AppSettings,
+    data_path, default_download_dir, file_mtime_seconds, load_or_init_node_id, load_runtime_state,
+    load_settings, load_sync_tree, peer_history_path, save_runtime_state, save_settings,
+    save_sync_tree, sha256_file, AppSettings, PersistedPendingAck, RuntimeState,
 };
 use chrono::{Duration as ChronoDuration, Local};
 use eframe::egui;
@@ -157,6 +158,7 @@ pub fn run() -> eframe::Result<()> {
             app.load_known_peers();
             // 启动时加载最近配置天数的历史记录
             app.load_recent_history();
+            app.restore_runtime_state();
             // 启动时加载自动同步树
             app.load_sync_tree();
             // 加载 metadata cache
@@ -426,6 +428,81 @@ pub struct RustleApp {
 }
 
 impl RustleApp {
+    fn persist_runtime_state(&self) {
+        let mut peers = HashMap::new();
+
+        for (peer_id, queue) in &self.offline_msgs {
+            if !queue.is_empty() {
+                peers
+                    .entry(peer_id.clone())
+                    .or_insert_with(|| crate::storage::PersistedPeerRuntimeState::default())
+                    .offline_msgs = queue.clone();
+            }
+        }
+
+        for (peer_id, pending) in &self.pending_acks {
+            if !pending.is_empty() {
+                peers
+                    .entry(peer_id.clone())
+                    .or_insert_with(|| crate::storage::PersistedPeerRuntimeState::default())
+                    .pending_acks = pending
+                    .iter()
+                    .map(|(msg_id, _)| PersistedPendingAck {
+                        msg_id: msg_id.clone(),
+                    })
+                    .collect();
+            }
+        }
+
+        save_runtime_state(&RuntimeState { peers });
+    }
+
+    fn restore_runtime_state(&mut self) {
+        let state = load_runtime_state();
+
+        for (peer_id, peer_state) in state.peers {
+            let queue = self.offline_msgs.entry(peer_id.clone()).or_default();
+            for queued in peer_state.offline_msgs {
+                let exists = queue.iter().any(|existing| {
+                    existing.msg_id == queued.msg_id
+                        || (existing.text == queued.text
+                            && existing.send_ts == queued.send_ts
+                            && existing.file_path == queued.file_path
+                            && existing.is_dir == queued.is_dir)
+                });
+                if !exists {
+                    queue.push(queued);
+                }
+            }
+
+            let pending_list = self.pending_acks.entry(peer_id.clone()).or_default();
+            for pending in peer_state.pending_acks {
+                if !pending_list
+                    .iter()
+                    .any(|(msg_id, _)| msg_id == &pending.msg_id)
+                {
+                    pending_list.push((
+                        pending.msg_id.clone(),
+                        Instant::now() + Duration::from_secs(5),
+                    ));
+                }
+
+                if let Some(msgs) = self.messages.get_mut(&peer_id) {
+                    if let Some(message) = msgs.iter_mut().rev().find(|msg| {
+                        msg.from_me && msg.msg_id.as_deref() == Some(pending.msg_id.as_str())
+                    }) {
+                        message.is_pending = true;
+                        if message.file_path.is_none() {
+                            message.transfer_status = Some("等待对方确认...".to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        self.persist_runtime_state();
+    }
+
     fn peer_supports_reliable_folders(&self, peer_id: &str) -> bool {
         self.users
             .iter()
@@ -1303,6 +1380,7 @@ impl RustleApp {
                 self.offline_msgs.insert(peer_id.to_string(), remain);
             }
         }
+        self.persist_runtime_state();
     }
 
     fn flush_offline_sync(&mut self, peer_id: &str, ip: Option<&str>) {
@@ -1451,6 +1529,7 @@ impl RustleApp {
                 self.update_history_pending(peer_id, &mid, true);
             }
         }
+        self.persist_runtime_state();
     }
 
     fn scan_node_for_changes(node: &mut SyncNode) -> bool {
@@ -1821,6 +1900,8 @@ impl RustleApp {
                 false,
             );
         }
+
+        self.persist_runtime_state();
     }
 
     fn try_send_message_with_retry(
@@ -1933,6 +2014,8 @@ impl RustleApp {
                 }
             }
         }
+
+        self.persist_runtime_state();
     }
 
     fn send_current(&mut self) {
@@ -2773,6 +2856,58 @@ impl eframe::App for RustleApp {
                         if let Some(queue) = self.offline_msgs.get_mut(&from_id) {
                             queue.retain(|q| q.msg_id.as_deref() != Some(&msg_id));
                         }
+                        self.persist_runtime_state();
+                    }
+                    PeerEvent::FileCompletionAck {
+                        from_id,
+                        file_name,
+                        is_dir: _,
+                        is_sync,
+                        succeeded,
+                        status,
+                    } => {
+                        if let Some(msgs) = self.messages.get_mut(&from_id) {
+                            if let Some(msg) = msgs.iter_mut().rev().find(|m| {
+                                m.from_me
+                                    && m.file_path
+                                        .as_ref()
+                                        .map(|p| p.ends_with(&file_name))
+                                        .unwrap_or(false)
+                            }) {
+                                msg.transfer_status = Some(status.clone());
+                                msg.is_pending = !succeeded;
+                                if succeeded {
+                                    let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                    msg.recv_ts = Some(ts.clone());
+                                    msg.last_sync_ts = Some(ts);
+                                    msg.needs_sync = false;
+                                }
+                            }
+                        }
+
+                        if let Some(path) = self.messages.get(&from_id).and_then(|msgs| {
+                            msgs.iter()
+                                .rev()
+                                .find(|m| {
+                                    m.from_me
+                                        && m.file_path
+                                            .as_ref()
+                                            .map(|p| p.ends_with(&file_name))
+                                            .unwrap_or(false)
+                                })
+                                .and_then(|m| m.file_path.clone())
+                        }) {
+                            self.update_history_needs_sync(&from_id, &path, !succeeded, true);
+                            if succeeded {
+                                let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                self.update_history_sync(&from_id, &path, &ts, true);
+                                self.update_history_file_done(&from_id, &path, &ts, true);
+                            }
+                        }
+
+                        if !is_sync {
+                            self.persist_runtime_state();
+                        }
                     }
                     PeerEvent::LocalBound { ip, port } => {
                         // 记录可用的绑定接口
@@ -3450,6 +3585,7 @@ impl eframe::App for RustleApp {
                 if self.selected_user_id.as_deref() == Some(&id_to_delete) {
                     self.selected_user_id = None;
                 }
+                self.persist_runtime_state();
             }
         }
 
@@ -3932,6 +4068,7 @@ impl eframe::App for RustleApp {
                     list.retain(|(mid, _)| mid != &msg_id);
                 }
             }
+            self.persist_runtime_state();
         }
 
         // 检查计划的重试任务（用于在对方上线后一段短时间再重试）

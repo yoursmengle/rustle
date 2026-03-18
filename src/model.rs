@@ -115,7 +115,7 @@ pub struct KnownPeer {
     pub bound_interface: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueuedMsg {
     pub text: String,
     pub send_ts: String,
@@ -194,6 +194,15 @@ pub enum PeerEvent {
     ChatAck {
         from_id: String,
         msg_id: String,
+    },
+    FileCompletionAck {
+        from_id: String,
+        file_name: String,
+        #[allow(dead_code)]
+        is_dir: bool,
+        is_sync: bool,
+        succeeded: bool,
+        status: String,
     },
     FileProgress {
         peer_id: Option<String>,
@@ -290,6 +299,17 @@ pub struct AckPayload {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct FileCompletionPayload {
+    pub msg_type: String,
+    pub from_id: String,
+    pub file_name: String,
+    pub is_dir: bool,
+    pub is_sync: bool,
+    pub success: bool,
+    pub status: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct NameUpdatePayload {
     pub msg_type: String,
     pub from_id: String,
@@ -341,8 +361,6 @@ pub enum FileCmd {
 mod tests {
     use super::*;
     use serde_json;
-    use std::path::PathBuf;
-
     #[test]
     fn hello_msg_serde_roundtrip() {
         let h = HelloMsg {
@@ -391,6 +409,20 @@ mod tests {
         let s = serde_json::to_string(&ack).unwrap();
         let ack2: AckPayload = serde_json::from_str(&s).unwrap();
         assert_eq!(ack.msg_id, ack2.msg_id);
+
+        let completion = FileCompletionPayload {
+            msg_type: "file_completion_ack".to_string(),
+            from_id: "node2".to_string(),
+            file_name: "file.txt".to_string(),
+            is_dir: false,
+            is_sync: false,
+            success: true,
+            status: "接收完成 (1 B)".to_string(),
+        };
+        let s = serde_json::to_string(&completion).unwrap();
+        let completion2: FileCompletionPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(completion.file_name, completion2.file_name);
+        assert!(completion2.success);
 
         let pb = PeerBrief {
             id: "p1".to_string(),

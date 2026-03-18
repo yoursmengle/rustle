@@ -1,4 +1,4 @@
-use crate::model::{SyncTree, RECEIVE_MAP_FILE, SYNC_TREE_FILE};
+use crate::model::{QueuedMsg, SyncTree, RECEIVE_MAP_FILE, SYNC_TREE_FILE};
 use chrono::{Duration as ChronoDuration, Local};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +11,27 @@ use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 
 const SETTINGS_FILE: &str = "settings.json";
+const NODE_ID_FILE: &str = "node_id.txt";
+const RUNTIME_STATE_FILE: &str = "runtime_state.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedPendingAck {
+    pub msg_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PersistedPeerRuntimeState {
+    #[serde(default)]
+    pub offline_msgs: Vec<QueuedMsg>,
+    #[serde(default)]
+    pub pending_acks: Vec<PersistedPendingAck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RuntimeState {
+    #[serde(default)]
+    pub peers: HashMap<String, PersistedPeerRuntimeState>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum LogLevel {
@@ -156,6 +177,14 @@ pub fn data_path(name: &str) -> PathBuf {
     let mut p = data_dir();
     p.push(name);
     p
+}
+
+fn node_id_path() -> PathBuf {
+    data_path(NODE_ID_FILE)
+}
+
+fn runtime_state_path() -> PathBuf {
+    data_path(RUNTIME_STATE_FILE)
 }
 
 pub fn history_dir() -> PathBuf {
@@ -363,12 +392,42 @@ pub fn read_machine_uuid() -> Option<String> {
     }
 }
 
-pub fn load_or_init_node_id() -> String {
-    // 仅在内存中生成 ID：优先硬件 UUID，失败则随机 UUID；不再读写 node_id.txt
+fn load_or_init_node_id_at(path: &Path) -> String {
+    if let Ok(existing) = fs::read_to_string(path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return existing.to_string();
+        }
+    }
+
     if let Some(hw_uuid) = read_machine_uuid() {
+        let _ = fs::write(path, &hw_uuid);
         hw_uuid
     } else {
-        Uuid::new_v4().to_string()
+        let generated = Uuid::new_v4().to_string();
+        let _ = fs::write(path, &generated);
+        generated
+    }
+}
+
+pub fn load_or_init_node_id() -> String {
+    load_or_init_node_id_at(&node_id_path())
+}
+
+pub fn load_runtime_state() -> RuntimeState {
+    let path = runtime_state_path();
+    if let Ok(text) = fs::read_to_string(path) {
+        if let Ok(state) = serde_json::from_str::<RuntimeState>(&text) {
+            return state;
+        }
+    }
+    RuntimeState::default()
+}
+
+pub fn save_runtime_state(state: &RuntimeState) {
+    let path = runtime_state_path();
+    if let Ok(text) = serde_json::to_string_pretty(state) {
+        let _ = fs::write(path, text);
     }
 }
 
@@ -474,6 +533,10 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
+    fn unique_temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("rustle_{}_{}", name, Uuid::new_v4()))
+    }
+
     #[test]
     fn data_dir_exists_and_named() {
         let dir = data_dir();
@@ -533,6 +596,44 @@ mod tests {
     fn load_or_init_node_id_non_empty() {
         let id = load_or_init_node_id();
         assert!(!id.trim().is_empty());
+    }
+
+    #[test]
+    fn load_or_init_node_id_persists_value() {
+        let path = unique_temp_path("node_id");
+        let first = load_or_init_node_id_at(&path);
+        let second = load_or_init_node_id_at(&path);
+
+        assert!(!first.trim().is_empty());
+        assert_eq!(first, second);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn runtime_state_roundtrip_preserves_offline_and_pending() {
+        let state = RuntimeState {
+            peers: HashMap::from([(
+                "peer-1".to_string(),
+                PersistedPeerRuntimeState {
+                    offline_msgs: vec![QueuedMsg {
+                        text: "hello".to_string(),
+                        send_ts: "2026-03-18 12:00:00".to_string(),
+                        msg_id: Some("m1".to_string()),
+                        file_path: None,
+                        is_dir: false,
+                    }],
+                    pending_acks: vec![PersistedPendingAck {
+                        msg_id: "m1".to_string(),
+                    }],
+                },
+            )]),
+        };
+
+        let text = serde_json::to_string_pretty(&state).unwrap();
+        let loaded: RuntimeState = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(loaded, state);
     }
 
     #[test]

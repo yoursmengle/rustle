@@ -1,8 +1,11 @@
 use crate::debug_println;
 #[allow(unused_imports)]
 use crate::metadata::{Metadata, MetadataStore};
-use crate::model::{PeerEvent, TCP_DIR_PORT, TCP_FILE_PORT};
-use crate::storage::{default_download_dir, load_receive_map, save_receive_map, windows_long_path};
+use crate::model::{FileCompletionPayload, PeerEvent, TCP_DIR_PORT, TCP_FILE_PORT, UDP_MESSAGE_PORT};
+use crate::storage::{
+    default_download_dir, load_or_init_node_id, load_receive_map, save_receive_map,
+    windows_long_path,
+};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -407,6 +410,51 @@ fn promote_staged_folder(staged_root: &Path, final_root: &Path) -> io::Result<()
         std::fs::remove_dir_all(final_root)?;
     }
     std::fs::rename(staged_root, final_root)
+}
+
+fn staged_file_path(transfer_root: &Path, safe_filename: &str) -> PathBuf {
+    transfer_root.join(format!(".{}.part-{}", safe_filename, Uuid::new_v4()))
+}
+
+fn promote_staged_file(staged_path: &Path, final_path: &Path) -> io::Result<()> {
+    if let Some(parent) = final_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if final_path.exists() {
+        std::fs::remove_file(final_path)?;
+    }
+    std::fs::rename(staged_path, final_path)
+}
+
+fn cleanup_failed_regular_file(staged_path: &Path, final_path: &Path) {
+    let _ = std::fs::remove_file(staged_path);
+    let _ = std::fs::remove_file(final_path);
+}
+
+async fn send_file_completion_ack(
+    sender_ip: std::net::IpAddr,
+    file_name: &str,
+    is_dir: bool,
+    is_sync: bool,
+    success: bool,
+    status: &str,
+) {
+    let payload = FileCompletionPayload {
+        msg_type: "file_completion_ack".to_string(),
+        from_id: load_or_init_node_id(),
+        file_name: file_name.to_string(),
+        is_dir,
+        is_sync,
+        success,
+        status: status.to_string(),
+    };
+
+    if let Ok(data) = serde_json::to_vec(&payload) {
+        if let Ok(socket) = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await {
+            let target = SocketAddr::new(sender_ip, UDP_MESSAGE_PORT);
+            let _ = socket.send_to(&data, target).await;
+        }
+    }
 }
 
 fn human_size(bytes: u64) -> String {
@@ -929,7 +977,12 @@ pub async fn handle_incoming_file(
         if !success {
             let _ = tokio::fs::remove_dir_all(&final_save_path).await;
         }
-    } else if let Ok(mut file) = tokio::fs::File::create(&final_save_path).await {
+    } else {
+        let staged_path = staged_file_path(&transfer_root, &safe_filename);
+        if let Some(parent) = staged_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = tokio::fs::File::create(&staged_path).await {
         let mut buf = vec![0u8; 64 * 1024];
         let mut received: u64 = 0;
         if !leading_payload.is_empty() {
@@ -992,14 +1045,38 @@ pub async fn handle_incoming_file(
             failure_reason = Some(format!("接收失败：文件大小不匹配（{received}/{total_size}）"));
         }
         if failure_reason.is_none() && expected_sha256.is_some() {
-            let received_sha256 = crate::storage::sha256_file(&final_save_path);
+            let received_sha256 = crate::storage::sha256_file(&staged_path);
             if received_sha256 != expected_sha256 {
                 failure_reason = Some("接收失败：文件校验失败".to_string());
             }
         }
-        success = failure_reason.is_none();
-    } else {
-        failure_reason = Some("接收失败：无法创建目标文件".to_string());
+        if failure_reason.is_none() {
+            let staged_clone = staged_path.clone();
+            let final_clone = final_save_path.clone();
+            match tokio::task::spawn_blocking(move || promote_staged_file(&staged_clone, &final_clone)).await {
+                Ok(Ok(())) => {
+                    success = true;
+                    final_local_path = final_save_path.clone();
+                }
+                Ok(Err(err)) => {
+                    failure_reason = Some(format!("接收失败：文件提交失败 ({err})"));
+                }
+                Err(err) => {
+                    failure_reason = Some(format!("接收失败：文件提交任务失败 ({err})"));
+                }
+            }
+        }
+        if !success {
+            let staged_cleanup = staged_path.clone();
+            let final_cleanup = final_save_path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                cleanup_failed_regular_file(&staged_cleanup, &final_cleanup)
+            })
+            .await;
+        }
+        } else {
+            failure_reason = Some("接收失败：无法创建暂存文件".to_string());
+        }
     }
 
     if success {
@@ -1028,9 +1105,9 @@ pub async fn handle_incoming_file(
     emit_progress(
         &peer_tx,
         Some(sender_id),
-        filename,
+        filename.clone(),
         1.0,
-        final_status,
+        final_status.clone(),
         true,
         is_dir,
         if success {
@@ -1042,6 +1119,8 @@ pub async fn handle_incoming_file(
         true,
         success,
     );
+
+    send_file_completion_ack(addr.ip(), &filename, is_dir, is_sync, success, &final_status).await;
 }
 
 pub async fn handle_outgoing_file(
@@ -1457,34 +1536,44 @@ pub async fn handle_outgoing_file(
                         0.0
                     };
 
-                    let status_text =
-                        if send_ok && (declared_size == 0 || sent_total >= declared_size) {
+                    let send_completed = send_ok && (declared_size == 0 || sent_total >= declared_size);
+                    if send_completed {
+                        emit_progress(
+                            &peer_tx,
+                            Some(peer_id),
+                            filename,
+                            final_progress,
                             if is_dir {
-                                "目录发送完成，等待对端校验".to_string()
+                                "目录发送完成，等待对端确认".to_string()
                             } else {
-                                "发送完成".to_string()
-                            }
-                        } else {
+                                "发送完成，等待对端确认".to_string()
+                            },
+                            false,
+                            is_dir,
+                            Some(path.to_string_lossy().to_string()),
+                            is_sync,
+                            false,
+                            false,
+                        );
+                    } else {
+                        emit_progress(
+                            &peer_tx,
+                            Some(peer_id),
+                            filename,
+                            final_progress,
                             if is_dir {
                                 "目录发送失败".to_string()
                             } else {
                                 "发送失败".to_string()
-                            }
-                        };
-
-                    emit_progress(
-                        &peer_tx,
-                        Some(peer_id),
-                        filename,
-                        final_progress,
-                        status_text,
-                        false,
-                        is_dir,
-                        Some(path.to_string_lossy().to_string()),
-                        is_sync,
-                        true,
-                        send_ok && (declared_size == 0 || sent_total >= declared_size),
-                    );
+                            },
+                            false,
+                            is_dir,
+                            Some(path.to_string_lossy().to_string()),
+                            is_sync,
+                            true,
+                            false,
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("[tx] open send_path {:?} failed: {e}", send_path);
@@ -1645,6 +1734,39 @@ mod tests {
 
         let err = validate_extracted_folder(&root, &manifest).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn promote_staged_file_moves_file_into_place() {
+        let base = std::env::temp_dir().join(format!("rustle_stage_file_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let staged = base.join("file.part");
+        let final_path = base.join("file.txt");
+        std::fs::write(&staged, b"hello").unwrap();
+
+        promote_staged_file(&staged, &final_path).unwrap();
+
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"hello");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cleanup_failed_regular_file_removes_temp_and_partial_target() {
+        let base = std::env::temp_dir().join(format!("rustle_cleanup_file_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let staged = base.join("file.part");
+        let final_path = base.join("file.txt");
+        std::fs::write(&staged, b"temp").unwrap();
+        std::fs::write(&final_path, b"partial").unwrap();
+
+        cleanup_failed_regular_file(&staged, &final_path);
+
+        assert!(!staged.exists());
+        assert!(!final_path.exists());
 
         let _ = std::fs::remove_dir_all(base);
     }

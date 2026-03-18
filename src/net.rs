@@ -1,7 +1,8 @@
 use crate::model::{
-    AckPayload, APP_PROTOCOL_VERSION, ByePayload, ChatPayload, DiscoverPayload, DiscoveredPeer, FileCmd,
-    HeartbeatPayload, HelloMsg, NameUpdatePayload, NetCmd, PeerBrief, PeerEvent, PeerSnapshot,
-    SyncPayload, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT, UDP_MESSAGE_PORT,
+    AckPayload, APP_PROTOCOL_VERSION, ByePayload, ChatPayload, DiscoverPayload, DiscoveredPeer,
+    FileCmd, FileCompletionPayload, HeartbeatPayload, HelloMsg, NameUpdatePayload, NetCmd,
+    PeerBrief, PeerEvent, PeerSnapshot, SyncPayload, TCP_DIR_PORT, TCP_FILE_PORT,
+    UDP_DISCOVERY_PORT, UDP_MESSAGE_PORT,
 };
 use crate::storage::{load_or_init_node_id, load_settings};
 use crate::transfer::{handle_incoming_file, handle_outgoing_file};
@@ -1144,6 +1145,27 @@ pub fn spawn_network_worker(
                                                                 ip: a.from_ip.clone(),
                                                             });
                                                     }
+                                                }
+                                            }
+                                            "file_completion_ack" => {
+                                                if let Ok(completion) =
+                                                    serde_json::from_value::<FileCompletionPayload>(v)
+                                                {
+                                                    if completion.from_id == my_id {
+                                                        continue;
+                                                    }
+                                                    last_from_peer.insert(
+                                                        completion.from_id.clone(),
+                                                        Instant::now(),
+                                                    );
+                                                    let _ = peer_tx.send(PeerEvent::FileCompletionAck {
+                                                        from_id: completion.from_id,
+                                                        file_name: completion.file_name,
+                                                        is_dir: completion.is_dir,
+                                                        is_sync: completion.is_sync,
+                                                        succeeded: completion.success,
+                                                        status: completion.status,
+                                                    });
                                                 }
                                             }
                                             "name_update" => {
