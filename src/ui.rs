@@ -65,6 +65,106 @@ mod theme {
     // #ef4444 (red)
 }
 
+#[cfg(target_os = "windows")]
+fn platform_cjk_font_candidates() -> &'static [(&'static str, &'static str, u32)] {
+    &[
+        ("msyh", r"C:\Windows\Fonts\msyh.ttc", 0),
+        ("msyh", r"C:\Windows\Fonts\msyh.ttf", 0),
+        ("simhei", r"C:\Windows\Fonts\simhei.ttf", 0),
+        ("simsun", r"C:\Windows\Fonts\simsun.ttc", 0),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn platform_cjk_font_candidates() -> &'static [(&'static str, &'static str, u32)] {
+    &[
+        ("pingfang", "/System/Library/Fonts/PingFang.ttc", 0),
+        (
+            "hiragino_sans_gb",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            0,
+        ),
+        (
+            "songti",
+            "/System/Library/Fonts/Supplemental/Songti.ttc",
+            0,
+        ),
+        (
+            "stheiti_light",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            0,
+        ),
+    ]
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_cjk_font_candidates() -> &'static [(&'static str, &'static str, u32)] {
+    &[
+        (
+            "noto_sans_cjk_sc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            0,
+        ),
+        (
+            "noto_sans_cjk_sc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            2,
+        ),
+        (
+            "noto_sans_sc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            0,
+        ),
+        (
+            "wqy_zenhei",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            0,
+        ),
+    ]
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn platform_cjk_font_candidates() -> &'static [(&'static str, &'static str, u32)] {
+    &[]
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    for (font_name, font_path, font_index) in platform_cjk_font_candidates() {
+        if let Ok(font_bytes) = fs::read(font_path) {
+            let mut font_data = egui::FontData::from_owned(font_bytes);
+            font_data.index = *font_index;
+
+            fonts.font_data.insert((*font_name).to_owned(), font_data);
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, (*font_name).to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, (*font_name).to_owned());
+
+            debug_println!(
+                "Loaded CJK font '{}' from {} (index {})",
+                font_name,
+                font_path,
+                font_index
+            );
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+
+    debug_println!(
+        "No platform CJK font found; falling back to egui default fonts, CJK text may not render correctly"
+    );
+    ctx.set_fonts(fonts);
+}
+
 pub fn run() -> eframe::Result<()> {
     // 加载图标
     let icon_data = match image::load_from_memory(include_bytes!("../rustle.ico")) {
@@ -99,28 +199,7 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             // 加载中文字体
-            let mut fonts = egui::FontDefinitions::default();
-
-            // 添加中文字体（使用 Windows 系统自带的微软雅黑）
-            fonts.font_data.insert(
-                "msyh".to_owned(),
-                egui::FontData::from_static(include_bytes!("C:\\Windows\\Fonts\\msyh.ttc")),
-            );
-
-            // 将中文字体设为最高优先级
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "msyh".to_owned());
-
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .insert(0, "msyh".to_owned());
-
-            cc.egui_ctx.set_fonts(fonts);
+            configure_fonts(&cc.egui_ctx);
 
             // 在启动时检查用户数据目录下的 me.txt
             let mut app = RustleApp::default();
@@ -1967,6 +2046,7 @@ impl RustleApp {
 
 fn spawn_check_update(tx: Sender<Result<(String, String), String>>) {
     thread::spawn(move || {
+        #[cfg(target_os = "windows")]
         let cmd = r#"
 $ErrorActionPreference = 'Stop'
 try {
