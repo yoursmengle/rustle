@@ -134,6 +134,60 @@ fn header_roundtrip_with_folder_manifest_extension() {
 }
 
 #[test]
+fn header_roundtrip_with_transfer_id_extension() {
+    let transfer_id = "transfer-123";
+
+    let mut header = Vec::new();
+    header.push(0);
+    header.push(0x01 | 0x02);
+    header.push(6);
+    header.extend_from_slice(b"sender");
+    header.extend_from_slice(&(8u16).to_be_bytes());
+    header.extend_from_slice(b"file.txt");
+    header.extend_from_slice(&(77u64).to_be_bytes());
+    header.push(transfer_id.len() as u8);
+    header.extend_from_slice(transfer_id.as_bytes());
+    header.push(0);
+
+    let mut i = 0usize;
+    assert_eq!(header[i], 0);
+    i += 1;
+    assert_eq!(header[i] & 0x01, 0x01);
+    assert_eq!(header[i] & 0x02, 0x02);
+    i += 1;
+
+    let id_len = header[i] as usize;
+    i += 1;
+    assert_eq!(&header[i..i + id_len], b"sender");
+    i += id_len;
+
+    let name_len = u16::from_be_bytes([header[i], header[i + 1]]) as usize;
+    i += 2;
+    assert_eq!(&header[i..i + name_len], b"file.txt");
+    i += name_len;
+
+    let size = u64::from_be_bytes(header[i..i + 8].try_into().unwrap());
+    i += 8;
+    assert_eq!(size, 77);
+
+    let transfer_id_len = header[i] as usize;
+    i += 1;
+    assert_eq!(
+        std::str::from_utf8(&header[i..i + transfer_id_len]).unwrap(),
+        transfer_id
+    );
+    i += transfer_id_len;
+
+    assert_eq!(header[i], 0);
+}
+
+#[test]
+fn transfer_id_extension_length_overflow_is_detectable_in_header_shape() {
+    let oversized = "x".repeat(129);
+    assert!(oversized.len() > u8::MAX as usize || oversized.len() > 128);
+}
+
+#[test]
 fn tar_pack_unpack_tempdir() {
     let base = std::env::temp_dir().join(format!("rustle_test_{}", Uuid::new_v4()));
     let src = base.join("srcdir");

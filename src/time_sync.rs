@@ -75,7 +75,7 @@ fn parse_ntp_response(response: &[u8; 48]) -> io::Result<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn parse_ntp_response_valid() {

@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::process::Command;
@@ -146,7 +147,9 @@ pub fn load_settings() -> AppSettings {
 pub fn save_settings(settings: &AppSettings) {
     let path = data_path(SETTINGS_FILE);
     if let Ok(text) = serde_json::to_string_pretty(settings) {
-        let _ = fs::write(path, text);
+        if let Err(err) = write_text_atomic(&path, &text) {
+            eprintln!("[storage] failed to save settings atomically: {err}");
+        }
     }
 }
 
@@ -188,6 +191,34 @@ fn runtime_state_path() -> PathBuf {
     data_path(RUNTIME_STATE_FILE)
 }
 
+fn atomic_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rustle.tmp");
+    path.with_file_name(format!("{}.{}.tmp", file_name, Uuid::new_v4()))
+}
+
+pub fn write_text_atomic(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp_path = atomic_temp_path(path);
+    {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    fs::rename(&temp_path, path).or_else(|rename_err| {
+        let _ = fs::remove_file(path);
+        fs::rename(&temp_path, path).map_err(|_| rename_err)
+    })?;
+
+    Ok(())
+}
+
 pub fn history_dir() -> PathBuf {
     let mut dir = data_dir();
     dir.push("history");
@@ -219,10 +250,24 @@ pub fn load_sync_tree() -> SyncTree {
 
 pub fn save_sync_tree(tree: &SyncTree) {
     let path = sync_tree_path();
-    if let Ok(mut file) = fs::File::create(path) {
-        let mut ser = serde_json::Serializer::pretty(&mut file);
+    let mut buffer = Vec::new();
+    {
+        let mut ser = serde_json::Serializer::pretty(&mut buffer);
         let ser = serde_stacker::Serializer::new(&mut ser);
-        let _ = tree.serialize(ser);
+        if tree.serialize(ser).is_err() {
+            eprintln!("[storage] failed to serialize sync tree");
+            return;
+        }
+    }
+    let text = match String::from_utf8(buffer) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("[storage] failed to encode sync tree as utf-8: {err}");
+            return;
+        }
+    };
+    if let Err(err) = write_text_atomic(&path, &text) {
+        eprintln!("[storage] failed to save sync tree atomically: {err}");
     }
 }
 
@@ -239,7 +284,9 @@ pub fn load_receive_map() -> HashMap<String, String> {
 pub fn save_receive_map(map: &HashMap<String, String>) {
     let path = data_path(RECEIVE_MAP_FILE);
     if let Ok(text) = serde_json::to_string_pretty(map) {
-        let _ = fs::write(path, text);
+        if let Err(err) = write_text_atomic(&path, &text) {
+            eprintln!("[storage] failed to save receive map atomically: {err}");
+        }
     }
 }
 
@@ -428,7 +475,9 @@ pub fn load_runtime_state() -> RuntimeState {
 pub fn save_runtime_state(state: &RuntimeState) {
     let path = runtime_state_path();
     if let Ok(text) = serde_json::to_string_pretty(state) {
-        let _ = fs::write(path, text);
+        if let Err(err) = write_text_atomic(&path, &text) {
+            eprintln!("[storage] failed to save runtime state atomically: {err}");
+        }
     }
 }
 
@@ -622,6 +671,7 @@ mod tests {
                         send_ts: "2026-03-18 12:00:00".to_string(),
                         msg_id: Some("m1".to_string()),
                         file_path: None,
+                        transfer_id: None,
                         is_dir: false,
                     }],
                     pending_acks: vec![PersistedPendingAck {
@@ -647,5 +697,30 @@ mod tests {
         assert_eq!(s.auto_check_update, s2.auto_check_update);
         assert_eq!(s.preferred_interface, s2.preferred_interface);
         assert_eq!(s.recv_dir.is_none(), s2.recv_dir.is_none());
+    }
+
+    #[test]
+    fn write_text_atomic_replaces_file_contents() {
+        let path = unique_temp_path("atomic_write");
+        fs::write(&path, "old").unwrap();
+
+        write_text_atomic(&path, "new").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        let parent = path.parent().unwrap();
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+        let leftovers: Vec<_> = fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&(file_name.clone() + "."))
+            })
+            .collect();
+        assert!(leftovers.is_empty());
+
+        let _ = fs::remove_file(path);
     }
 }

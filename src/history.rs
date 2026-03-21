@@ -1,9 +1,9 @@
 use crate::model::{ChatMessage, HistoryEntry};
-use crate::storage::{history_dir, peer_history_path};
+use crate::storage::{history_dir, peer_history_path, write_text_atomic};
 use chrono::{Duration as ChronoDuration, Local};
 use serde_json::{self, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 pub struct LoadedHistoryMessage {
@@ -111,14 +111,12 @@ fn log_history_at(
     })
     .to_string();
 
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| {
-            f.write_all(line.as_bytes())?;
-            f.write_all(b"\n")
-        });
+    let mut content = fs::read_to_string(path).unwrap_or_default();
+    content.push_str(&line);
+    content.push('\n');
+    if let Err(err) = write_text_atomic(path, &content) {
+        eprintln!("[history] failed to append history atomically: {err}");
+    }
 }
 
 fn load_recent_history_from_dir(dir: &Path, days: i64) -> Vec<LoadedHistoryMessage> {
@@ -174,6 +172,7 @@ fn load_recent_history_from_dir(dir: &Path, days: i64) -> Vec<LoadedHistoryMessa
                     recv_ts: entry.recv_ts,
                     last_sync_ts: entry.sync_ts,
                     file_path: entry.file_path,
+                    transfer_id: None,
                     transfer_status,
                     msg_id: entry.msg_id,
                     is_read: true,
@@ -269,7 +268,10 @@ where
         lines.push(line.to_string());
     }
     if updated {
-        let _ = fs::write(path, lines.join("\n") + "\n");
+        let content = lines.join("\n") + "\n";
+        if let Err(err) = write_text_atomic(path, &content) {
+            eprintln!("[history] failed to rewrite history atomically: {err}");
+        }
     }
 }
 

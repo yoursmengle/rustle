@@ -84,11 +84,7 @@ fn platform_cjk_font_candidates() -> &'static [(&'static str, &'static str, u32)
             "/System/Library/Fonts/Hiragino Sans GB.ttc",
             0,
         ),
-        (
-            "songti",
-            "/System/Library/Fonts/Supplemental/Songti.ttc",
-            0,
-        ),
+        ("songti", "/System/Library/Fonts/Supplemental/Songti.ttc", 0),
         (
             "stheiti_light",
             "/System/Library/Fonts/STHeiti Light.ttc",
@@ -588,6 +584,35 @@ impl RustleApp {
             .unwrap_or(false)
     }
 
+    fn peer_supports_transfer_id(&self, peer_id: &str) -> bool {
+        self.users
+            .iter()
+            .find(|u| u.id == peer_id)
+            .and_then(|u| u.protocol_version.as_deref())
+            .map(|version| version >= crate::model::APP_PROTOCOL_VERSION)
+            .unwrap_or(false)
+    }
+
+    fn message_matches_transfer(
+        message: &ChatMessage,
+        from_me: bool,
+        transfer_id: Option<&str>,
+        file_name: &str,
+    ) -> bool {
+        if message.from_me != from_me {
+            return false;
+        }
+        if let Some(transfer_id) = transfer_id {
+            return message.transfer_id.as_deref() == Some(transfer_id);
+        }
+        message
+            .file_path
+            .as_ref()
+            .map(|p| p.ends_with(file_name))
+            .unwrap_or(false)
+            || (!from_me && message.text.contains(file_name))
+    }
+
     fn is_private_ipv4(ip: &str) -> bool {
         let parts: Vec<_> = ip.split('.').collect();
         if parts.len() != 4 {
@@ -855,6 +880,8 @@ impl RustleApp {
                                 ip: peer_ip.clone(),
                                 tcp_port,
                                 path,
+                                transfer_id: Some(meta.id.clone()),
+                                supports_transfer_id: true,
                                 is_dir: meta.is_dir,
                                 via: None,
                                 is_sync: true,
@@ -1168,6 +1195,8 @@ impl RustleApp {
                             ip: ip.to_string(),
                             tcp_port: target_tcp_port,
                             path: path.clone(),
+                            transfer_id: msg.transfer_id.clone(),
+                            supports_transfer_id: self.peer_supports_transfer_id(peer_id),
                             is_dir: msg.is_dir,
                             via: via.clone(),
                             is_sync: false,
@@ -1250,6 +1279,8 @@ impl RustleApp {
                         ip: ip.to_string(),
                         tcp_port: target_tcp_port,
                         path: item.path.clone(),
+                        transfer_id: None,
+                        supports_transfer_id: true,
                         is_dir: item.is_dir,
                         via: via.clone(),
                         is_sync: true,
@@ -1350,6 +1381,7 @@ impl RustleApp {
                             send_ts: send_ts.clone(),
                             msg_id: Some(mid.clone()),
                             file_path: None,
+                            transfer_id: None,
                             is_dir: false,
                         });
                     }
@@ -1361,6 +1393,7 @@ impl RustleApp {
                             send_ts: send_ts.clone(),
                             msg_id: Some(mid.clone()),
                             file_path: None,
+                            transfer_id: None,
                             is_dir: false,
                         }],
                     );
@@ -1476,6 +1509,8 @@ impl RustleApp {
                                         ip: ip.clone(),
                                         tcp_port: target_tcp_port,
                                         path: change.path.clone(),
+                                        transfer_id: None,
+                                        supports_transfer_id: true,
                                         is_dir: change.is_dir,
                                         via,
                                         is_sync: true,
@@ -1649,6 +1684,7 @@ impl RustleApp {
                 recv_ts: None,
                 last_sync_ts: None,
                 file_path: None,
+                transfer_id: None,
                 transfer_status: Some("发送中...".to_string()),
                 msg_id: Some(msg_id.clone()),
                 is_read: true,
@@ -1698,6 +1734,7 @@ impl RustleApp {
                     send_ts: ts.clone(),
                     msg_id: Some(msg_id.clone()),
                     file_path: None,
+                    transfer_id: None,
                     is_dir: false,
                 });
 
@@ -1907,6 +1944,7 @@ impl RustleApp {
                         recv_ts: None,
                         last_sync_ts: None,
                         file_path: Some(path.to_string_lossy().to_string()),
+                        transfer_id: None,
                         transfer_status: Some("发送失败：对方版本不支持可靠目录传输".to_string()),
                         msg_id: None,
                         is_read: true,
@@ -1936,17 +1974,25 @@ impl RustleApp {
 
             let text = format!("{} {}", icon, name);
             let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let transfer_id = Some(Uuid::new_v4().to_string());
 
             let mut sent = false;
             if online {
                 if let Some(ip) = ip {
                     if let Some(tx) = &self.net_cmd_tx {
+                        let supports_transfer_id = self.peer_supports_transfer_id(&id);
                         if tx
                             .send(NetCmd::SendFile {
                                 peer_id: id.clone(),
                                 ip: ip.clone(),
                                 tcp_port: target_tcp_port,
                                 path: path.clone(),
+                                transfer_id: if supports_transfer_id {
+                                    transfer_id.clone()
+                                } else {
+                                    None
+                                },
+                                supports_transfer_id,
                                 is_dir,
                                 via: via.clone(),
                                 is_sync: false,
@@ -1970,6 +2016,7 @@ impl RustleApp {
                         send_ts: ts.clone(),
                         msg_id: None,
                         file_path: Some(path.clone()),
+                        transfer_id: transfer_id.clone(),
                         is_dir,
                     });
             }
@@ -1983,6 +2030,7 @@ impl RustleApp {
                 recv_ts: None,
                 last_sync_ts: None,
                 file_path: Some(path.to_string_lossy().to_string()),
+                transfer_id: transfer_id.clone(),
                 transfer_status: Some(if sent {
                     "发送中...".to_string()
                 } else {
@@ -2578,6 +2626,7 @@ impl eframe::App for RustleApp {
                                 recv_ts: Some(recv_ts.clone()),
                                 last_sync_ts: None,
                                 file_path: None,
+                                transfer_id: None,
                                 transfer_status: None,
                                 msg_id: Some(msg_id.clone()),
                                 is_read: false,
@@ -2700,6 +2749,7 @@ impl eframe::App for RustleApp {
                     }
                     PeerEvent::FileCompletionAck {
                         from_id,
+                        transfer_id,
                         file_name,
                         is_dir: _,
                         is_sync,
@@ -2708,11 +2758,12 @@ impl eframe::App for RustleApp {
                     } => {
                         if let Some(msgs) = self.messages.get_mut(&from_id) {
                             if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                m.from_me
-                                    && m.file_path
-                                        .as_ref()
-                                        .map(|p| p.ends_with(&file_name))
-                                        .unwrap_or(false)
+                                Self::message_matches_transfer(
+                                    m,
+                                    true,
+                                    transfer_id.as_deref(),
+                                    &file_name,
+                                )
                             }) {
                                 msg.transfer_status = Some(status.clone());
                                 msg.is_pending = !succeeded;
@@ -2729,11 +2780,12 @@ impl eframe::App for RustleApp {
                             msgs.iter()
                                 .rev()
                                 .find(|m| {
-                                    m.from_me
-                                        && m.file_path
-                                            .as_ref()
-                                            .map(|p| p.ends_with(&file_name))
-                                            .unwrap_or(false)
+                                    Self::message_matches_transfer(
+                                        m,
+                                        true,
+                                        transfer_id.as_deref(),
+                                        &file_name,
+                                    )
                                 })
                                 .and_then(|m| m.file_path.clone())
                         }) {
@@ -2769,6 +2821,7 @@ impl eframe::App for RustleApp {
                     }
                     PeerEvent::FileProgress {
                         peer_id,
+                        transfer_id,
                         file_name,
                         progress,
                         status,
@@ -2790,17 +2843,19 @@ impl eframe::App for RustleApp {
                                     if is_sync {
                                         if is_final && succeeded {
                                             if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                                !m.from_me
-                                                    && (m
-                                                        .file_path
-                                                        .as_ref()
-                                                        .map(|p| p.ends_with(&file_name))
-                                                        .unwrap_or(false)
-                                                        || m.text.contains(&file_name))
+                                                Self::message_matches_transfer(
+                                                    m,
+                                                    false,
+                                                    transfer_id.as_deref(),
+                                                    &file_name,
+                                                )
                                             }) {
                                                 let ts = Local::now()
                                                     .format("%Y-%m-%d %H:%M:%S")
                                                     .to_string();
+                                                if msg.transfer_id.is_none() {
+                                                    msg.transfer_id = transfer_id.clone();
+                                                }
                                                 msg.last_sync_ts = Some(ts.clone());
                                                 if let Some(path) = msg.file_path.clone() {
                                                     pending_sync = Some((path, ts, false));
@@ -2825,6 +2880,7 @@ impl eframe::App for RustleApp {
                                                 recv_ts: Some(ts.clone()),
                                                 last_sync_ts: None,
                                                 file_path: Some(file_name.clone()),
+                                                transfer_id: None,
                                                 transfer_status: Some(status.clone()),
                                                 msg_id: None,
                                                 is_read: false,
@@ -2843,14 +2899,16 @@ impl eframe::App for RustleApp {
                                                 self.scroll_to_bottom = true;
                                             }
                                         } else if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                            !m.from_me
-                                                && (m
-                                                    .file_path
-                                                    .as_ref()
-                                                    .map(|p| p.ends_with(&file_name))
-                                                    .unwrap_or(false)
-                                                    || m.text.contains(&file_name))
+                                            Self::message_matches_transfer(
+                                                m,
+                                                false,
+                                                transfer_id.as_deref(),
+                                                &file_name,
+                                            )
                                         }) {
+                                            if msg.transfer_id.is_none() {
+                                                msg.transfer_id = transfer_id.clone();
+                                            }
                                             msg.transfer_status = Some(status.clone());
                                             if let Some(path) = local_path.as_deref() {
                                                 msg.file_path = Some(path.to_string());
@@ -2884,12 +2942,16 @@ impl eframe::App for RustleApp {
                                         }
                                     }
                                 } else if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                    m.from_me
-                                        && m.file_path
-                                            .as_ref()
-                                            .map(|p| p.ends_with(&file_name))
-                                            .unwrap_or(false)
+                                    Self::message_matches_transfer(
+                                        m,
+                                        true,
+                                        transfer_id.as_deref(),
+                                        &file_name,
+                                    )
                                 }) {
+                                    if msg.transfer_id.is_none() {
+                                        msg.transfer_id = transfer_id.clone();
+                                    }
                                     let new_needs_sync = !(is_final && succeeded);
                                     if msg.needs_sync != new_needs_sync {
                                         msg.needs_sync = new_needs_sync;
@@ -3895,6 +3957,7 @@ impl eframe::App for RustleApp {
                             send_ts,
                             msg_id: Some(msg_id.clone()),
                             file_path: None,
+                            transfer_id: None,
                             is_dir: false,
                         });
                     }
@@ -4028,5 +4091,56 @@ mod tests {
             app.get_best_interface_for_peer("192.168.1.20"),
             Some("192.168.1.10".to_string())
         );
+    }
+
+    #[test]
+    fn message_matches_transfer_prefers_transfer_id_over_filename() {
+        let exact = ChatMessage {
+            from_me: true,
+            text: "📄 file.txt".to_string(),
+            send_ts: "ts".to_string(),
+            recv_ts: None,
+            last_sync_ts: None,
+            file_path: Some("C:/a/file.txt".to_string()),
+            transfer_id: Some("transfer-a".to_string()),
+            transfer_status: None,
+            msg_id: None,
+            is_read: true,
+            is_pending: false,
+            needs_sync: false,
+        };
+        let same_name_other_transfer = ChatMessage {
+            from_me: true,
+            text: "📄 file.txt".to_string(),
+            send_ts: "ts".to_string(),
+            recv_ts: None,
+            last_sync_ts: None,
+            file_path: Some("C:/b/file.txt".to_string()),
+            transfer_id: Some("transfer-b".to_string()),
+            transfer_status: None,
+            msg_id: None,
+            is_read: true,
+            is_pending: false,
+            needs_sync: false,
+        };
+
+        assert!(RustleApp::message_matches_transfer(
+            &exact,
+            true,
+            Some("transfer-a"),
+            "file.txt",
+        ));
+        assert!(!RustleApp::message_matches_transfer(
+            &same_name_other_transfer,
+            true,
+            Some("transfer-a"),
+            "file.txt",
+        ));
+        assert!(RustleApp::message_matches_transfer(
+            &same_name_other_transfer,
+            true,
+            None,
+            "file.txt",
+        ));
     }
 }

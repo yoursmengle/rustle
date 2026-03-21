@@ -9,7 +9,7 @@ pub const UDP_DISCOVERY_PORT: u16 = 44517;
 pub const UDP_MESSAGE_PORT: u16 = 44518;
 pub const TCP_FILE_PORT: u16 = 44517;
 pub const TCP_DIR_PORT: u16 = 44518;
-pub const APP_PROTOCOL_VERSION: &str = "0.2";
+pub const APP_PROTOCOL_VERSION: &str = "0.3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncStatus {
@@ -44,6 +44,7 @@ pub struct ChatMessage {
     pub recv_ts: Option<String>,
     pub last_sync_ts: Option<String>,
     pub file_path: Option<String>,
+    pub transfer_id: Option<String>,
     pub transfer_status: Option<String>,
     pub msg_id: Option<String>,
     pub is_read: bool,
@@ -121,6 +122,7 @@ pub struct QueuedMsg {
     pub send_ts: String,
     pub msg_id: Option<String>,
     pub file_path: Option<PathBuf>,
+    pub transfer_id: Option<String>,
     pub is_dir: bool,
 }
 
@@ -167,6 +169,8 @@ pub enum NetCmd {
         ip: String,
         tcp_port: u16,
         path: PathBuf,
+        transfer_id: Option<String>,
+        supports_transfer_id: bool,
         is_dir: bool,
         via: Option<String>,
         is_sync: bool,
@@ -197,6 +201,7 @@ pub enum PeerEvent {
     },
     FileCompletionAck {
         from_id: String,
+        transfer_id: Option<String>,
         file_name: String,
         #[allow(dead_code)]
         is_dir: bool,
@@ -206,6 +211,7 @@ pub enum PeerEvent {
     },
     FileProgress {
         peer_id: Option<String>,
+        transfer_id: Option<String>,
         file_name: String,
         progress: f32,
         status: String,
@@ -302,6 +308,8 @@ pub struct AckPayload {
 pub struct FileCompletionPayload {
     pub msg_type: String,
     pub from_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_id: Option<String>,
     pub file_name: String,
     pub is_dir: bool,
     pub is_sync: bool,
@@ -351,6 +359,8 @@ pub enum FileCmd {
         peer_ip: String,
         tcp_port: u16,
         path: PathBuf,
+        transfer_id: Option<String>,
+        supports_transfer_id: bool,
         is_dir: bool,
         via: Option<String>,
         is_sync: bool,
@@ -413,6 +423,7 @@ mod tests {
         let completion = FileCompletionPayload {
             msg_type: "file_completion_ack".to_string(),
             from_id: "node2".to_string(),
+            transfer_id: Some("transfer-1".to_string()),
             file_name: "file.txt".to_string(),
             is_dir: false,
             is_sync: false,
@@ -422,6 +433,7 @@ mod tests {
         let s = serde_json::to_string(&completion).unwrap();
         let completion2: FileCompletionPayload = serde_json::from_str(&s).unwrap();
         assert_eq!(completion.file_name, completion2.file_name);
+        assert_eq!(completion.transfer_id, completion2.transfer_id);
         assert!(completion2.success);
 
         let pb = PeerBrief {
@@ -468,5 +480,25 @@ mod tests {
         assert!(t2.peers.contains_key("p1"));
         assert_eq!(t2.peers.get("p1").unwrap().len(), 1);
         assert_eq!(t2.peers.get("p1").unwrap()[0].children.len(), 1);
+    }
+
+    #[test]
+    fn file_completion_payload_without_transfer_id_still_deserializes() {
+        let payload = r#"{
+            "msg_type":"file_completion_ack",
+            "from_id":"node2",
+            "file_name":"file.txt",
+            "is_dir":false,
+            "is_sync":false,
+            "success":true,
+            "status":"接收完成 (1 B)"
+        }"#;
+
+        let completion: FileCompletionPayload = serde_json::from_str(payload).unwrap();
+
+        assert_eq!(completion.from_id, "node2");
+        assert_eq!(completion.file_name, "file.txt");
+        assert_eq!(completion.transfer_id, None);
+        assert!(completion.success);
     }
 }

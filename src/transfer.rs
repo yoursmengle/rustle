@@ -18,11 +18,39 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 const MAX_ID_LEN: usize = 64;
 const MAX_NAME_LEN: usize = 255;
 const FLAG_SYNC: u8 = 0x01;
+const FLAG_TRANSFER_ID_EXTENSION: u8 = 0x02;
+const MAX_TRANSFER_ID_LEN: usize = 128;
+const MAX_MANIFEST_LEN: usize = 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const BODY_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn validate_transfer_id_len(len: usize) -> io::Result<()> {
+    if len == 0 || len > MAX_TRANSFER_ID_LEN {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid transfer_id length {len}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_len(len: usize) -> io::Result<()> {
+    if len == 0 || len > MAX_MANIFEST_LEN {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid manifest length {len}"),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +86,7 @@ struct FolderPackage {
 fn emit_progress(
     peer_tx: &Sender<PeerEvent>,
     peer_id: Option<String>,
+    transfer_id: Option<String>,
     file_name: String,
     progress: f32,
     status: String,
@@ -70,6 +99,7 @@ fn emit_progress(
 ) {
     let _ = peer_tx.send(PeerEvent::FileProgress {
         peer_id,
+        transfer_id,
         file_name,
         progress,
         status,
@@ -250,6 +280,46 @@ fn build_folder_package(source_dir: &Path, tar_path: &Path, root_name: &str) -> 
 
 fn decode_folder_manifest(bytes: &[u8]) -> io::Result<FolderManifest> {
     serde_json::from_slice(bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
+}
+
+async fn read_exact_with_timeout<R>(
+    reader: &mut R,
+    buf: &mut [u8],
+    phase: &str,
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+{
+    timeout(HEADER_READ_TIMEOUT, reader.read_exact(buf))
+        .await
+        .map_err(|_| io::Error::new(ErrorKind::TimedOut, format!("{phase} timed out")))?
+        .map_err(|e| io::Error::new(e.kind(), format!("{phase} failed: {e}")))?;
+    Ok(())
+}
+
+async fn write_all_with_timeout<W>(
+    writer: &mut W,
+    buf: &[u8],
+    phase: &str,
+) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    timeout(BODY_IO_TIMEOUT, writer.write_all(buf))
+        .await
+        .map_err(|_| io::Error::new(ErrorKind::TimedOut, format!("{phase} timed out")))?
+        .map_err(|e| io::Error::new(e.kind(), format!("{phase} failed: {e}")))?;
+    Ok(())
+}
+
+async fn read_with_timeout<R>(reader: &mut R, buf: &mut [u8], phase: &str) -> io::Result<usize>
+where
+    R: AsyncReadExt + Unpin,
+{
+    timeout(BODY_IO_TIMEOUT, reader.read(buf))
+        .await
+        .map_err(|_| io::Error::new(ErrorKind::TimedOut, format!("{phase} timed out")))?
+        .map_err(|e| io::Error::new(e.kind(), format!("{phase} failed: {e}")))
 }
 
 fn normalize_archive_member_path(path: &Path, expected_root: &str) -> io::Result<Option<String>> {
@@ -433,6 +503,7 @@ fn cleanup_failed_regular_file(staged_path: &Path, final_path: &Path) {
 
 async fn send_file_completion_ack(
     sender_ip: std::net::IpAddr,
+    transfer_id: Option<String>,
     file_name: &str,
     is_dir: bool,
     is_sync: bool,
@@ -442,6 +513,7 @@ async fn send_file_completion_ack(
     let payload = FileCompletionPayload {
         msg_type: "file_completion_ack".to_string(),
         from_id: load_or_init_node_id(),
+        transfer_id,
         file_name: file_name.to_string(),
         is_dir,
         is_sync,
@@ -543,6 +615,7 @@ pub async fn handle_incoming_file(
         emit_progress(
             peer_tx,
             Some(sender_id.to_string()),
+            None,
             filename.to_string(),
             1.0,
             status,
@@ -556,12 +629,12 @@ pub async fn handle_incoming_file(
     };
 
     let mut type_buf = [0u8; 1];
-    if socket.read_exact(&mut type_buf).await.is_err() {
+    if read_exact_with_timeout(&mut socket, &mut type_buf, "read type").await.is_err() {
         debug_println!("[rx] failed to read type from {addr}");
         return;
     }
     let mut flag_buf = [0u8; 1];
-    if socket.read_exact(&mut flag_buf).await.is_err() {
+    if read_exact_with_timeout(&mut socket, &mut flag_buf, "read flags").await.is_err() {
         debug_println!("[rx] failed to read flags from {addr}");
         return;
     }
@@ -569,7 +642,7 @@ pub async fn handle_incoming_file(
     let is_sync = (flag_buf[0] & FLAG_SYNC) == FLAG_SYNC;
 
     let mut id_len_buf = [0u8; 1];
-    if socket.read_exact(&mut id_len_buf).await.is_err() {
+    if read_exact_with_timeout(&mut socket, &mut id_len_buf, "read id_len").await.is_err() {
         debug_println!("[rx] failed to read id_len from {addr}");
         return;
     }
@@ -580,14 +653,14 @@ pub async fn handle_incoming_file(
     }
 
     let mut id_buf = vec![0u8; id_len];
-    if socket.read_exact(&mut id_buf).await.is_err() {
+    if read_exact_with_timeout(&mut socket, &mut id_buf, "read id bytes").await.is_err() {
         eprintln!("[rx] failed to read id bytes from {addr}");
         return;
     }
     let sender_id = String::from_utf8_lossy(&id_buf).to_string();
 
     let mut len_buf = [0u8; 2];
-    if socket.read_exact(&mut len_buf).await.is_err() {
+    if read_exact_with_timeout(&mut socket, &mut len_buf, "read name_len").await.is_err() {
         eprintln!("[rx] failed to read name_len from {addr}");
         return;
     }
@@ -598,7 +671,7 @@ pub async fn handle_incoming_file(
     }
 
     let mut name_buf = vec![0u8; name_len];
-    if socket.read_exact(&mut name_buf).await.is_err() {
+    if read_exact_with_timeout(&mut socket, &mut name_buf, "read name bytes").await.is_err() {
         eprintln!("[rx] failed to read name bytes from {addr}");
         return;
     }
@@ -606,19 +679,56 @@ pub async fn handle_incoming_file(
     let safe_filename = sanitize_filename(&filename);
 
     let mut size_buf = [0u8; 8];
-    if socket.read_exact(&mut size_buf).await.is_err() {
+    if read_exact_with_timeout(&mut socket, &mut size_buf, "read size bytes").await.is_err() {
         eprintln!("[rx] failed to read size bytes from {addr}");
         return;
     }
     let total_size = u64::from_be_bytes(size_buf);
 
+    let mut transfer_id: Option<String> = None;
+    if (flag_buf[0] & FLAG_TRANSFER_ID_EXTENSION) == FLAG_TRANSFER_ID_EXTENSION {
+        let mut transfer_id_len_buf = [0u8; 1];
+        if read_exact_with_timeout(&mut socket, &mut transfer_id_len_buf, "read transfer_id length")
+            .await
+            .is_err()
+        {
+            eprintln!("[rx] failed to read transfer_id length from {addr}");
+            return;
+        }
+        let transfer_id_len = transfer_id_len_buf[0] as usize;
+        if validate_transfer_id_len(transfer_id_len).is_err() {
+            eprintln!("[rx] invalid transfer_id length {transfer_id_len} from {addr}");
+            return;
+        }
+
+        let mut transfer_id_buf = vec![0u8; transfer_id_len];
+        if read_exact_with_timeout(&mut socket, &mut transfer_id_buf, "read transfer_id bytes")
+            .await
+            .is_err()
+        {
+            eprintln!("[rx] failed to read transfer_id bytes from {addr}");
+            return;
+        }
+        transfer_id = Some(String::from_utf8_lossy(&transfer_id_buf).to_string());
+    }
+
     let mut leading_payload: Vec<u8> = Vec::new();
     let mut sha256_present_buf = [0u8; 1];
-    let expected_sha256: Option<String> = if socket.read_exact(&mut sha256_present_buf).await.is_ok() {
+    let expected_sha256: Option<String> = if read_exact_with_timeout(
+        &mut socket,
+        &mut sha256_present_buf,
+        "read sha256 present flag",
+    )
+    .await
+    .is_ok()
+    {
         match sha256_present_buf[0] {
             1 => {
                 let mut sha256_buf = [0u8; 32];
-                if socket.read_exact(&mut sha256_buf).await.is_ok() {
+                if read_exact_with_timeout(&mut socket, &mut sha256_buf, "read sha256 bytes")
+                    .await
+                    .is_ok()
+                {
                     Some(hex::encode(sha256_buf))
                 } else {
                     None
@@ -651,7 +761,10 @@ pub async fn handle_incoming_file(
         }
 
         let mut manifest_present_buf = [0u8; 1];
-        if socket.read_exact(&mut manifest_present_buf).await.is_err() {
+        if read_exact_with_timeout(&mut socket, &mut manifest_present_buf, "read manifest flag")
+            .await
+            .is_err()
+        {
             fail_and_emit(
                 &peer_tx,
                 &sender_id,
@@ -676,7 +789,10 @@ pub async fn handle_incoming_file(
             return;
         }
         let mut manifest_len_buf = [0u8; 4];
-        if socket.read_exact(&mut manifest_len_buf).await.is_err() {
+        if read_exact_with_timeout(&mut socket, &mut manifest_len_buf, "read manifest length")
+            .await
+            .is_err()
+        {
             fail_and_emit(
                 &peer_tx,
                 &sender_id,
@@ -689,8 +805,23 @@ pub async fn handle_incoming_file(
             return;
         }
         let manifest_len = u32::from_be_bytes(manifest_len_buf) as usize;
+        if validate_manifest_len(manifest_len).is_err() {
+            fail_and_emit(
+                &peer_tx,
+                &sender_id,
+                &filename,
+                true,
+                is_sync,
+                None,
+                "接收失败：目录清单长度无效".to_string(),
+            );
+            return;
+        }
         let mut manifest_buf = vec![0u8; manifest_len];
-        if socket.read_exact(&mut manifest_buf).await.is_err() {
+        if read_exact_with_timeout(&mut socket, &mut manifest_buf, "read manifest bytes")
+            .await
+            .is_err()
+        {
             fail_and_emit(
                 &peer_tx,
                 &sender_id,
@@ -719,7 +850,10 @@ pub async fn handle_incoming_file(
         }
 
         let mut tar_sha_present = [0u8; 1];
-        if socket.read_exact(&mut tar_sha_present).await.is_err() {
+        if read_exact_with_timeout(&mut socket, &mut tar_sha_present, "read tar sha flag")
+            .await
+            .is_err()
+        {
             fail_and_emit(
                 &peer_tx,
                 &sender_id,
@@ -733,7 +867,10 @@ pub async fn handle_incoming_file(
         }
         if tar_sha_present[0] == 1 {
             let mut tar_sha_buf = [0u8; 32];
-            if socket.read_exact(&mut tar_sha_buf).await.is_err() {
+            if read_exact_with_timeout(&mut socket, &mut tar_sha_buf, "read tar sha bytes")
+                .await
+                .is_err()
+            {
                 fail_and_emit(
                     &peer_tx,
                     &sender_id,
@@ -765,6 +902,7 @@ pub async fn handle_incoming_file(
     emit_progress(
         &peer_tx,
         Some(sender_id.clone()),
+        transfer_id.clone(),
         filename.clone(),
         0.0,
         initial_status,
@@ -779,7 +917,12 @@ pub async fn handle_incoming_file(
     let base_dir = default_download_dir();
     let mapped_path = if is_sync {
         let map = load_receive_map();
-        let key = receive_map_key(&sender_id, is_dir, &filename);
+        let key = receive_map_key_with_transfer_id(
+            &sender_id,
+            transfer_id.as_deref(),
+            is_dir,
+            &filename,
+        );
         map.get(&key).map(PathBuf::from)
     } else {
         None
@@ -836,7 +979,7 @@ pub async fn handle_incoming_file(
             let mut buf = vec![0u8; 64 * 1024];
             let mut received = 0u64;
             loop {
-                match socket.read(&mut buf).await {
+                match read_with_timeout(&mut socket, &mut buf, "read directory body").await {
                     Ok(0) => break,
                     Ok(n) => {
                         if file.write_all(&buf[..n]).await.is_err() {
@@ -854,6 +997,7 @@ pub async fn handle_incoming_file(
                                 emit_progress(
                                     &peer_tx,
                                     Some(sender_id.clone()),
+                                    transfer_id.clone(),
                                     filename.clone(),
                                     progress,
                                     format!(
@@ -896,6 +1040,7 @@ pub async fn handle_incoming_file(
                 emit_progress(
                     &peer_tx,
                     Some(sender_id.clone()),
+                    transfer_id.clone(),
                     filename.clone(),
                     1.0,
                     "正在解压目录...".to_string(),
@@ -930,6 +1075,7 @@ pub async fn handle_incoming_file(
                         emit_progress(
                             &peer_tx,
                             Some(sender_id.clone()),
+                            transfer_id.clone(),
                             filename.clone(),
                             1.0,
                             "正在校验目录...".to_string(),
@@ -993,7 +1139,7 @@ pub async fn handle_incoming_file(
             }
         }
         while failure_reason.is_none() {
-            match socket.read(&mut buf).await {
+            match read_with_timeout(&mut socket, &mut buf, "read file body").await {
                 Ok(0) => break,
                 Ok(n) => {
                     if file.write_all(&buf[..n]).await.is_err() {
@@ -1008,11 +1154,12 @@ pub async fn handle_incoming_file(
                             && now.duration_since(last_report_instant).as_millis() >= 200)
                             || last_report_bytes == 0
                         {
-                            emit_progress(
-                                &peer_tx,
-                                Some(sender_id.clone()),
-                                filename.clone(),
-                                progress,
+                                emit_progress(
+                                    &peer_tx,
+                                    Some(sender_id.clone()),
+                                    transfer_id.clone(),
+                                    filename.clone(),
+                                    progress,
                                 format!(
                                     "正在接收 {:.0}% / {} ({})",
                                     progress * 100.0,
@@ -1081,7 +1228,12 @@ pub async fn handle_incoming_file(
 
     if success {
         let mut map = load_receive_map();
-        let key = receive_map_key(&sender_id, is_dir, &filename);
+        let key = receive_map_key_with_transfer_id(
+            &sender_id,
+            transfer_id.as_deref(),
+            is_dir,
+            &filename,
+        );
         map.insert(
             key,
             final_local_path.to_string_lossy().to_string(),
@@ -1105,6 +1257,7 @@ pub async fn handle_incoming_file(
     emit_progress(
         &peer_tx,
         Some(sender_id),
+        transfer_id.clone(),
         filename.clone(),
         1.0,
         final_status.clone(),
@@ -1120,7 +1273,35 @@ pub async fn handle_incoming_file(
         success,
     );
 
-    send_file_completion_ack(addr.ip(), &filename, is_dir, is_sync, success, &final_status).await;
+    send_file_completion_ack(
+        addr.ip(),
+        transfer_id,
+        &filename,
+        is_dir,
+        is_sync,
+        success,
+        &final_status,
+    )
+    .await;
+}
+
+fn receive_map_key_with_transfer_id(
+    sender_id: &str,
+    transfer_id: Option<&str>,
+    is_dir: bool,
+    filename: &str,
+) -> String {
+    if let Some(transfer_id) = transfer_id {
+        format!(
+            "{}|{}|{}|{}",
+            sender_id,
+            if is_dir { "dir" } else { "file" },
+            "transfer",
+            transfer_id
+        )
+    } else {
+        receive_map_key(sender_id, is_dir, filename)
+    }
 }
 
 pub async fn handle_outgoing_file(
@@ -1129,6 +1310,8 @@ pub async fn handle_outgoing_file(
     peer_ip: String,
     tcp_port: u16,
     path: PathBuf,
+    transfer_id: Option<String>,
+    supports_transfer_id: bool,
     is_dir: bool,
     via: Option<String>,
     is_sync: bool,
@@ -1188,7 +1371,10 @@ pub async fn handle_outgoing_file(
     let mut retry_count = 0;
     
     loop {
-        socket = connect_with_via(&peer_ip, tcp_port, &via).await;
+                socket = timeout(CONNECT_TIMEOUT, connect_with_via(&peer_ip, tcp_port, &via))
+                    .await
+                    .map_err(|_| io::Error::new(ErrorKind::TimedOut, "connect timed out"))
+                    .and_then(|result| result);
         
         if socket.is_ok() {
             break;
@@ -1209,7 +1395,10 @@ pub async fn handle_outgoing_file(
         if alt_port != tcp_port {
             retry_count = 0;
             loop {
-                socket = connect_with_via(&peer_ip, alt_port, &via).await;
+                socket = timeout(CONNECT_TIMEOUT, connect_with_via(&peer_ip, alt_port, &via))
+                    .await
+                    .map_err(|_| io::Error::new(ErrorKind::TimedOut, "connect timed out"))
+                    .and_then(|result| result);
                 
                 if socket.is_ok() {
                     used_port = alt_port;
@@ -1266,6 +1455,7 @@ pub async fn handle_outgoing_file(
                     emit_progress(
                         &peer_tx,
                         Some(peer_id),
+                        None,
                         filename,
                         1.0,
                         "目录打包失败：无法读取临时归档信息".to_string(),
@@ -1285,6 +1475,7 @@ pub async fn handle_outgoing_file(
                 emit_progress(
                     &peer_tx,
                     Some(peer_id),
+                    None,
                     filename,
                     1.0,
                     format!("目录打包失败：{e}"),
@@ -1303,6 +1494,7 @@ pub async fn handle_outgoing_file(
                 emit_progress(
                     &peer_tx,
                     Some(peer_id),
+                    None,
                     filename,
                     1.0,
                     format!("目录打包失败：后台任务异常 ({join_err})"),
@@ -1325,6 +1517,7 @@ pub async fn handle_outgoing_file(
         emit_progress(
             &peer_tx,
             Some(peer_id.clone()),
+            transfer_id.clone(),
             filename.clone(),
             0.0,
             if is_dir {
@@ -1380,12 +1573,39 @@ pub async fn handle_outgoing_file(
         }
 
         header.push(if is_dir { 1 } else { 0 });
-        header.push(if is_sync { FLAG_SYNC } else { 0 });
+        let mut header_flags = if is_sync { FLAG_SYNC } else { 0 };
+        if supports_transfer_id && transfer_id.is_some() {
+            header_flags |= FLAG_TRANSFER_ID_EXTENSION;
+        }
+        header.push(header_flags);
         header.push(id_len);
         header.extend_from_slice(id_bytes);
         header.extend_from_slice(&name_len.to_be_bytes());
         header.extend_from_slice(name_bytes);
         header.extend_from_slice(&declared_size.to_be_bytes());
+        if (header_flags & FLAG_TRANSFER_ID_EXTENSION) == FLAG_TRANSFER_ID_EXTENSION {
+            let transfer_id = transfer_id.as_deref().unwrap_or_default();
+            let transfer_id_bytes = transfer_id.as_bytes();
+            if validate_transfer_id_len(transfer_id_bytes.len()).is_err() {
+                emit_progress(
+                    &peer_tx,
+                    Some(peer_id),
+                    None,
+                    filename,
+                    1.0,
+                    "发送失败：transfer_id 长度无效".to_string(),
+                    false,
+                    is_dir,
+                    Some(path.to_string_lossy().to_string()),
+                    is_sync,
+                    true,
+                    false,
+                );
+                return;
+            }
+            header.push(transfer_id_bytes.len() as u8);
+            header.extend_from_slice(transfer_id_bytes);
+        }
         
         // 添加 SHA256 校验码（如果有）
         if let Some(ref sha_str) = sha {
@@ -1408,6 +1628,7 @@ pub async fn handle_outgoing_file(
                             emit_progress(
                                 &peer_tx,
                                 Some(peer_id),
+                                None,
                                 filename,
                                 1.0,
                                 format!("目录打包失败：无法序列化清单 ({err})"),
@@ -1421,6 +1642,26 @@ pub async fn handle_outgoing_file(
                             return;
                         }
                     };
+                    if validate_manifest_len(manifest_json.len()).is_err() {
+                        if let Some(p) = cleanup_path.as_ref() {
+                            let _ = tokio::fs::remove_file(p).await;
+                        }
+                        emit_progress(
+                            &peer_tx,
+                            Some(peer_id),
+                            None,
+                            filename,
+                            1.0,
+                            "目录打包失败：目录清单长度无效".to_string(),
+                            false,
+                            true,
+                            Some(path.to_string_lossy().to_string()),
+                            is_sync,
+                            true,
+                            false,
+                        );
+                        return;
+                    }
                     header.push(1);
                     header.extend_from_slice(&(manifest_json.len() as u32).to_be_bytes());
                     header.extend_from_slice(&manifest_json);
@@ -1432,6 +1673,7 @@ pub async fn handle_outgoing_file(
                     emit_progress(
                         &peer_tx,
                         Some(peer_id),
+                        None,
                         filename,
                         1.0,
                         "目录打包失败：目录清单缺失".to_string(),
@@ -1457,7 +1699,10 @@ pub async fn handle_outgoing_file(
 
         eprintln!("[tx] sending header to {addr_str} id={my_id} peer={peer_id} name={filename} is_dir={is_dir} size={declared_size}");
 
-        if socket.write_all(&header).await.is_ok() {
+        if write_all_with_timeout(&mut socket, &header, "write header")
+            .await
+            .is_ok()
+        {
             match tokio::fs::File::open(&send_path).await {
                 Ok(mut file) => {
                     let mut buf = vec![0u8; 64 * 1024];
@@ -1471,7 +1716,10 @@ pub async fn handle_outgoing_file(
                         match file.read(&mut buf).await {
                             Ok(0) => break,
                             Ok(n) => {
-                                if socket.write_all(&buf[..n]).await.is_err() {
+                                if write_all_with_timeout(&mut socket, &buf[..n], "write body")
+                                    .await
+                                    .is_err()
+                                {
                                     eprintln!("[tx] write error to {addr_str}");
                                     send_ok = false;
                                     break;
@@ -1497,6 +1745,7 @@ pub async fn handle_outgoing_file(
                                         emit_progress(
                                             &peer_tx,
                                             Some(peer_id.clone()),
+                                            transfer_id.clone(),
                                             filename.clone(),
                                             progress,
                                             status,
@@ -1521,7 +1770,7 @@ pub async fn handle_outgoing_file(
                         }
                     }
 
-                    let _ = socket.shutdown().await;
+                    let _ = timeout(SHUTDOWN_TIMEOUT, socket.shutdown()).await;
                     eprintln!("[tx] shutdown write half to {addr_str}");
 
                     if let Some(p) = cleanup_path.as_ref() {
@@ -1541,6 +1790,7 @@ pub async fn handle_outgoing_file(
                         emit_progress(
                             &peer_tx,
                             Some(peer_id),
+                            transfer_id.clone(),
                             filename,
                             final_progress,
                             if is_dir {
@@ -1559,6 +1809,7 @@ pub async fn handle_outgoing_file(
                         emit_progress(
                             &peer_tx,
                             Some(peer_id),
+                            transfer_id.clone(),
                             filename,
                             final_progress,
                             if is_dir {
@@ -1583,6 +1834,7 @@ pub async fn handle_outgoing_file(
                     emit_progress(
                         &peer_tx,
                         Some(peer_id),
+                        transfer_id.clone(),
                         filename,
                         1.0,
                         format!("发送失败：无法读取待发送内容 ({e})"),
@@ -1602,6 +1854,7 @@ pub async fn handle_outgoing_file(
             emit_progress(
                 &peer_tx,
                 Some(peer_id),
+                transfer_id.clone(),
                 filename,
                 1.0,
                 "连接失败".to_string(),
@@ -1620,6 +1873,7 @@ pub async fn handle_outgoing_file(
         emit_progress(
             &peer_tx,
             Some(peer_id),
+            transfer_id,
             filename,
             1.0,
             "连接失败".to_string(),
@@ -1769,5 +2023,17 @@ mod tests {
         assert!(!final_path.exists());
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn oversized_transfer_id_is_rejected() {
+        let err = validate_transfer_id_len(MAX_TRANSFER_ID_LEN + 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn oversized_manifest_is_rejected() {
+        let err = validate_manifest_len(MAX_MANIFEST_LEN + 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 }

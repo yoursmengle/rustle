@@ -140,6 +140,8 @@ impl MetadataStore {
                                                                 path: std::path::PathBuf::from(
                                                                     syncing_meta.abs_path.clone(),
                                                                 ),
+                                                                transfer_id: Some(syncing_meta.id.clone()),
+                                                                supports_transfer_id: true,
                                                                 is_dir: syncing_meta.is_dir,
                                                                 via: None,
                                                                 is_sync: true,
