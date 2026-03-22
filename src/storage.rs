@@ -33,6 +33,8 @@ pub struct PersistedPeerRuntimeState {
 pub struct RuntimeState {
     #[serde(default)]
     pub peers: HashMap<String, PersistedPeerRuntimeState>,
+    #[serde(default)]
+    pub recent_received_msg_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -288,6 +290,16 @@ pub fn save_receive_map(map: &HashMap<String, String>) {
             eprintln!("[storage] failed to save receive map atomically: {err}");
         }
     }
+}
+
+pub fn lookup_receive_map(key: &str) -> Option<String> {
+    load_receive_map().get(key).cloned()
+}
+
+pub fn upsert_receive_map_entry(key: String, value: String) {
+    let mut map = load_receive_map();
+    map.insert(key, value);
+    save_receive_map(&map);
 }
 
 pub fn file_mtime_seconds(path: &Path) -> Option<i64> {
@@ -679,6 +691,7 @@ mod tests {
                     }],
                 },
             )]),
+            recent_received_msg_ids: vec!["r1".to_string()],
         };
 
         let text = serde_json::to_string_pretty(&state).unwrap();
@@ -722,5 +735,25 @@ mod tests {
         assert!(leftovers.is_empty());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn receive_map_upsert_preserves_existing_entries() {
+        let path = data_path(RECEIVE_MAP_FILE);
+        let backup = fs::read_to_string(&path).ok();
+        let _ = fs::remove_file(&path);
+
+        upsert_receive_map_entry("k1".to_string(), "v1".to_string());
+        upsert_receive_map_entry("k2".to_string(), "v2".to_string());
+
+        let map = load_receive_map();
+        assert_eq!(map.get("k1").map(String::as_str), Some("v1"));
+        assert_eq!(map.get("k2").map(String::as_str), Some("v2"));
+
+        if let Some(original) = backup {
+            let _ = write_text_atomic(&path, &original);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
     }
 }

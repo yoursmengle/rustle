@@ -1,4 +1,5 @@
 use crate::debug_println;
+use crate::delivery::DeliveryState;
 use crate::history;
 use crate::model::{
     ChatMessage, KnownPeer, NetCmd, Peer, PeerEvent, QueuedMsg, SyncNode, SyncStatus, SyncTree,
@@ -6,9 +7,8 @@ use crate::model::{
 };
 use crate::net::spawn_network_worker;
 use crate::storage::{
-    data_path, default_download_dir, file_mtime_seconds, load_or_init_node_id, load_runtime_state,
-    load_settings, load_sync_tree, save_runtime_state, save_settings, save_sync_tree, sha256_file,
-    AppSettings, PersistedPendingAck, RuntimeState,
+    data_path, default_download_dir, file_mtime_seconds, load_or_init_node_id, load_settings,
+    load_sync_tree, save_settings, save_sync_tree, sha256_file, AppSettings,
 };
 use chrono::Local;
 use eframe::egui;
@@ -402,7 +402,7 @@ pub struct RustleApp {
     pub selected_user_id: Option<String>,
     pub messages: HashMap<String, Vec<ChatMessage>>,
     pub input: String,
-    pub pending_acks: HashMap<String, Vec<(String, Instant)>>,
+    pub delivery: DeliveryState,
 
     // 当前用户名称（从 me.txt 读取或用户输入）
     pub me_name: Option<String>,
@@ -423,7 +423,6 @@ pub struct RustleApp {
     pub known_dirty: bool,
 
     // 离线消息队列
-    pub offline_msgs: HashMap<String, Vec<QueuedMsg>>,
     // 重试发送的待处理列表：peer_id -> due instant
     pub pending_resend: std::collections::HashMap<String, Instant>,
 
@@ -451,8 +450,6 @@ pub struct RustleApp {
     pub bound_interfaces: HashSet<String>,
 
     // 已接收消息 ID 缓存（用于去重）
-    pub received_msg_ids: HashSet<String>,
-
     // 已记录到历史的入站文件（peer_id, file_name）避免重复
     pub logged_incoming_files: HashSet<(String, String)>,
 
@@ -502,77 +499,11 @@ pub struct RustleApp {
 
 impl RustleApp {
     fn persist_runtime_state(&self) {
-        let mut peers = HashMap::new();
-
-        for (peer_id, queue) in &self.offline_msgs {
-            if !queue.is_empty() {
-                peers
-                    .entry(peer_id.clone())
-                    .or_insert_with(|| crate::storage::PersistedPeerRuntimeState::default())
-                    .offline_msgs = queue.clone();
-            }
-        }
-
-        for (peer_id, pending) in &self.pending_acks {
-            if !pending.is_empty() {
-                peers
-                    .entry(peer_id.clone())
-                    .or_insert_with(|| crate::storage::PersistedPeerRuntimeState::default())
-                    .pending_acks = pending
-                    .iter()
-                    .map(|(msg_id, _)| PersistedPendingAck {
-                        msg_id: msg_id.clone(),
-                    })
-                    .collect();
-            }
-        }
-
-        save_runtime_state(&RuntimeState { peers });
+        self.delivery.persist_runtime_state();
     }
 
     fn restore_runtime_state(&mut self) {
-        let state = load_runtime_state();
-
-        for (peer_id, peer_state) in state.peers {
-            let queue = self.offline_msgs.entry(peer_id.clone()).or_default();
-            for queued in peer_state.offline_msgs {
-                let exists = queue.iter().any(|existing| {
-                    existing.msg_id == queued.msg_id
-                        || (existing.text == queued.text
-                            && existing.send_ts == queued.send_ts
-                            && existing.file_path == queued.file_path
-                            && existing.is_dir == queued.is_dir)
-                });
-                if !exists {
-                    queue.push(queued);
-                }
-            }
-
-            let pending_list = self.pending_acks.entry(peer_id.clone()).or_default();
-            for pending in peer_state.pending_acks {
-                if !pending_list
-                    .iter()
-                    .any(|(msg_id, _)| msg_id == &pending.msg_id)
-                {
-                    pending_list.push((
-                        pending.msg_id.clone(),
-                        Instant::now() + Duration::from_secs(5),
-                    ));
-                }
-
-                if let Some(msgs) = self.messages.get_mut(&peer_id) {
-                    if let Some(message) = msgs.iter_mut().rev().find(|msg| {
-                        msg.from_me && msg.msg_id.as_deref() == Some(pending.msg_id.as_str())
-                    }) {
-                        message.is_pending = true;
-                        if message.file_path.is_none() {
-                            message.transfer_status = Some("等待对方确认...".to_string());
-                        }
-                    }
-                }
-            }
-        }
-
+        self.delivery.restore_runtime_state(&mut self.messages);
         self.persist_runtime_state();
     }
 
@@ -807,7 +738,7 @@ impl RustleApp {
                     best_interface: None,
                     has_unread: false,
                 });
-                self.offline_msgs.entry(pid.clone()).or_default();
+                self.delivery.offline_msgs.entry(pid.clone()).or_default();
             }
 
             self.messages.entry(pid).or_default().push(loaded.message);
@@ -1168,7 +1099,7 @@ impl RustleApp {
         let Some(tx) = self.net_cmd_tx.clone() else {
             return;
         };
-        if let Some(queue) = self.offline_msgs.get_mut(peer_id) {
+        if let Some(queue) = self.delivery.offline_msgs.get_mut(peer_id) {
             if queue.is_empty() {
                 return;
             }
@@ -1230,6 +1161,7 @@ impl RustleApp {
                     );
 
                     let sent = self
+                        .delivery
                         .pending_acks
                         .get(peer_id)
                         .map(|list| list.iter().any(|(mid_item, _)| mid_item == &mid))
@@ -1239,13 +1171,19 @@ impl RustleApp {
                         peer_id,
                         mid,
                         sent,
-                        self.pending_acks.get(peer_id).map(|l| l.len()).unwrap_or(0)
+                        self.delivery
+                            .pending_acks
+                            .get(peer_id)
+                            .map(|l| l.len())
+                            .unwrap_or(0)
                     );
                     self.update_history_pending(peer_id, &mid, !sent);
                 }
             }
             if !remain.is_empty() {
-                self.offline_msgs.insert(peer_id.to_string(), remain);
+                self.delivery
+                    .offline_msgs
+                    .insert(peer_id.to_string(), remain);
             }
         }
         self.persist_runtime_state();
@@ -1329,6 +1267,7 @@ impl RustleApp {
 
             // see if it was enqueued for ack
             let was_sent = self
+                .delivery
                 .pending_acks
                 .get(peer_id)
                 .map(|list| list.iter().any(|(mid_item, _)| mid_item == &mid))
@@ -1338,7 +1277,11 @@ impl RustleApp {
                 peer_id,
                 mid,
                 was_sent,
-                self.pending_acks.get(peer_id).map(|l| l.len()).unwrap_or(0)
+                self.delivery
+                    .pending_acks
+                    .get(peer_id)
+                    .map(|l| l.len())
+                    .unwrap_or(0)
             );
 
             if was_sent {
@@ -1355,7 +1298,7 @@ impl RustleApp {
                 }
                 self.update_history_pending(peer_id, &mid, false);
                 // remove from offline queue if any
-                if let Some(queue) = self.offline_msgs.get_mut(peer_id) {
+                if let Some(queue) = self.delivery.offline_msgs.get_mut(peer_id) {
                     queue.retain(|q| q.msg_id.as_deref() != Some(&mid));
                 }
             } else {
@@ -1371,7 +1314,7 @@ impl RustleApp {
                     }
                 }
 
-                if let Some(queue) = self.offline_msgs.get_mut(peer_id) {
+                if let Some(queue) = self.delivery.offline_msgs.get_mut(peer_id) {
                     if !queue
                         .iter()
                         .any(|q| q.msg_id.as_deref() == Some(&mid) && q.text == text)
@@ -1386,7 +1329,7 @@ impl RustleApp {
                         });
                     }
                 } else {
-                    self.offline_msgs.insert(
+                    self.delivery.offline_msgs.insert(
                         peer_id.to_string(),
                         vec![QueuedMsg {
                             text: text.clone(),
@@ -1582,7 +1525,7 @@ impl RustleApp {
                             has_unread: false,
                         });
                         self.messages.entry(kp.id.clone()).or_default();
-                        self.offline_msgs.entry(kp.id.clone()).or_default();
+                        self.delivery.offline_msgs.entry(kp.id.clone()).or_default();
                         self.known_dirty = true;
                     }
                 }
@@ -1726,7 +1669,8 @@ impl RustleApp {
             );
         } else {
             // 离线：排队，并且如果已有地址尝试一次乐观发送
-            self.offline_msgs
+            self.delivery
+                .offline_msgs
                 .entry(id.to_string())
                 .or_default()
                 .push(QueuedMsg {
@@ -1794,7 +1738,11 @@ impl RustleApp {
 
         let mut mark_pending_ack = |peer_id: &str, msg_id: &str| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            let list = self.pending_acks.entry(peer_id.to_string()).or_default();
+            let list = self
+                .delivery
+                .pending_acks
+                .entry(peer_id.to_string())
+                .or_default();
             if let Some((_, existing_deadline)) = list.iter_mut().find(|(mid, _)| mid == msg_id) {
                 *existing_deadline = deadline;
             } else {
@@ -2008,7 +1956,8 @@ impl RustleApp {
             }
 
             if !sent {
-                self.offline_msgs
+                self.delivery
+                    .offline_msgs
                     .entry(id.clone())
                     .or_default()
                     .push(QueuedMsg {
@@ -2588,7 +2537,7 @@ impl eframe::App for RustleApp {
                                 has_unread: false,
                             });
                             self.messages.entry(key.clone()).or_default();
-                            self.offline_msgs.entry(key.clone()).or_default();
+                            self.delivery.offline_msgs.entry(key.clone()).or_default();
                             self.known_dirty = true;
                             if self.selected_user_id.is_none() {
                                 self.selected_user_id = Some(key.clone());
@@ -2611,13 +2560,8 @@ impl eframe::App for RustleApp {
                     } => {
                         let key = from_id.clone();
 
-                        if !self.received_msg_ids.contains(&msg_id) {
-                            self.received_msg_ids.insert(msg_id.clone());
-                            if self.received_msg_ids.len() > 1000 {
-                                self.received_msg_ids.clear();
-                                self.received_msg_ids.insert(msg_id.clone());
-                            }
-
+                        if self.delivery.mark_received_message(&msg_id) {
+                            self.persist_runtime_state();
                             let msgs = self.messages.entry(key.clone()).or_default();
                             msgs.push(ChatMessage {
                                 from_me: false,
@@ -2703,7 +2647,7 @@ impl eframe::App for RustleApp {
                                 best_interface: Some(local_ip.clone()),
                                 has_unread: self.selected_user_id.as_deref() != Some(&key),
                             });
-                            self.offline_msgs.entry(key.clone()).or_default();
+                            self.delivery.offline_msgs.entry(key.clone()).or_default();
                             self.known_dirty = true;
                             self.flush_offline_queue(&key, Some(&ip_clone), Some(port_clone));
                             self.flush_offline_sync(&key, Some(&ip_clone));
@@ -2714,7 +2658,7 @@ impl eframe::App for RustleApp {
                         }
                     }
                     PeerEvent::ChatAck { from_id, msg_id } => {
-                        if let Some(list) = self.pending_acks.get_mut(&from_id) {
+                        if let Some(list) = self.delivery.pending_acks.get_mut(&from_id) {
                             list.retain(|(mid, _)| mid != &msg_id);
                         }
                         // 更新用户最优接口（能收到 ACK 的接口）
@@ -2742,7 +2686,7 @@ impl eframe::App for RustleApp {
                             }
                         }
                         self.update_history_ack(&from_id, &msg_id, &ack_ts);
-                        if let Some(queue) = self.offline_msgs.get_mut(&from_id) {
+                        if let Some(queue) = self.delivery.offline_msgs.get_mut(&from_id) {
                             queue.retain(|q| q.msg_id.as_deref() != Some(&msg_id));
                         }
                         self.persist_runtime_state();
@@ -3132,7 +3076,10 @@ impl eframe::App for RustleApp {
                                 has_unread: false,
                             });
                             self.messages.entry(from_id.clone()).or_default();
-                            self.offline_msgs.entry(from_id.clone()).or_default();
+                            self.delivery
+                                .offline_msgs
+                                .entry(from_id.clone())
+                                .or_default();
                             self.known_dirty = true;
                             if let Some(name) = from_name.clone() {
                                 pending_name_updates.push((
@@ -3190,7 +3137,7 @@ impl eframe::App for RustleApp {
                                     has_unread: false,
                                 });
                                 self.messages.entry(p.id.clone()).or_default();
-                                self.offline_msgs.entry(p.id.clone()).or_default();
+                                self.delivery.offline_msgs.entry(p.id.clone()).or_default();
                                 self.known_dirty = true;
                                 if p.name.is_some() {
                                     pending_name_updates.push((
@@ -3255,7 +3202,7 @@ impl eframe::App for RustleApp {
                                 has_unread: false,
                             });
                             self.messages.entry(id.clone()).or_default();
-                            self.offline_msgs.entry(id.clone()).or_default();
+                            self.delivery.offline_msgs.entry(id.clone()).or_default();
                             self.known_dirty = true;
                         }
                     }
@@ -3288,7 +3235,7 @@ impl eframe::App for RustleApp {
                                 has_unread: false,
                             });
                             self.messages.entry(id.clone()).or_default();
-                            self.offline_msgs.entry(id.clone()).or_default();
+                            self.delivery.offline_msgs.entry(id.clone()).or_default();
                             self.known_dirty = true;
                             self.name_source.insert(id.clone(), NameSource::Direct);
                         }
@@ -3472,8 +3419,8 @@ impl eframe::App for RustleApp {
             if let Some(index) = self.users.iter().position(|u| u.id == id_to_delete) {
                 self.users.remove(index);
                 self.messages.remove(&id_to_delete);
-                self.offline_msgs.remove(&id_to_delete);
-                self.pending_acks.remove(&id_to_delete);
+                self.delivery.offline_msgs.remove(&id_to_delete);
+                self.delivery.pending_acks.remove(&id_to_delete);
                 self.peers.remove(&id_to_delete);
 
                 self.logged_incoming_files
@@ -3923,7 +3870,7 @@ impl eframe::App for RustleApp {
         // 检查待确认消息超时
         let now_instant = Instant::now();
         let mut timeouts: Vec<(String, String)> = Vec::new();
-        for (peer, list) in self.pending_acks.iter() {
+        for (peer, list) in self.delivery.pending_acks.iter() {
             for (msg_id, deadline) in list.iter() {
                 if now_instant > *deadline {
                     timeouts.push((peer.clone(), msg_id.clone()));
@@ -3947,7 +3894,7 @@ impl eframe::App for RustleApp {
                 }
 
                 if let Some((text, send_ts)) = offline_data {
-                    let queue = self.offline_msgs.entry(peer.clone()).or_default();
+                    let queue = self.delivery.offline_msgs.entry(peer.clone()).or_default();
                     let exists = queue
                         .iter()
                         .any(|q| q.msg_id.as_deref() == Some(msg_id.as_str()));
@@ -3967,7 +3914,7 @@ impl eframe::App for RustleApp {
                 self.mark_offline(peer);
             }
             for (peer, msg_id) in timeouts {
-                if let Some(list) = self.pending_acks.get_mut(&peer) {
+                if let Some(list) = self.delivery.pending_acks.get_mut(&peer) {
                     list.retain(|(mid, _)| mid != &msg_id);
                 }
             }
