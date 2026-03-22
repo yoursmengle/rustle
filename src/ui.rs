@@ -2,27 +2,33 @@ use crate::debug_println;
 use crate::delivery::DeliveryState;
 use crate::history;
 use crate::model::{
-    ChatMessage, KnownPeer, NetCmd, Peer, PeerEvent, QueuedMsg, SyncNode, SyncStatus, SyncTree,
-    User, KNOWN_PEERS_FILE, TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT, UDP_MESSAGE_PORT,
+    ChatMessage, KnownPeer, NetCmd, Peer, PeerEvent, SyncNode, SyncTree, User, KNOWN_PEERS_FILE,
+    TCP_DIR_PORT, TCP_FILE_PORT, UDP_DISCOVERY_PORT,
 };
 use crate::net::spawn_network_worker;
 use crate::storage::{
-    data_path, default_download_dir, file_mtime_seconds, load_or_init_node_id, load_settings,
-    load_sync_tree, save_settings, save_sync_tree, sha256_file, AppSettings,
+    data_path, file_mtime_seconds, load_or_init_node_id, load_settings, load_sync_tree,
+    save_sync_tree, sha256_file, AppSettings,
 };
 use chrono::Local;
 use eframe::egui;
 use rfd::FileDialog;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{NetworkExt, SystemExt};
-use uuid::Uuid;
+mod delivery_flow;
+mod dialog_flow;
+mod message_flow;
+mod metadata_flow;
+mod peer_flow;
+mod render_flow;
+mod runtime_flow;
+mod transfer_flow;
 
 // Theme colors for professional UI - Modern elegant design
 #[allow(dead_code)]
@@ -235,11 +241,7 @@ pub fn run() -> eframe::Result<()> {
             // 启动时加载自动同步树
             app.load_sync_tree();
             // 加载 metadata cache
-            if let Ok(store) = crate::metadata::MetadataStore::open_default() {
-                if let Ok(items) = store.get_all() {
-                    app.meta_list = items.iter().map(|m| MetadataView::from(m)).collect();
-                }
-            }
+            app.refresh_metadata_cache();
             // 默认不显示同步管理窗口
             app.show_sync_window = false;
 
@@ -391,6 +393,20 @@ enum NameSource {
 struct SyncScanResult {
     tree: SyncTree,
     changes: Vec<SyncTransfer>,
+}
+
+type PendingHistoryLog = (String, String, String, Option<String>);
+type PendingHistorySync = (String, Option<String>, String, bool);
+type PendingHistoryPathUpdate = (String, Option<String>, String);
+type PendingHistoryNeedsSyncUpdate = (String, Option<String>, bool);
+
+#[derive(Default)]
+struct FileProgressHistoryEffects {
+    pending_log: Option<PendingHistoryLog>,
+    pending_sync: Option<PendingHistorySync>,
+    pending_file_done: Option<PendingHistorySync>,
+    pending_path_update: Option<PendingHistoryPathUpdate>,
+    pending_needs_sync_update: Option<PendingHistoryNeedsSyncUpdate>,
 }
 
 #[derive(Default)]
@@ -669,13 +685,6 @@ impl RustleApp {
         candidate.to_string()
     }
 
-    fn mark_offline(&mut self, id: &str) {
-        if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
-            u.online = false;
-            self.known_dirty = true;
-        }
-    }
-
     fn update_outgoing_msg_id(&mut self, peer_id: &str, new_id: &str, text: &str) {
         if let Some(msgs) = self.messages.get_mut(peer_id) {
             let mut target = msgs
@@ -707,12 +716,22 @@ impl RustleApp {
         recv_ts: Option<&str>,
         file_path: Option<&str>,
         sync_ts: Option<&str>,
+        transfer_id: Option<&str>,
         msg_id: Option<&str>,
         is_pending: bool,
         needs_sync: bool,
     ) {
         history::log_history(
-            peer_id, from_me, text, send_ts, recv_ts, file_path, sync_ts, msg_id, is_pending,
+            peer_id,
+            from_me,
+            text,
+            send_ts,
+            recv_ts,
+            file_path,
+            sync_ts,
+            transfer_id,
+            msg_id,
+            is_pending,
             needs_sync,
         );
     }
@@ -760,81 +779,6 @@ impl RustleApp {
         }
     }
 
-    // Reload metadata list from sled
-    fn reload_meta_list(&mut self) {
-        if let Ok(store) = crate::metadata::MetadataStore::open_default() {
-            if let Ok(items) = store.get_all() {
-                self.meta_list = items.iter().map(|m| MetadataView::from(m)).collect();
-            }
-        }
-    }
-
-    // Update auto_sync flag for a metadata record
-    fn set_meta_auto(&mut self, id: &str, enabled: bool) {
-        if let Ok(store) = crate::metadata::MetadataStore::open_default() {
-            let _ = store.update_first_matching(|meta| {
-                if meta.id == id {
-                    let mut updated = meta.clone();
-                    updated.auto_sync_enabled = enabled;
-                    Some(updated)
-                } else {
-                    None
-                }
-            });
-        }
-        // refresh cache
-        self.reload_meta_list();
-    }
-
-    // Trigger a manual sync for a metadata record (sends NetCmd::SendFile)
-    fn trigger_sync_for_meta(&mut self, id: &str) {
-        if let Ok(store) = crate::metadata::MetadataStore::open_default() {
-            if let Ok(items) = store.get_all() {
-                if let Some(meta) = items.into_iter().find(|m| m.id == id) {
-                    if meta.is_dir
-                        && !self.peer_supports_reliable_folders(
-                            meta.peer_id.as_deref().unwrap_or_default(),
-                        )
-                    {
-                        return;
-                    }
-                    if let Some(tx) = &self.net_cmd_tx {
-                        if let Some(peer_ip) = meta.peer_ip.clone() {
-                            let tcp_port = if meta.is_dir {
-                                TCP_DIR_PORT
-                            } else {
-                                TCP_FILE_PORT
-                            };
-                            let path = PathBuf::from(meta.abs_path.clone());
-                            let _ = tx.send(NetCmd::SendFile {
-                                peer_id: meta.peer_id.clone().unwrap_or_default(),
-                                ip: peer_ip.clone(),
-                                tcp_port,
-                                path,
-                                transfer_id: Some(meta.id.clone()),
-                                supports_transfer_id: true,
-                                is_dir: meta.is_dir,
-                                via: None,
-                                is_sync: true,
-                            });
-                            let _ = store.update_first_matching(|record| {
-                                if record.id == id {
-                                    let mut updated = record.clone();
-                                    updated.sync_status = SyncStatus::Syncing;
-                                    Some(updated)
-                                } else {
-                                    None
-                                }
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        // refresh cache
-        self.reload_meta_list();
-    }
-
     fn push_peer_list_to_net(&mut self) {
         let Some(tx) = self.net_cmd_tx.clone() else {
             return;
@@ -880,40 +824,6 @@ impl RustleApp {
                     .insert(u.id.clone(), name.to_string());
             }
         }
-    }
-
-    fn flush_offline_name_updates(&mut self, peer_id: &str, ip: Option<&str>) {
-        let Some(ip) = ip else { return };
-        let Some(name) = self.offline_name_updates.remove(peer_id) else {
-            return;
-        };
-        let Some(tx) = self.net_cmd_tx.clone() else {
-            return;
-        };
-        let via = self.get_best_interface_for_peer(ip);
-        let _ = tx.send(NetCmd::SendNameUpdate {
-            ip: ip.to_string(),
-            via,
-            name,
-            local_ip: self.local_ip.clone(),
-        });
-    }
-
-    fn apply_name_update(&mut self, id: &str, new_name: &str, source: NameSource) {
-        if new_name.trim().is_empty() {
-            return;
-        }
-        let existing_source = self.name_source.get(id).copied();
-        if matches!(existing_source, Some(NameSource::Direct)) && source == NameSource::Indirect {
-            return;
-        }
-        if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
-            if u.name != new_name {
-                u.name = new_name.to_string();
-                self.known_dirty = true;
-            }
-        }
-        self.name_source.insert(id.to_string(), source);
     }
 
     fn build_sync_node(path: &PathBuf) -> Option<SyncNode> {
@@ -1051,8 +961,15 @@ impl RustleApp {
         self.sync_dirty = true;
     }
 
-    fn update_history_sync(&self, peer_id: &str, file_path: &str, sync_ts: &str, from_me: bool) {
-        history::update_history_sync(peer_id, file_path, sync_ts, from_me);
+    fn update_history_sync(
+        &self,
+        peer_id: &str,
+        file_path: &str,
+        transfer_id: Option<&str>,
+        sync_ts: &str,
+        from_me: bool,
+    ) {
+        history::update_history_sync(peer_id, file_path, transfer_id, sync_ts, from_me);
     }
 
     fn update_history_ack(&self, peer_id: &str, msg_id: &str, recv_ts: &str) {
@@ -1063,288 +980,37 @@ impl RustleApp {
         &self,
         peer_id: &str,
         file_path: &str,
+        transfer_id: Option<&str>,
         recv_ts: &str,
         from_me: bool,
     ) {
-        history::update_history_file_done(peer_id, file_path, recv_ts, from_me);
+        history::update_history_file_done(peer_id, file_path, transfer_id, recv_ts, from_me);
     }
 
     fn update_history_needs_sync(
         &self,
         peer_id: &str,
         file_path: &str,
+        transfer_id: Option<&str>,
         needs_sync: bool,
         from_me: bool,
     ) {
-        history::update_history_needs_sync(peer_id, file_path, needs_sync, from_me);
+        history::update_history_needs_sync(peer_id, file_path, transfer_id, needs_sync, from_me);
     }
 
     fn update_history_file_path(
         &self,
         peer_id: &str,
         file_name: &str,
+        transfer_id: Option<&str>,
         new_path: &str,
         from_me: bool,
     ) {
-        history::update_history_file_path(peer_id, file_name, new_path, from_me);
+        history::update_history_file_path(peer_id, file_name, transfer_id, new_path, from_me);
     }
 
     fn update_history_pending(&self, peer_id: &str, msg_id: &str, is_pending: bool) {
         history::update_history_pending(peer_id, msg_id, is_pending);
-    }
-
-    fn flush_offline_queue(&mut self, peer_id: &str, ip: Option<&str>, port: Option<u16>) {
-        let Some(ip) = ip else { return };
-        let Some(port) = port else { return };
-        let Some(tx) = self.net_cmd_tx.clone() else {
-            return;
-        };
-        if let Some(queue) = self.delivery.offline_msgs.get_mut(peer_id) {
-            if queue.is_empty() {
-                return;
-            }
-            let drained: Vec<QueuedMsg> = queue.drain(..).collect();
-            let mut remain = Vec::new();
-
-            // 使用统一的接口选择逻辑
-            let via = self.get_best_interface_for_peer(ip);
-
-            for msg in drained {
-                if let Some(path) = &msg.file_path {
-                    if msg.is_dir && !self.peer_supports_reliable_folders(peer_id) {
-                        remain.push(msg);
-                        continue;
-                    }
-                    let target_tcp_port = if msg.is_dir {
-                        TCP_DIR_PORT
-                    } else {
-                        TCP_FILE_PORT
-                    };
-                    if tx
-                        .send(NetCmd::SendFile {
-                            peer_id: peer_id.to_string(),
-                            ip: ip.to_string(),
-                            tcp_port: target_tcp_port,
-                            path: path.clone(),
-                            transfer_id: msg.transfer_id.clone(),
-                            supports_transfer_id: self.peer_supports_transfer_id(peer_id),
-                            is_dir: msg.is_dir,
-                            via: via.clone(),
-                            is_sync: false,
-                        })
-                        .is_err()
-                    {
-                        remain.push(msg);
-                    }
-                } else {
-                    let mid = msg
-                        .msg_id
-                        .clone()
-                        .unwrap_or_else(|| Uuid::new_v4().to_string());
-                    debug_println!(
-                        "Flushing offline queue for {} mid={} text={}",
-                        peer_id,
-                        mid,
-                        msg.text
-                    );
-                    self.update_outgoing_msg_id(peer_id, &mid, &msg.text);
-
-                    // 使用重试机制发送消息
-                    self.try_send_message_with_retry(
-                        peer_id,
-                        ip,
-                        port,
-                        &msg.text,
-                        &msg.send_ts,
-                        &mid,
-                        via.clone(),
-                    );
-
-                    let sent = self
-                        .delivery
-                        .pending_acks
-                        .get(peer_id)
-                        .map(|list| list.iter().any(|(mid_item, _)| mid_item == &mid))
-                        .unwrap_or(false);
-                    debug_println!(
-                        "Flush result for {} mid={} sent={} pending_acks_count={}",
-                        peer_id,
-                        mid,
-                        sent,
-                        self.delivery
-                            .pending_acks
-                            .get(peer_id)
-                            .map(|l| l.len())
-                            .unwrap_or(0)
-                    );
-                    self.update_history_pending(peer_id, &mid, !sent);
-                }
-            }
-            if !remain.is_empty() {
-                self.delivery
-                    .offline_msgs
-                    .insert(peer_id.to_string(), remain);
-            }
-        }
-        self.persist_runtime_state();
-    }
-
-    fn flush_offline_sync(&mut self, peer_id: &str, ip: Option<&str>) {
-        let Some(ip) = ip else { return };
-        let Some(tx) = self.net_cmd_tx.clone() else {
-            return;
-        };
-        if let Some(queue) = self.offline_sync.get_mut(peer_id) {
-            if queue.is_empty() {
-                return;
-            }
-            let drained: Vec<SyncTransfer> = queue.drain(..).collect();
-            let mut remain = Vec::new();
-            let via = self.get_best_interface_for_peer(ip);
-            for item in drained {
-                if item.is_dir && !self.peer_supports_reliable_folders(peer_id) {
-                    remain.push(item);
-                    continue;
-                }
-                let target_tcp_port = if item.is_dir {
-                    TCP_DIR_PORT
-                } else {
-                    TCP_FILE_PORT
-                };
-                if tx
-                    .send(NetCmd::SendFile {
-                        peer_id: peer_id.to_string(),
-                        ip: ip.to_string(),
-                        tcp_port: target_tcp_port,
-                        path: item.path.clone(),
-                        transfer_id: None,
-                        supports_transfer_id: true,
-                        is_dir: item.is_dir,
-                        via: via.clone(),
-                        is_sync: true,
-                    })
-                    .is_err()
-                {
-                    remain.push(item);
-                }
-            }
-            if !remain.is_empty() {
-                self.offline_sync.insert(peer_id.to_string(), remain);
-            }
-        }
-    }
-
-    fn resend_pending_for_peer(&mut self, peer_id: &str, ip: &str, port: u16) {
-        // Collect pending messages and prepare them for sending to avoid holding a mutable borrow
-        let via = self.get_best_interface_for_peer(ip);
-        let mut to_send: Vec<(String, String, String)> = Vec::new(); // (mid, text, send_ts)
-
-        if let Some(msgs) = self.messages.get_mut(peer_id) {
-            for m in msgs.iter_mut() {
-                if m.from_me && m.is_pending {
-                    let mid = m
-                        .msg_id
-                        .clone()
-                        .unwrap_or_else(|| Uuid::new_v4().to_string());
-                    m.msg_id = Some(mid.clone());
-                    // mark as sending (optimistic)
-                    m.transfer_status = Some("发送中...".to_string());
-                    // keep pending until we see ack
-                    to_send.push((mid, m.text.clone(), m.send_ts.clone()));
-                }
-            }
-        }
-
-        // Now release the borrow on messages and actually attempt sends
-        for (mid, text, send_ts) in to_send {
-            debug_println!(
-                "Resend pending message to {}: mid={} text={}",
-                peer_id,
-                mid,
-                text
-            );
-            self.try_send_message_with_retry(peer_id, ip, port, &text, &send_ts, &mid, via.clone());
-
-            // see if it was enqueued for ack
-            let was_sent = self
-                .delivery
-                .pending_acks
-                .get(peer_id)
-                .map(|list| list.iter().any(|(mid_item, _)| mid_item == &mid))
-                .unwrap_or(false);
-            debug_println!(
-                "Resend result for {} mid={} sent={} pending_acks_count={}",
-                peer_id,
-                mid,
-                was_sent,
-                self.delivery
-                    .pending_acks
-                    .get(peer_id)
-                    .map(|l| l.len())
-                    .unwrap_or(0)
-            );
-
-            if was_sent {
-                // update message state
-                if let Some(msgs) = self.messages.get_mut(peer_id) {
-                    if let Some(m) = msgs
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.msg_id.as_deref() == Some(&mid))
-                    {
-                        m.is_pending = false;
-                        m.transfer_status = Some("发送中...".to_string());
-                    }
-                }
-                self.update_history_pending(peer_id, &mid, false);
-                // remove from offline queue if any
-                if let Some(queue) = self.delivery.offline_msgs.get_mut(peer_id) {
-                    queue.retain(|q| q.msg_id.as_deref() != Some(&mid));
-                }
-            } else {
-                // still not sent, ensure it's queued for offline send and state reflects waiting
-                if let Some(msgs) = self.messages.get_mut(peer_id) {
-                    if let Some(m) = msgs
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.msg_id.as_deref() == Some(&mid))
-                    {
-                        m.transfer_status = Some("等待对方上线...".to_string());
-                        m.is_pending = true;
-                    }
-                }
-
-                if let Some(queue) = self.delivery.offline_msgs.get_mut(peer_id) {
-                    if !queue
-                        .iter()
-                        .any(|q| q.msg_id.as_deref() == Some(&mid) && q.text == text)
-                    {
-                        queue.push(QueuedMsg {
-                            text: text.clone(),
-                            send_ts: send_ts.clone(),
-                            msg_id: Some(mid.clone()),
-                            file_path: None,
-                            transfer_id: None,
-                            is_dir: false,
-                        });
-                    }
-                } else {
-                    self.delivery.offline_msgs.insert(
-                        peer_id.to_string(),
-                        vec![QueuedMsg {
-                            text: text.clone(),
-                            send_ts: send_ts.clone(),
-                            msg_id: Some(mid.clone()),
-                            file_path: None,
-                            transfer_id: None,
-                            is_dir: false,
-                        }],
-                    );
-                }
-                self.update_history_pending(peer_id, &mid, true);
-            }
-        }
-        self.persist_runtime_state();
     }
 
     fn scan_node_for_changes(node: &mut SyncNode) -> bool {
@@ -1559,48 +1225,6 @@ impl RustleApp {
         self.known_dirty = false;
     }
 
-    fn merge_users_by_id(&mut self) {
-        let before = self.users.len();
-        let mut first: HashMap<String, usize> = HashMap::new();
-        let mut i = 0;
-        while i < self.users.len() {
-            let id = self.users[i].id.clone();
-            if let Some(&keep_idx) = first.get(&id) {
-                let dup = self.users.remove(i);
-                let primary = &mut self.users[keep_idx];
-                primary.online |= dup.online;
-                if primary.ip.is_none() {
-                    primary.ip = dup.ip.clone();
-                }
-                if primary.port.is_none() {
-                    primary.port = dup.port;
-                }
-                if primary.tcp_port.is_none() {
-                    primary.tcp_port = dup.tcp_port;
-                }
-                if primary.bound_interface.is_none() {
-                    primary.bound_interface = dup.bound_interface.clone();
-                }
-                if primary.best_interface.is_none() {
-                    primary.best_interface = dup.best_interface.clone();
-                }
-                primary.has_unread |= dup.has_unread;
-                if primary.name.trim().is_empty() || primary.name == primary.id {
-                    if !dup.name.trim().is_empty() {
-                        primary.name = dup.name;
-                    }
-                }
-                continue;
-            } else {
-                first.insert(id, i);
-                i += 1;
-            }
-        }
-        if before != self.users.len() {
-            self.known_dirty = true;
-        }
-    }
-
     fn selected_user_name(&self) -> String {
         let Some(id) = &self.selected_user_id else {
             return "选择联系人".to_string();
@@ -1610,236 +1234,6 @@ impl RustleApp {
             .find(|u| &u.id == id)
             .map(|u| u.name.clone())
             .unwrap_or_else(|| "选择联系人".to_string())
-    }
-
-    fn send_message_internal(&mut self, id: &str, text: String) {
-        let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let msg_id = Uuid::new_v4().to_string();
-
-        // 本地追加
-        self.messages
-            .entry(id.to_string())
-            .or_default()
-            .push(ChatMessage {
-                from_me: true,
-                text: text.clone(),
-                send_ts: ts.clone(),
-                recv_ts: None,
-                last_sync_ts: None,
-                file_path: None,
-                transfer_id: None,
-                transfer_status: Some("发送中...".to_string()),
-                msg_id: Some(msg_id.clone()),
-                is_read: true,
-                is_pending: false,
-                needs_sync: false,
-            });
-
-        let Some(u) = self.users.iter().find(|u| u.id == id) else {
-            return;
-        };
-        let online = u.online;
-        let ip = u.ip.clone();
-        let port = u.port;
-
-        // 使用统一的接口选择逻辑
-        let via = if let Some(target_ip) = &ip {
-            self.get_best_interface_for_peer(target_ip)
-        } else {
-            None
-        };
-
-        let has_addr = ip.is_some() && port.is_some();
-
-        if online && has_addr {
-            if let (Some(ip), Some(port)) = (ip.as_deref(), port) {
-                self.try_send_message_with_retry(id, &ip, port, &text, &ts, &msg_id, via);
-            }
-            self.log_history(
-                id,
-                true,
-                &text,
-                &ts,
-                None,
-                None,
-                None,
-                Some(&msg_id),
-                false,
-                false,
-            );
-        } else {
-            // 离线：排队，并且如果已有地址尝试一次乐观发送
-            self.delivery
-                .offline_msgs
-                .entry(id.to_string())
-                .or_default()
-                .push(QueuedMsg {
-                    text: text.to_string(),
-                    send_ts: ts.clone(),
-                    msg_id: Some(msg_id.clone()),
-                    file_path: None,
-                    transfer_id: None,
-                    is_dir: false,
-                });
-
-            if has_addr {
-                if let (Some(ip), Some(port)) = (ip.as_deref(), port) {
-                    if let Some(local) = self.local_ip.as_deref() {
-                        if Self::same_lan(local, ip) {
-                            self.try_send_message_with_retry(
-                                id, &ip, port, &text, &ts, &msg_id, via,
-                            );
-                        }
-                    }
-                }
-            } else {
-                // 没有地址信息，直接标记为等待上线
-                if let Some(msgs) = self.messages.get_mut(id) {
-                    if let Some(m) = msgs
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.msg_id.as_deref() == Some(&msg_id))
-                    {
-                        m.transfer_status = Some("等待对方上线...".to_string());
-                        m.is_pending = true;
-                    }
-                }
-            }
-
-            // 离线消息：写入历史并标记等待确认
-            self.log_history(
-                id,
-                true,
-                &text,
-                &ts,
-                None,
-                None,
-                None,
-                Some(&msg_id),
-                true,
-                false,
-            );
-        }
-
-        self.persist_runtime_state();
-    }
-
-    fn try_send_message_with_retry(
-        &mut self,
-        peer_id: &str,
-        ip: &str,
-        _port: u16,
-        text: &str,
-        ts: &str,
-        msg_id: &str,
-        preferred_via: Option<String>,
-    ) {
-        let Some(tx) = &self.net_cmd_tx else { return };
-
-        let mut mark_pending_ack = |peer_id: &str, msg_id: &str| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let list = self
-                .delivery
-                .pending_acks
-                .entry(peer_id.to_string())
-                .or_default();
-            if let Some((_, existing_deadline)) = list.iter_mut().find(|(mid, _)| mid == msg_id) {
-                *existing_deadline = deadline;
-            } else {
-                list.push((msg_id.to_string(), deadline));
-            }
-        };
-
-        // 首先尝试使用首选接口发送
-        if let Some(via) = preferred_via {
-            if tx
-                .send(NetCmd::SendChat {
-                    ip: ip.to_string(),
-                    text: text.to_string(),
-                    ts: ts.to_string(),
-                    via: Some(via),
-                    msg_id: msg_id.to_string(),
-                    local_ip: self.local_ip.clone(),
-                })
-                .is_ok()
-            {
-                // 添加到待确认列表（同一 msg_id 去重并刷新超时）
-                mark_pending_ack(peer_id, msg_id);
-                return;
-            }
-        }
-
-        // 如果首选接口失败，尝试所有可用接口
-        // 优先尝试同网段接口，然后尝试其他接口
-        let mut sent = false;
-        let bound_list: Vec<String> = self.bound_interfaces.iter().cloned().collect();
-
-        // 第一轮：尝试同网段接口
-        for bound_ip in &bound_list {
-            if Self::same_lan(bound_ip, ip) {
-                if tx
-                    .send(NetCmd::SendChat {
-                        ip: ip.to_string(),
-                        text: text.to_string(),
-                        ts: ts.to_string(),
-                        via: Some(bound_ip.clone()),
-                        msg_id: msg_id.to_string(),
-                        local_ip: self.local_ip.clone(),
-                    })
-                    .is_ok()
-                {
-                    sent = true;
-                    break;
-                }
-            }
-        }
-
-        // 第二轮：如果同网段失败，尝试所有其他接口
-        if !sent {
-            eprintln!("[发送] 未找到同网段接口 -> {}, 尝试所有可用接口", ip);
-            for bound_ip in &bound_list {
-                if !Self::same_lan(bound_ip, ip) {
-                    if tx
-                        .send(NetCmd::SendChat {
-                            ip: ip.to_string(),
-                            text: text.to_string(),
-                            ts: ts.to_string(),
-                            via: Some(bound_ip.clone()),
-                            msg_id: msg_id.to_string(),
-                            local_ip: self.local_ip.clone(),
-                        })
-                        .is_ok()
-                    {
-                        eprintln!("[发送] 使用跨网段接口 {} -> {} 发送成功", bound_ip, ip);
-                        sent = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if sent {
-            // 添加到待确认列表（同一 msg_id 去重并刷新超时）
-            mark_pending_ack(peer_id, msg_id);
-        } else {
-            eprintln!(
-                "[发送失败] 无可用接口发送到 {} (绑定接口数: {})",
-                ip,
-                self.bound_interfaces.len()
-            );
-            if let Some(msgs) = self.messages.get_mut(peer_id) {
-                if let Some(m) = msgs
-                    .iter_mut()
-                    .rev()
-                    .find(|m| m.msg_id.as_deref() == Some(msg_id))
-                {
-                    m.transfer_status = Some("未送达".to_string());
-                    m.is_pending = true;
-                }
-            }
-        }
-
-        self.persist_runtime_state();
     }
 
     fn send_current(&mut self) {
@@ -1852,158 +1246,6 @@ impl RustleApp {
             self.scroll_to_bottom = true;
         }
         self.input.clear();
-    }
-
-    fn append_file_message(&mut self, path: &PathBuf, is_dir: bool) {
-        if let Some(id) = self.selected_user_id.clone() {
-            self.scroll_to_bottom = true;
-            let (ip, via, online) = {
-                let Some(user) = self.users.iter().find(|u| u.id == id) else {
-                    return;
-                };
-                let via = if let Some(target_ip) = &user.ip {
-                    self.get_best_interface_for_peer(target_ip)
-                } else {
-                    None
-                };
-                (user.ip.clone(), via, user.online)
-            };
-
-            let target_tcp_port = if is_dir { TCP_DIR_PORT } else { TCP_FILE_PORT };
-
-            if is_dir {
-                let supports_reliable = self
-                    .users
-                    .iter()
-                    .find(|u| u.id == id)
-                    .map(|u| u.supports_reliable_folders)
-                    .unwrap_or(false);
-                if !supports_reliable {
-                    let text = format!(
-                        "📁 {}",
-                        path.file_name().and_then(|n| n.to_str()).unwrap_or("item")
-                    );
-                    let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                    let msgs = self.messages.entry(id.clone()).or_default();
-                    msgs.push(ChatMessage {
-                        from_me: true,
-                        text: text.clone(),
-                        send_ts: ts.clone(),
-                        recv_ts: None,
-                        last_sync_ts: None,
-                        file_path: Some(path.to_string_lossy().to_string()),
-                        transfer_id: None,
-                        transfer_status: Some("发送失败：对方版本不支持可靠目录传输".to_string()),
-                        msg_id: None,
-                        is_read: true,
-                        is_pending: false,
-                        needs_sync: false,
-                    });
-                    self.log_history(
-                        &id,
-                        true,
-                        &text,
-                        &ts,
-                        None,
-                        Some(&path.to_string_lossy()),
-                        None,
-                        None,
-                        false,
-                        false,
-                    );
-                    return;
-                }
-            }
-
-            let icon = if is_dir { "📁" } else { "📄" };
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
-
-            self.track_sync_source(&id, path);
-
-            let text = format!("{} {}", icon, name);
-            let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let transfer_id = Some(Uuid::new_v4().to_string());
-
-            let mut sent = false;
-            if online {
-                if let Some(ip) = ip {
-                    if let Some(tx) = &self.net_cmd_tx {
-                        let supports_transfer_id = self.peer_supports_transfer_id(&id);
-                        if tx
-                            .send(NetCmd::SendFile {
-                                peer_id: id.clone(),
-                                ip: ip.clone(),
-                                tcp_port: target_tcp_port,
-                                path: path.clone(),
-                                transfer_id: if supports_transfer_id {
-                                    transfer_id.clone()
-                                } else {
-                                    None
-                                },
-                                supports_transfer_id,
-                                is_dir,
-                                via: via.clone(),
-                                is_sync: false,
-                            })
-                            .is_ok()
-                        {
-                            sent = true;
-                        } else {
-                            self.mark_offline(&id);
-                        }
-                    }
-                }
-            }
-
-            if !sent {
-                self.delivery
-                    .offline_msgs
-                    .entry(id.clone())
-                    .or_default()
-                    .push(QueuedMsg {
-                        text: text.clone(),
-                        send_ts: ts.clone(),
-                        msg_id: None,
-                        file_path: Some(path.clone()),
-                        transfer_id: transfer_id.clone(),
-                        is_dir,
-                    });
-            }
-
-            let msgs = self.messages.entry(id.clone()).or_default();
-            let needs_sync = self.settings.auto_sync_on_send;
-            msgs.push(ChatMessage {
-                from_me: true,
-                text: text.clone(),
-                send_ts: ts.clone(),
-                recv_ts: None,
-                last_sync_ts: None,
-                file_path: Some(path.to_string_lossy().to_string()),
-                transfer_id: transfer_id.clone(),
-                transfer_status: Some(if sent {
-                    "发送中...".to_string()
-                } else {
-                    "等待对方上线...".to_string()
-                }),
-                msg_id: None,
-                is_read: true,
-                is_pending: !sent,
-                needs_sync,
-            });
-
-            self.log_history(
-                &id,
-                true,
-                &text,
-                &ts,
-                None,
-                Some(&path.to_string_lossy()),
-                None,
-                None,
-                !sent,
-                needs_sync,
-            );
-        }
     }
 
     fn pick_and_send(&mut self, pick_folder: bool) {
@@ -2128,274 +1370,12 @@ impl eframe::App for RustleApp {
             }
         }
 
-        // 设置窗口
-        let mut show_settings = self.show_settings_window;
-        if show_settings {
-            egui::Window::new("设置")
-                .open(&mut show_settings)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    let mut changed = false;
+        self.render_settings_dialog(ctx);
+        self.render_usage_dialog(ctx);
+        self.render_about_dialog(ctx);
+        self.render_update_dialog(ctx);
 
-                    ui.label("历史记录保存天数");
-                    let mut days = self.settings.history_days.max(1);
-                    if ui
-                        .add(egui::DragValue::new(&mut days).range(1..=3650))
-                        .changed()
-                    {
-                        self.settings.history_days = days;
-                        changed = true;
-                    }
-
-                    ui.add_space(6.0);
-                    ui.label("接收文件夹");
-                    ui.horizontal(|ui| {
-                        let resp = ui.text_edit_singleline(&mut self.settings_recv_dir_input);
-                        if resp.changed() {
-                            changed = true;
-                        }
-                        let mut pending_folder_select = false;
-                        if ui.button("选择...").clicked() {
-                            pending_folder_select = true;
-                        }
-                        if pending_folder_select {
-                            use std::sync::mpsc;
-                            let (tx, rx) = mpsc::channel();
-                            std::thread::spawn(move || {
-                                let path = FileDialog::new().pick_folder();
-                                let _ = tx.send(path);
-                            });
-                            if let Ok(Some(path)) = rx.recv() {
-                                self.settings_recv_dir_input = path.to_string_lossy().to_string();
-                                changed = true;
-                            }
-                        }
-                        if ui.button("恢复默认").clicked() {
-                            let def = crate::storage::default_download_dir();
-                            self.settings_recv_dir_input = def.to_string_lossy().to_string();
-                            changed = true;
-                        }
-                    });
-
-                    ui.add_space(6.0);
-                    if ui
-                        .checkbox(
-                            &mut self.settings.auto_sync_on_send,
-                            "发送文件/文件夹自动同步",
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
-
-                    if ui
-                        .checkbox(&mut self.settings.auto_check_update, "启动时检查更新")
-                        .changed()
-                    {
-                        changed = true;
-                    }
-
-                    ui.add_space(6.0);
-                    ui.label("首选发送网卡");
-                    let mut interfaces: Vec<String> =
-                        self.bound_interfaces.iter().cloned().collect();
-                    interfaces.sort();
-                    let current_label = self
-                        .settings
-                        .preferred_interface
-                        .as_deref()
-                        .unwrap_or("自动");
-                    egui::ComboBox::from_id_salt("preferred_iface")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_value(
-                                    &mut self.settings.preferred_interface,
-                                    None,
-                                    "自动",
-                                )
-                                .clicked()
-                            {
-                                changed = true;
-                            }
-                            for iface in interfaces {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.settings.preferred_interface,
-                                        Some(iface.clone()),
-                                        iface.clone(),
-                                    )
-                                    .clicked()
-                                {
-                                    changed = true;
-                                }
-                            }
-                        });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    ui.label("本机显示名称");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.settings_name_input));
-                        if ui.button("保存名称").clicked() {
-                            let name = self.settings_name_input.trim();
-                            if !name.is_empty() {
-                                if fs::write(data_path("me.txt"), name).is_ok() {
-                                    self.me_name = Some(name.to_string());
-                                    if let Some(tx) = &self.net_cmd_tx {
-                                        let _ = tx.send(NetCmd::ChangeName(
-                                            self.me_name.clone().unwrap_or_default(),
-                                        ));
-                                    }
-                                    if let Some(name) = self.me_name.clone() {
-                                        self.send_name_update_to_all(&name);
-                                    }
-                                }
-                            }
-                        }
-                    });
-
-                    if changed {
-                        let recv = self.settings_recv_dir_input.trim().to_string();
-                        self.settings.recv_dir = if recv.is_empty() { None } else { Some(recv) };
-                        if let Some(dir) = self.settings.recv_dir.as_ref() {
-                            let _ = fs::create_dir_all(dir);
-                        }
-                        save_settings(&self.settings);
-                    }
-                });
-            self.show_settings_window = show_settings;
-        }
-
-        // 使用说明窗口
-        let mut show_usage = self.show_usage_window;
-        if show_usage {
-            egui::Window::new("使用说明").open(&mut show_usage).show(ctx, |ui| {
-                ui.label(egui::RichText::new("Rustle (如梭) 使用说明").heading());
-                ui.add_space(10.0);
-                ui.label("1. 节点发现：\n   软件启动会自动发现局域网内的其他 Rustle 节点。无需配置。");
-                ui.add_space(5.0);
-                ui.label("2. 发送消息：\n   点击左侧列表中的用户，在右侧输入框输入文字并回车即可发送。");
-                ui.add_space(5.0);
-                ui.label("3. 文件传输：\n   直接将文件或文件夹拖入聊天窗口即可发送给当前选中的用户。");
-                ui.add_space(5.0);
-            });
-            self.show_usage_window = show_usage;
-        }
-
-        // 关于窗口
-        let mut show_about = self.show_about_window;
-        if show_about {
-            egui::Window::new("关于")
-                .open(&mut show_about)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label(egui::RichText::new("Rustle (如梭)").heading());
-                    ui.add_space(6.0);
-                    ui.label(format!("版本号: {}", crate::APP_VERSION));
-                });
-            self.show_about_window = show_about;
-        }
-
-        // 升级窗口
-        let mut show_update = self.show_update_dialog;
-        if show_update {
-            egui::Window::new("软件升级")
-                .open(&mut show_update)
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    if self.is_checking_update {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("正在检查新版本...");
-                        });
-                    } else if let Some((ver, url)) = &self.new_version_info {
-                        let current = env!("CARGO_PKG_VERSION");
-                        let ver_clean = ver.trim_start_matches('v');
-
-                        if ver_clean != current {
-                            ui.label(format!("发现新版本: {}", ver));
-                            ui.label(format!("当前版本: {}", current));
-                            ui.add_space(10.0);
-                            if ui.button("前往下载更新").clicked() {
-                                let _ = open::that(url);
-                            }
-                        } else {
-                            ui.label("当前已是最新版本。");
-                            ui.label(format!("版本: {}", current));
-                        }
-                    } else if ui.button("检查更新").clicked() {
-                        let (tx, rx) = mpsc::channel();
-                        self.update_check_rx = Some(rx);
-                        self.is_checking_update = true;
-                        self.new_version_info = None;
-                        spawn_check_update(tx);
-                    }
-                });
-            self.show_update_dialog = show_update;
-        }
-
-        // Sync Manager window
-        let mut show_sync = self.show_sync_window;
-        let mut open = show_sync;
-        egui::Window::new("同步管理")
-            .open(&mut open)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("刷新").clicked() {
-                        self.reload_meta_list();
-                    }
-                    if ui.button("全部同步").clicked() {
-                        // trigger sync for all entries that have peer info
-                        let snapshot = self.meta_list.clone();
-                        for m in snapshot.iter() {
-                            if m.peer_ip.is_some() {
-                                self.trigger_sync_for_meta(&m.id);
-                            }
-                        }
-                    }
-                });
-                ui.separator();
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("meta_grid").striped(true).show(ui, |ui| {
-                        ui.label("文件名");
-                        ui.label("类型");
-                        ui.label("路径");
-                        ui.label("Peer");
-                        ui.label("大小");
-                        ui.label("状态");
-                        ui.label("自动");
-                        ui.label("");
-                        ui.end_row();
-
-                        let snapshot = self.meta_list.clone();
-                        for m in snapshot.iter() {
-                            ui.label(&m.filename);
-                            ui.label(if m.is_dir { "目录" } else { "文件" });
-                            ui.label(&m.abs_path);
-                            let peer_label = m.peer_id.clone().unwrap_or_else(|| "-".to_string());
-                            ui.label(peer_label);
-                            ui.label(format!("{}", m.size));
-                            ui.label(&m.status);
-                            let mut auto = m.auto_sync_enabled;
-                            if ui.add(egui::Checkbox::new(&mut auto, "")).changed() {
-                                self.set_meta_auto(&m.id, auto);
-                            }
-                            if ui.button("同步").clicked() {
-                                self.trigger_sync_for_meta(&m.id);
-                            }
-                            ui.end_row();
-                        }
-                    });
-                });
-            });
-        show_sync = open;
-        self.show_sync_window = show_sync;
+        self.render_sync_manager_dialog(ctx);
 
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
 
@@ -2473,79 +1453,7 @@ impl eframe::App for RustleApp {
             for evt in pending {
                 match evt {
                     PeerEvent::Discovered(peer, local_ip) => {
-                        // 更新 UI 中保存的本地端口（若尚未设置）
-                        if self.local_port.is_none() {
-                            self.local_port = Some(UDP_DISCOVERY_PORT);
-                        }
-
-                        // 使用 peer.id 作为唯一键，避免创建重复联系人（多网卡场景）
-                        let key = peer.id.clone();
-                        let name = peer
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("{}:{}", peer.ip, peer.port));
-
-                        // 更新 peers map（以 peer.id 为键）
-                        self.peers.insert(
-                            key.clone(),
-                            Peer {
-                                id: peer.id.clone(),
-                                ip: peer.ip.clone(),
-                                port: UDP_MESSAGE_PORT,
-                                tcp_port: None,
-                                name: peer.name.clone(),
-                                last_seen: Local::now(),
-                            },
-                        );
-
-                        // 选择更合适的 IP（优先私网/同网段）
-                        let preferred_ip = peer.ip.clone();
-
-                        // 标记为在线并添加/更新联系人（以 peer.id 为 id）
-                        let (ip_clone, port_clone) = (preferred_ip.clone(), UDP_MESSAGE_PORT);
-                        self.maybe_switch_primary_interface(&local_ip, &peer.ip);
-                        if let Some(u) = self.users.iter_mut().find(|u| u.id == key) {
-                            u.online = true;
-                            u.name = name.clone();
-                            u.ip = Some(ip_clone.clone());
-                            u.port = Some(port_clone);
-                            u.tcp_port = None;
-                            u.protocol_version = Some(peer.version.clone());
-                            u.supports_reliable_folders = peer.supports_reliable_folders;
-                            u.bound_interface = Some(local_ip.clone());
-                            u.best_interface = Some(local_ip.clone());
-                            self.known_dirty = true;
-                            let peer_id = u.id.clone();
-                            let ip_opt = u.ip.clone();
-                            let port_opt = u.port;
-                            let _ = u;
-                            self.flush_offline_queue(&peer_id, ip_opt.as_deref(), port_opt);
-                            self.flush_offline_sync(&peer_id, ip_opt.as_deref());
-                            self.flush_offline_name_updates(&peer_id, ip_opt.as_deref());
-                        } else {
-                            self.users.push(User {
-                                id: key.clone(),
-                                name: name.clone(),
-                                online: true,
-                                ip: Some(ip_clone.clone()),
-                                port: Some(port_clone),
-                                tcp_port: None,
-                                protocol_version: Some(peer.version.clone()),
-                                supports_reliable_folders: peer.supports_reliable_folders,
-                                bound_interface: Some(local_ip.clone()),
-                                best_interface: Some(local_ip.clone()),
-                                has_unread: false,
-                            });
-                            self.messages.entry(key.clone()).or_default();
-                            self.delivery.offline_msgs.entry(key.clone()).or_default();
-                            self.known_dirty = true;
-                            if self.selected_user_id.is_none() {
-                                self.selected_user_id = Some(key.clone());
-                            }
-                            self.flush_offline_queue(&key, Some(&ip_clone), Some(port_clone));
-                            self.flush_offline_sync(&key, Some(&ip_clone));
-                            self.flush_offline_name_updates(&key, Some(&ip_clone));
-                        }
+                        self.handle_discovered(peer, local_ip);
                     }
                     PeerEvent::ChatReceived {
                         from_id,
@@ -2558,138 +1466,13 @@ impl eframe::App for RustleApp {
                         msg_id,
                         local_ip,
                     } => {
-                        let key = from_id.clone();
-
-                        if self.delivery.mark_received_message(&msg_id) {
-                            self.persist_runtime_state();
-                            let msgs = self.messages.entry(key.clone()).or_default();
-                            msgs.push(ChatMessage {
-                                from_me: false,
-                                text: text.clone(),
-                                send_ts: send_ts.clone(),
-                                recv_ts: Some(recv_ts.clone()),
-                                last_sync_ts: None,
-                                file_path: None,
-                                transfer_id: None,
-                                transfer_status: None,
-                                msg_id: Some(msg_id.clone()),
-                                is_read: false,
-                                is_pending: false,
-                                needs_sync: false,
-                            });
-                            self.log_history(
-                                &key,
-                                false,
-                                &text,
-                                &send_ts,
-                                Some(&recv_ts),
-                                None,
-                                None,
-                                Some(&msg_id),
-                                false,
-                                false,
-                            );
-
-                            // 触发任务栏闪烁
-                            if !self.has_unread_messages {
-                                self.has_unread_messages = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                                    egui::UserAttentionType::Informational,
-                                ));
-                            }
-
-                            if self.selected_user_id.as_deref() == Some(&key) {
-                                self.scroll_to_bottom = true;
-                            }
-                        }
-
-                        // 确保 contact 存在，并强制更新为当前收信路径
-                        let (ip_clone, port_clone) = (from_ip.clone(), UDP_MESSAGE_PORT);
-                        self.maybe_switch_primary_interface(&local_ip, &from_ip);
-
-                        let mut pending_name_update: Option<String> = None;
-                        if let Some(u) = self.users.iter_mut().find(|u| u.id == key) {
-                            if self.selected_user_id.as_deref() != Some(&key) {
-                                u.has_unread = true;
-                            }
-                            u.online = true;
-                            if u.ip.as_deref() != Some(&ip_clone) {
-                                u.ip = Some(ip_clone.clone());
-                                self.known_dirty = true;
-                            }
-                            pending_name_update = from_name.clone();
-                            u.port = Some(port_clone);
-                            u.bound_interface = Some(local_ip.clone());
-                            u.best_interface = Some(local_ip.clone());
-                            let peer_id = u.id.clone();
-                            let ip_opt = u.ip.clone();
-                            let port_opt = u.port;
-                            let _ = u;
-                            self.flush_offline_queue(&peer_id, ip_opt.as_deref(), port_opt);
-                            self.flush_offline_sync(&peer_id, ip_opt.as_deref());
-                            self.flush_offline_name_updates(&peer_id, ip_opt.as_deref());
-                        } else {
-                            let display = if from_id.is_empty() {
-                                format!("{}:{}", from_ip, from_port)
-                            } else {
-                                from_name.clone().unwrap_or_else(|| from_id.clone())
-                            };
-                            self.users.push(User {
-                                id: key.clone(),
-                                name: display,
-                                online: true,
-                                ip: Some(ip_clone.clone()),
-                                port: Some(port_clone),
-                                tcp_port: None,
-                                protocol_version: None,
-                                supports_reliable_folders: false,
-                                bound_interface: Some(local_ip.clone()),
-                                best_interface: Some(local_ip.clone()),
-                                has_unread: self.selected_user_id.as_deref() != Some(&key),
-                            });
-                            self.delivery.offline_msgs.entry(key.clone()).or_default();
-                            self.known_dirty = true;
-                            self.flush_offline_queue(&key, Some(&ip_clone), Some(port_clone));
-                            self.flush_offline_sync(&key, Some(&ip_clone));
-                            self.flush_offline_name_updates(&key, Some(&ip_clone));
-                        }
-                        if let Some(name) = pending_name_update {
-                            self.apply_name_update(&key, &name, NameSource::Direct);
-                        }
+                        self.handle_chat_received(
+                            ctx, from_id, from_ip, from_port, from_name, text, send_ts, recv_ts,
+                            msg_id, local_ip,
+                        );
                     }
                     PeerEvent::ChatAck { from_id, msg_id } => {
-                        if let Some(list) = self.delivery.pending_acks.get_mut(&from_id) {
-                            list.retain(|(mid, _)| mid != &msg_id);
-                        }
-                        // 更新用户最优接口（能收到 ACK 的接口）
-                        if let Some(u) = self.users.iter_mut().find(|u| u.id == from_id) {
-                            if let Some(bound) = &u.bound_interface {
-                                u.best_interface = Some(bound.clone());
-                                debug_println!(
-                                    "ACK received from {} (msg_id={}), confirmed best_interface: {}",
-                                    from_id,
-                                    msg_id,
-                                    bound
-                                );
-                            }
-                        }
-                        let ack_ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                        if let Some(msgs) = self.messages.get_mut(&from_id) {
-                            if let Some(m) = msgs
-                                .iter_mut()
-                                .rev()
-                                .find(|m| m.msg_id.as_deref() == Some(&msg_id))
-                            {
-                                m.transfer_status = Some("已送达".to_string());
-                                m.recv_ts = Some(ack_ts.clone());
-                                m.is_pending = false;
-                            }
-                        }
-                        self.update_history_ack(&from_id, &msg_id, &ack_ts);
-                        if let Some(queue) = self.delivery.offline_msgs.get_mut(&from_id) {
-                            queue.retain(|q| q.msg_id.as_deref() != Some(&msg_id));
-                        }
-                        self.persist_runtime_state();
+                        self.handle_chat_ack(from_id, msg_id);
                     }
                     PeerEvent::FileCompletionAck {
                         from_id,
@@ -2700,50 +1483,14 @@ impl eframe::App for RustleApp {
                         succeeded,
                         status,
                     } => {
-                        if let Some(msgs) = self.messages.get_mut(&from_id) {
-                            if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                Self::message_matches_transfer(
-                                    m,
-                                    true,
-                                    transfer_id.as_deref(),
-                                    &file_name,
-                                )
-                            }) {
-                                msg.transfer_status = Some(status.clone());
-                                msg.is_pending = !succeeded;
-                                if succeeded {
-                                    let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                    msg.recv_ts = Some(ts.clone());
-                                    msg.last_sync_ts = Some(ts);
-                                    msg.needs_sync = false;
-                                }
-                            }
-                        }
-
-                        if let Some(path) = self.messages.get(&from_id).and_then(|msgs| {
-                            msgs.iter()
-                                .rev()
-                                .find(|m| {
-                                    Self::message_matches_transfer(
-                                        m,
-                                        true,
-                                        transfer_id.as_deref(),
-                                        &file_name,
-                                    )
-                                })
-                                .and_then(|m| m.file_path.clone())
-                        }) {
-                            self.update_history_needs_sync(&from_id, &path, !succeeded, true);
-                            if succeeded {
-                                let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                self.update_history_sync(&from_id, &path, &ts, true);
-                                self.update_history_file_done(&from_id, &path, &ts, true);
-                            }
-                        }
-
-                        if !is_sync {
-                            self.persist_runtime_state();
-                        }
+                        self.handle_file_completion_ack_event(
+                            &from_id,
+                            transfer_id.as_deref(),
+                            &file_name,
+                            is_sync,
+                            succeeded,
+                            &status,
+                        );
                     }
                     PeerEvent::LocalBound { ip, port } => {
                         // 记录可用的绑定接口
@@ -2777,260 +1524,19 @@ impl eframe::App for RustleApp {
                         succeeded,
                     } => {
                         if let Some(pid) = peer_id {
-                            let mut pending_log: Option<(String, String, String)> = None;
-                            let mut pending_sync: Option<(String, String, bool)> = None;
-                            let mut pending_file_done: Option<(String, String, bool)> = None;
-                            let mut pending_path_update: Option<(String, String)> = None;
-                            let mut pending_needs_sync_update: Option<(String, bool)> = None;
-                            if let Some(msgs) = self.messages.get_mut(&pid) {
-                                if is_incoming {
-                                    if is_sync {
-                                        if is_final && succeeded {
-                                            if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                                Self::message_matches_transfer(
-                                                    m,
-                                                    false,
-                                                    transfer_id.as_deref(),
-                                                    &file_name,
-                                                )
-                                            }) {
-                                                let ts = Local::now()
-                                                    .format("%Y-%m-%d %H:%M:%S")
-                                                    .to_string();
-                                                if msg.transfer_id.is_none() {
-                                                    msg.transfer_id = transfer_id.clone();
-                                                }
-                                                msg.last_sync_ts = Some(ts.clone());
-                                                if let Some(path) = msg.file_path.clone() {
-                                                    pending_sync = Some((path, ts, false));
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        let log_key = (pid.clone(), file_name.clone());
-                                        if progress == 0.0 {
-                                            let ts = Local::now()
-                                                .format("%Y-%m-%d %H:%M:%S")
-                                                .to_string();
-                                            let text = if is_dir {
-                                                format!("📁 {}", file_name)
-                                            } else {
-                                                format!("📄 {}", file_name)
-                                            };
-                                            msgs.push(ChatMessage {
-                                                from_me: false,
-                                                text: text.clone(),
-                                                send_ts: ts.clone(),
-                                                recv_ts: Some(ts.clone()),
-                                                last_sync_ts: None,
-                                                file_path: Some(file_name.clone()),
-                                                transfer_id: None,
-                                                transfer_status: Some(status.clone()),
-                                                msg_id: None,
-                                                is_read: false,
-                                                is_pending: false,
-                                                needs_sync: is_sync,
-                                            });
-
-                                            if self.logged_incoming_files.insert(log_key.clone()) {
-                                                let path_for_history = local_path
-                                                    .as_deref()
-                                                    .unwrap_or(file_name.as_str());
-                                                pending_log =
-                                                    Some((text, ts, path_for_history.to_string()));
-                                            }
-                                            if self.selected_user_id.as_deref() == Some(&pid) {
-                                                self.scroll_to_bottom = true;
-                                            }
-                                        } else if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                            Self::message_matches_transfer(
-                                                m,
-                                                false,
-                                                transfer_id.as_deref(),
-                                                &file_name,
-                                            )
-                                        }) {
-                                            if msg.transfer_id.is_none() {
-                                                msg.transfer_id = transfer_id.clone();
-                                            }
-                                            msg.transfer_status = Some(status.clone());
-                                            if let Some(path) = local_path.as_deref() {
-                                                msg.file_path = Some(path.to_string());
-                                            } else if msg.file_path.is_none() {
-                                                msg.file_path = Some(file_name.clone());
-                                            }
-
-                                            if is_final && succeeded {
-                                                if let Some(path) = local_path.as_deref() {
-                                                    pending_path_update =
-                                                        Some((file_name.clone(), path.to_string()));
-                                                }
-                                                let ts = msg.recv_ts.clone().unwrap_or_else(|| {
-                                                    Local::now()
-                                                        .format("%Y-%m-%d %H:%M:%S")
-                                                        .to_string()
-                                                });
-                                                if let Some(path) = msg.file_path.clone() {
-                                                    msg.last_sync_ts = Some(ts.clone());
-                                                    pending_sync =
-                                                        Some((path.clone(), ts.clone(), false));
-                                                    if self
-                                                        .logged_incoming_files
-                                                        .insert(log_key.clone())
-                                                    {
-                                                        pending_log =
-                                                            Some((msg.text.clone(), ts, path));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else if let Some(msg) = msgs.iter_mut().rev().find(|m| {
-                                    Self::message_matches_transfer(
-                                        m,
-                                        true,
-                                        transfer_id.as_deref(),
-                                        &file_name,
-                                    )
-                                }) {
-                                    if msg.transfer_id.is_none() {
-                                        msg.transfer_id = transfer_id.clone();
-                                    }
-                                    let new_needs_sync = !(is_final && succeeded);
-                                    if msg.needs_sync != new_needs_sync {
-                                        msg.needs_sync = new_needs_sync;
-                                        if let Some(path) = msg.file_path.clone() {
-                                            pending_needs_sync_update =
-                                                Some((path, new_needs_sync));
-                                        }
-                                    }
-
-                                    if !is_sync {
-                                        msg.transfer_status = Some(status.clone());
-                                    }
-                                    if is_final && succeeded {
-                                        let ts =
-                                            Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                        msg.last_sync_ts = Some(ts.clone());
-                                        msg.is_pending = false;
-                                        if is_sync {
-                                            msg.transfer_status =
-                                                Some(format!("已同步，最后同步时间： {}", ts));
-                                        }
-                                        if let Some(path) = msg.file_path.clone() {
-                                            pending_sync = Some((path.clone(), ts.clone(), true));
-                                            pending_file_done = Some((path, ts, true));
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some((path, needs_sync)) = pending_needs_sync_update.take() {
-                                self.update_history_needs_sync(&pid, &path, needs_sync, true);
-                            }
-                            if let Some((text, ts, path)) = pending_log {
-                                self.log_history(
-                                    &pid,
-                                    false,
-                                    &text,
-                                    &ts,
-                                    Some(&ts),
-                                    Some(&path),
-                                    None,
-                                    None,
-                                    false,
-                                    is_sync,
-                                );
-                            }
-                            if let Some((file_name, path)) = pending_path_update {
-                                self.update_history_file_path(&pid, &file_name, &path, false);
-                            }
-                            if let Some((path, ts, from_me)) = pending_sync {
-                                self.update_history_sync(&pid, &path, &ts, from_me);
-                            }
-                            if let Some((path, ts, from_me)) = pending_file_done {
-                                self.update_history_file_done(&pid, &path, &ts, from_me);
-                            }
-
-                            // Update metadata store based on this file progress event
-                            if let Ok(store) = crate::metadata::MetadataStore::open_default() {
-                                let path_hint = local_path.clone();
-                                let file_hint = file_name.clone();
-                                let peer_hint = pid.clone();
-                                let now_ts = Local::now().timestamp();
-                                let is_sync_flag = is_sync;
-                                let _ = store.update_first_matching(|meta| {
-                                    let matched = if let Some(lp) = path_hint.as_ref() {
-                                        meta.abs_path == *lp
-                                    } else {
-                                        meta.filename == file_hint
-                                    };
-                                    if !matched || meta.peer_id.as_deref() != Some(&peer_hint) {
-                                        return None;
-                                    }
-                                    let mut updated = meta.clone();
-                                    if is_final && succeeded {
-                                        updated.last_synced_time = Some(now_ts);
-                                        updated.sync_status = if is_sync_flag {
-                                            SyncStatus::Synced
-                                        } else {
-                                            SyncStatus::Sent
-                                        };
-                                    } else {
-                                        updated.sync_status = if is_sync_flag {
-                                            SyncStatus::Syncing
-                                        } else {
-                                            SyncStatus::Sending
-                                        };
-                                    }
-                                    Some(updated)
-                                });
-                            }
-
-                            if is_final && succeeded && !is_dir {
-                                if let Some(path_for_hash) = local_path.clone() {
-                                    let peer_clone = pid.clone();
-                                    let file_clone = file_name.clone();
-                                    let is_sync_flag = is_sync;
-                                    let db_path = crate::metadata::MetadataStore::default_db_path();
-                                    let path_clone = path_for_hash.clone();
-                                    thread::spawn(move || {
-                                        if let Some(hash) =
-                                            crate::storage::sha256_file(Path::new(&path_clone))
-                                        {
-                                            if let Ok(store) =
-                                                crate::metadata::MetadataStore::open(&db_path)
-                                            {
-                                                let _ = store.update_first_matching(|meta| {
-                                                    if meta.peer_id.as_deref() != Some(&peer_clone)
-                                                    {
-                                                        return None;
-                                                    }
-                                                    let matches_path = meta.abs_path == path_clone
-                                                        || meta.filename == file_clone;
-                                                    if !matches_path {
-                                                        return None;
-                                                    }
-                                                    let mut updated = meta.clone();
-                                                    updated.sha256 = Some(hash.clone());
-                                                    updated.last_synced_sha256 = Some(hash.clone());
-                                                    updated.last_synced_time =
-                                                        Some(Local::now().timestamp());
-                                                    updated.sync_status = if is_sync_flag {
-                                                        SyncStatus::Synced
-                                                    } else {
-                                                        SyncStatus::Sent
-                                                    };
-                                                    Some(updated)
-                                                });
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-
-                            // refresh ui cache
-                            self.reload_meta_list();
+                            self.handle_file_progress_event(
+                                &pid,
+                                transfer_id,
+                                file_name,
+                                progress,
+                                status,
+                                is_incoming,
+                                is_dir,
+                                local_path,
+                                is_sync,
+                                is_final,
+                                succeeded,
+                            );
                         }
                     }
                     PeerEvent::DiscoverReceived {
@@ -3039,206 +1545,19 @@ impl eframe::App for RustleApp {
                         from_name,
                         peers,
                     } => {
-                        let mut flush_targets: Vec<(String, Option<String>, Option<u16>)> =
-                            Vec::new();
-                        let mut pending_name_updates: Vec<(String, String, NameSource)> =
-                            Vec::new();
-
-                        // 确保发送方在线
-                        if let Some(u) = self.users.iter_mut().find(|u| u.id == from_id) {
-                            u.online = true;
-                            if u.ip.as_deref() != Some(&from_ip) {
-                                u.ip = Some(from_ip.clone());
-                                self.known_dirty = true;
-                            }
-                            if u.port.is_none() {
-                                u.port = Some(UDP_MESSAGE_PORT);
-                            }
-                            if let Some(name) = from_name.clone() {
-                                pending_name_updates.push((
-                                    from_id.clone(),
-                                    name,
-                                    NameSource::Direct,
-                                ));
-                            }
-                        } else {
-                            self.users.push(User {
-                                id: from_id.clone(),
-                                name: from_name.clone().unwrap_or_else(|| from_id.clone()),
-                                online: true,
-                                ip: Some(from_ip.clone()),
-                                port: Some(UDP_MESSAGE_PORT),
-                                tcp_port: None,
-                                protocol_version: None,
-                                supports_reliable_folders: false,
-                                bound_interface: None,
-                                best_interface: None,
-                                has_unread: false,
-                            });
-                            self.messages.entry(from_id.clone()).or_default();
-                            self.delivery
-                                .offline_msgs
-                                .entry(from_id.clone())
-                                .or_default();
-                            self.known_dirty = true;
-                            if let Some(name) = from_name.clone() {
-                                pending_name_updates.push((
-                                    from_id.clone(),
-                                    name,
-                                    NameSource::Direct,
-                                ));
-                            }
-                        }
-
-                        // 发送方上线后立即刷新离线队列
-                        if let Some(u) = self.users.iter().find(|u| u.id == from_id) {
-                            flush_targets.push((from_id.clone(), u.ip.clone(), u.port));
-                        }
-
-                        // 合并 peers 列表
-                        for p in peers {
-                            if p.id.is_empty() {
-                                continue;
-                            }
-                            if p.id == self.self_id {
-                                continue;
-                            }
-                            if let Some(u) = self.users.iter_mut().find(|u| u.id == p.id) {
-                                u.online = true; // 从 peers 列表来的用户应标记为在线
-                                if let Some(ip) = p.ip.clone() {
-                                    if u.ip.as_deref() != Some(&ip) {
-                                        u.ip = Some(ip);
-                                        self.known_dirty = true;
-                                    }
-                                }
-                                if u.port.is_none() {
-                                    u.port = Some(UDP_MESSAGE_PORT);
-                                }
-                                if let Some(name) = p.name.clone() {
-                                    pending_name_updates.push((
-                                        p.id.clone(),
-                                        name,
-                                        NameSource::Indirect,
-                                    ));
-                                }
-                                flush_targets.push((p.id.clone(), u.ip.clone(), u.port));
-                            } else {
-                                self.users.push(User {
-                                    id: p.id.clone(),
-                                    name: p.name.clone().unwrap_or_else(|| p.id.clone()),
-                                    online: true,
-                                    ip: p.ip.clone(),
-                                    port: Some(UDP_MESSAGE_PORT),
-                                    tcp_port: None,
-                                    protocol_version: None,
-                                    supports_reliable_folders: false,
-                                    bound_interface: None,
-                                    best_interface: None,
-                                    has_unread: false,
-                                });
-                                self.messages.entry(p.id.clone()).or_default();
-                                self.delivery.offline_msgs.entry(p.id.clone()).or_default();
-                                self.known_dirty = true;
-                                if p.name.is_some() {
-                                    pending_name_updates.push((
-                                        p.id.clone(),
-                                        p.name.clone().unwrap_or_default(),
-                                        NameSource::Indirect,
-                                    ));
-                                }
-                                flush_targets.push((
-                                    p.id.clone(),
-                                    p.ip.clone(),
-                                    Some(UDP_MESSAGE_PORT),
-                                ));
-                            }
-                        }
-
-                        for (id, ip, port) in flush_targets {
-                            let ip_opt = ip.as_deref();
-                            self.flush_offline_queue(&id, ip_opt, port);
-                            self.flush_offline_sync(&id, ip_opt);
-                            self.flush_offline_name_updates(&id, ip_opt);
-                            if let (Some(ip_str), Some(port_val)) = (ip_opt, port) {
-                                self.resend_pending_for_peer(&id, ip_str, port_val);
-                            }
-                        }
-
-                        for (id, name, source) in pending_name_updates {
-                            self.apply_name_update(&id, &name, source);
-                        }
+                        self.handle_discover_received(from_id, from_ip, from_name, peers);
                     }
                     PeerEvent::PeerOnline { id, ip } => {
                         if id == self.self_id {
                             continue;
                         }
-                        if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
-                            u.online = true;
-                            u.ip = Some(ip.clone());
-                            if u.port.is_none() {
-                                u.port = Some(UDP_MESSAGE_PORT);
-                            }
-                            self.known_dirty = true;
-                            let ip_opt = u.ip.clone();
-                            let port_opt = u.port;
-                            self.flush_offline_queue(&id, ip_opt.as_deref(), port_opt);
-                            self.flush_offline_sync(&id, ip_opt.as_deref());
-                            self.flush_offline_name_updates(&id, ip_opt.as_deref());
-                            // schedule a follow-up resend in 1s to let network stabilize
-                            self.pending_resend
-                                .insert(id.clone(), Instant::now() + Duration::from_secs(1));
-                        } else {
-                            self.users.push(User {
-                                id: id.clone(),
-                                name: id.clone(),
-                                online: true,
-                                ip: Some(ip.clone()),
-                                port: Some(UDP_MESSAGE_PORT),
-                                tcp_port: None,
-                                protocol_version: None,
-                                supports_reliable_folders: false,
-                                bound_interface: None,
-                                best_interface: None,
-                                has_unread: false,
-                            });
-                            self.messages.entry(id.clone()).or_default();
-                            self.delivery.offline_msgs.entry(id.clone()).or_default();
-                            self.known_dirty = true;
-                        }
+                        self.handle_peer_online(id, ip);
                     }
                     PeerEvent::NameUpdate { id, name, ip } => {
                         if id == self.self_id {
                             continue;
                         }
-                        if let Some(u) = self.users.iter_mut().find(|u| u.id == id) {
-                            let pending_name = name.clone();
-                            if let Some(ipv) = ip.clone() {
-                                if u.ip.as_deref() != Some(&ipv) {
-                                    u.ip = Some(ipv);
-                                    self.known_dirty = true;
-                                }
-                            }
-                            let _ = u;
-                            self.apply_name_update(&id, &pending_name, NameSource::Direct);
-                        } else {
-                            self.users.push(User {
-                                id: id.clone(),
-                                name: name.clone(),
-                                online: false,
-                                ip,
-                                port: Some(UDP_MESSAGE_PORT),
-                                tcp_port: None,
-                                protocol_version: None,
-                                supports_reliable_folders: false,
-                                bound_interface: None,
-                                best_interface: None,
-                                has_unread: false,
-                            });
-                            self.messages.entry(id.clone()).or_default();
-                            self.delivery.offline_msgs.entry(id.clone()).or_default();
-                            self.known_dirty = true;
-                            self.name_source.insert(id.clone(), NameSource::Direct);
-                        }
+                        self.handle_name_update(id, name, ip);
                     }
                     PeerEvent::PeerOffline { id } => {
                         self.mark_offline(&id);
@@ -3261,158 +1580,7 @@ impl eframe::App for RustleApp {
         self.maybe_start_sync_scan();
         self.persist_sync_tree();
 
-        egui::SidePanel::left("contacts")
-            .resizable(false)
-            .default_width(280.0)
-            .frame(egui::Frame::default().fill(theme::BG_PRIMARY))
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new("📞 联系人")
-                        .heading()
-                        .color(theme::TEXT_PRIMARY),
-                );
-                ui.add_space(10.0);
-
-                if self.users.is_empty() {
-                    ui.label(
-                        egui::RichText::new("暂无联系人")
-                            .weak()
-                            .color(theme::TEXT_LIGHT),
-                    );
-                } else {
-                    let mut online_users: Vec<User> = self
-                        .users
-                        .iter()
-                        .filter(|u| u.online && u.id != self.self_id)
-                        .cloned()
-                        .collect();
-                    let mut offline_users: Vec<User> = self
-                        .users
-                        .iter()
-                        .filter(|u| !u.online && u.id != self.self_id)
-                        .cloned()
-                        .collect();
-                    online_users.sort_by(|a, b| a.name.cmp(&b.name));
-                    offline_users.sort_by(|a, b| a.name.cmp(&b.name));
-
-                    let render_user = |ui: &mut egui::Ui, user: &User, this: &mut RustleApp| {
-                        let selected = this.selected_user_id.as_deref() == Some(&user.id);
-
-                        let mut label_text = user.name.clone();
-                        if user.has_unread {
-                            label_text.push(' ');
-                            label_text.push_str("●");
-                        }
-
-                        let text_color = if selected {
-                            theme::MSG_SENT_TEXT
-                        } else if user.has_unread {
-                            theme::STATUS_UNREAD
-                        } else if user.online {
-                            theme::SECONDARY_LIGHT
-                        } else {
-                            theme::TEXT_LIGHT
-                        };
-
-                        let bg_color = if selected {
-                            theme::PRIMARY_LIGHT
-                        } else if user.has_unread {
-                            theme::BG_SELECTED
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        };
-
-                        let text = if user.online {
-                            egui::RichText::new(label_text).strong().color(text_color)
-                        } else {
-                            egui::RichText::new(label_text).color(text_color)
-                        };
-
-                        let mut frame = egui::Frame::none()
-                            .fill(bg_color)
-                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                            .rounding(6.0);
-
-                        if selected {
-                            frame = frame.stroke(egui::Stroke::new(2.0, theme::PRIMARY));
-                        }
-
-                        let resp = frame
-                            .show(ui, |ui| {
-                                ui.push_id(&user.id, |ui| {
-                                    ui.add(egui::SelectableLabel::new(selected, text))
-                                })
-                                .inner
-                            })
-                            .inner;
-                        if resp.clicked() {
-                            this.selected_user_id = Some(user.id.clone());
-                            if let Some(u) = this.users.iter_mut().find(|u| u.id == user.id) {
-                                u.has_unread = false;
-                            }
-                            this.scroll_to_first_unread = true;
-                        }
-
-                        resp.context_menu(|ui| {
-                            if ui.button("用户信息").clicked() {
-                                let ip_info: String = format!(
-                                    "IP: {}\nID: {}",
-                                    user.ip.as_deref().unwrap_or("未知"),
-                                    user.id
-                                );
-                                this.show_ip_dialog = Some((user.name.clone(), ip_info));
-                                ui.close_menu();
-                            }
-                            if ui.button("删除联系人").clicked() {
-                                this.context_menu_user_id = Some(user.id.clone());
-                                ui.close_menu();
-                            }
-                        });
-                    };
-
-                    let avail = ui.available_height();
-                    let online_height = (avail * 0.5).max(120.0).min(avail);
-                    let offline_height = (avail - online_height - 12.0).max(80.0);
-
-                    ui.horizontal(|ui| {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("🟢 在线")
-                                .strong()
-                                .color(theme::SECONDARY_LIGHT),
-                        );
-                    });
-                    egui::ScrollArea::vertical()
-                        .id_salt("online_users")
-                        .max_height(online_height)
-                        .show(ui, |ui| {
-                            for user in &online_users {
-                                render_user(ui, user, self);
-                            }
-                        });
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(10.0);
-
-                    ui.horizontal(|ui| {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("⚪ 离线")
-                                .strong()
-                                .color(theme::TEXT_LIGHT),
-                        );
-                    });
-                    egui::ScrollArea::vertical()
-                        .id_salt("offline_users")
-                        .max_height(offline_height)
-                        .show(ui, |ui| {
-                            for user in &offline_users {
-                                render_user(ui, user, self);
-                            }
-                        });
-                }
-            });
+        self.render_contacts_panel(ctx);
 
         // 处理删除联系人
         if let Some(id_to_delete) = self.context_menu_user_id.take() {
@@ -3461,489 +1629,17 @@ impl eframe::App for RustleApp {
             self.show_ip_dialog = None;
         }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(theme::BG_PRIMARY))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(self.selected_user_name())
-                            .heading()
-                            .color(theme::TEXT_PRIMARY),
-                    );
-                });
-                ui.separator();
+        self.render_messages_panel(ctx);
 
-                let total_height = ui.available_height();
-                let top_height = total_height * 0.75;
-
-                // 上部区域：消息显示（3/4）
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), top_height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.set_height(top_height);
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let msgs: &[ChatMessage] = self
-                                    .selected_user_id
-                                    .as_ref()
-                                    .and_then(|id| self.messages.get(id))
-                                    .map(|v| v.as_slice())
-                                    .unwrap_or(&[]);
-
-                                let mut last_msg_resp = None;
-                                let mut first_unread_resp = None;
-                                let now = Instant::now();
-
-                                for (i, msg) in msgs.iter().enumerate() {
-                                    let align = if msg.from_me {
-                                        egui::Align::RIGHT
-                                    } else {
-                                        egui::Align::LEFT
-                                    };
-                                    let max_bubble_width = ui.available_width() * 0.7;
-                                    let resp = ui
-                                        .allocate_ui_with_layout(
-                                            egui::vec2(ui.available_width(), 0.0),
-                                            egui::Layout::top_down(align),
-                                            |ui| {
-                                                ui.set_max_width(max_bubble_width);
-                                                let mut meta = format!("发送: {}", msg.send_ts);
-                                                if let Some(r) = &msg.recv_ts {
-                                                    meta.push_str(&format!("  |  接收: {}", r));
-                                                }
-                                                if let Some(s) = &msg.last_sync_ts {
-                                                    meta.push_str(&format!("  |  同步: {}", s));
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(meta)
-                                                        .small()
-                                                        .color(theme::TEXT_LIGHT)
-                                                        .weak(),
-                                                );
-
-                                                let (bg, border_color, fg) = if msg.from_me {
-                                                    if msg.transfer_status.as_deref()
-                                                        == Some("未送达")
-                                                    {
-                                                        (
-                                                            theme::BG_HOVER,
-                                                            theme::BORDER,
-                                                            theme::TEXT_PRIMARY,
-                                                        )
-                                                    } else {
-                                                        (
-                                                            theme::MSG_SENT_BG,
-                                                            theme::PRIMARY,
-                                                            theme::MSG_SENT_TEXT,
-                                                        )
-                                                    }
-                                                } else {
-                                                    (
-                                                        theme::MSG_RECV_BG,
-                                                        theme::MSG_RECV_BORDER,
-                                                        theme::MSG_RECV_TEXT,
-                                                    )
-                                                };
-
-                                                egui::Frame::none()
-                                                    .fill(bg)
-                                                    .stroke(egui::Stroke::new(1.5, border_color))
-                                                    .rounding(egui::Rounding::same(10.0))
-                                                    .inner_margin(egui::Margin::symmetric(
-                                                        12.0, 10.0,
-                                                    ))
-                                                    .show(ui, |ui| {
-                                                        ui.label(
-                                                            egui::RichText::new(&msg.text)
-                                                                .color(fg),
-                                                        );
-
-                                                        if let Some(status) = &msg.transfer_status {
-                                                            ui.add_space(4.0);
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "⚡ {}",
-                                                                    status
-                                                                ))
-                                                                .small()
-                                                                .italics()
-                                                                .color(if msg.from_me {
-                                                                    theme::TEXT_LIGHT
-                                                                } else {
-                                                                    theme::STATUS_UNREAD
-                                                                }),
-                                                            );
-                                                        }
-
-                                                        if msg.file_path.is_some() {
-                                                            let status_label = if msg.needs_sync {
-                                                                Some("🔄 需同步")
-                                                            } else if msg.last_sync_ts.is_some() {
-                                                                Some("✓ 已同步")
-                                                            } else {
-                                                                None
-                                                            };
-                                                            if let Some(label) = status_label {
-                                                                ui.add_space(4.0);
-                                                                ui.label(
-                                                                    egui::RichText::new(label)
-                                                                        .small()
-                                                                        .color(if msg.from_me {
-                                                                            theme::TEXT_LIGHT
-                                                                        } else {
-                                                                            theme::SECONDARY_LIGHT
-                                                                        }),
-                                                                );
-                                                            }
-                                                        }
-
-                                                        if let Some(path) = &msg.file_path {
-                                                            ui.horizontal(|ui| {
-                                                                if ui
-                                                                    .link("📂 打开所在目录")
-                                                                    .clicked()
-                                                                {
-                                                                    let candidate = Path::new(path);
-                                                                    let target = if candidate
-                                                                        .is_absolute()
-                                                                    {
-                                                                        candidate
-                                                                    .parent()
-                                                                    .map(|p| p.to_path_buf())
-                                                                    .unwrap_or_else(
-                                                                        default_download_dir,
-                                                                    )
-                                                                    } else {
-                                                                        default_download_dir()
-                                                                    };
-                                                                    let _ = open::that(target);
-                                                                }
-                                                            });
-                                                        }
-                                                    });
-                                            },
-                                        )
-                                        .response;
-
-                                    if !msg.from_me && !msg.is_read {
-                                        if first_unread_resp.is_none() {
-                                            first_unread_resp = Some(resp.clone());
-                                        }
-
-                                        if ui.clip_rect().intersects(resp.rect) {
-                                            if let Some(peer_id) = &self.selected_user_id {
-                                                let key = (peer_id.clone(), i);
-                                                self.message_visible_since
-                                                    .entry(key)
-                                                    .or_insert(now);
-                                            }
-                                        }
-                                    }
-
-                                    if i == msgs.len() - 1 {
-                                        last_msg_resp = Some(resp);
-                                    }
-                                    ui.add_space(10.0);
-                                }
-
-                                if self.scroll_to_bottom {
-                                    if let Some(resp) = last_msg_resp {
-                                        resp.scroll_to_me(Some(egui::Align::Center));
-                                        self.scroll_to_bottom = false;
-                                    }
-                                } else if self.scroll_to_first_unread {
-                                    if let Some(resp) = first_unread_resp {
-                                        resp.scroll_to_me(Some(egui::Align::TOP));
-                                    } else if let Some(resp) = last_msg_resp {
-                                        resp.scroll_to_me(Some(egui::Align::Center));
-                                    }
-                                    self.scroll_to_first_unread = false;
-                                }
-                            });
-                    },
-                );
-
-                ui.separator();
-
-                // 下部区域：输入和按钮（剩余空间，约 1/4）
-                let bottom_height = ui.available_height();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), bottom_height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.set_height(bottom_height);
-                        ui.spacing_mut().item_spacing.y = 8.0;
-
-                        ui.horizontal(|ui| {
-                            ui.horizontal(|ui| {
-                                let btn_file = egui::Button::new(
-                                    egui::RichText::new("📁 文件")
-                                        .size(14.0)
-                                        .color(theme::TEXT_PRIMARY),
-                                )
-                                .fill(theme::BG_HOVER)
-                                .stroke(egui::Stroke::new(1.5, theme::BORDER))
-                                .min_size(egui::vec2(100.0, 36.0));
-                                if ui.add(btn_file).clicked() {
-                                    self.pick_and_send(false);
-                                }
-                                ui.add_space(6.0);
-
-                                let btn_folder = egui::Button::new(
-                                    egui::RichText::new("📂 文件夹")
-                                        .size(14.0)
-                                        .color(theme::TEXT_PRIMARY),
-                                )
-                                .fill(theme::BG_HOVER)
-                                .stroke(egui::Stroke::new(1.5, theme::BORDER))
-                                .min_size(egui::vec2(120.0, 36.0));
-                                if ui.add(btn_folder).clicked() {
-                                    self.pick_and_send(true);
-                                }
-                                ui.add_space(12.0);
-                                ui.label(
-                                    egui::RichText::new("支持拖放文件/文件夹到窗口")
-                                        .weak()
-                                        .small()
-                                        .color(theme::TEXT_LIGHT),
-                                );
-                            });
-
-                            ui.add_space(8.0);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.add_space(8.0);
-                                    let btn_send = egui::Button::new(
-                                        egui::RichText::new("🚀 发送")
-                                            .size(14.0)
-                                            .color(theme::MSG_SENT_TEXT),
-                                    )
-                                    .fill(theme::PRIMARY)
-                                    .stroke(egui::Stroke::new(1.5, theme::PRIMARY))
-                                    .min_size(egui::vec2(100.0, 36.0));
-                                    if ui.add(btn_send).clicked()
-                                        || ctx.input(|i| i.key_pressed(egui::Key::Enter))
-                                    {
-                                        self.send_current();
-                                    }
-                                },
-                            );
-                        });
-
-                        ui.add_space(8.0);
-
-                        let input_height = ui.available_height();
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.input)
-                                .hint_text("输入消息...")
-                                .desired_width(f32::INFINITY)
-                                .min_size(egui::vec2(0.0, input_height)),
-                        );
-                    },
-                );
-            });
-
-        if self.show_name_dialog {
-            egui::Window::new("欢迎使用 Rustle (如梭)")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("请输入你的姓名（建议使用真实姓名）：");
-                    ui.add_space(6.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.temp_name_input)
-                            .hint_text("例如：张三"),
-                    );
-                    ui.add_space(8.0);
-                    if let Some(err) = &self.name_save_error {
-                        ui.label(egui::RichText::new(err).color(egui::Color32::RED));
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("保存并登录").clicked() {
-                            let name = self.temp_name_input.trim();
-                            if name.is_empty() {
-                                self.name_save_error = Some("请输入名字后再保存".to_string());
-                            } else {
-                                match fs::write(data_path("me.txt"), name) {
-                                    Ok(_) => {
-                                        self.me_name = Some(name.to_string());
-                                        self.show_name_dialog = false;
-                                        self.name_save_error = None;
-                                        self.temp_name_input.clear();
-
-                                        if let Some(tx) = &self.net_cmd_tx {
-                                            let _ = tx.send(NetCmd::ChangeName(
-                                                self.me_name.clone().unwrap_or_default(),
-                                            ));
-                                        }
-                                        if let Some(name) = self.me_name.clone() {
-                                            self.send_name_update_to_all(&name);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.name_save_error = Some(format!("保存失败: {}", e));
-                                    }
-                                }
-                            }
-                        }
-                        if ui.button("稍后再说").clicked() {
-                            self.show_name_dialog = false;
-                        }
-                    });
-                });
-        }
-
-        if self.show_edit_name_dialog {
-            egui::Window::new("修改用户名")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("请输入新的用户名：");
-                    ui.add_space(6.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.edit_name_input)
-                            .hint_text("例如：张三"),
-                    );
-                    ui.add_space(8.0);
-                    if let Some(err) = &self.edit_name_error {
-                        ui.label(egui::RichText::new(err).color(egui::Color32::RED));
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("保存").clicked() {
-                            let name = self.edit_name_input.trim();
-                            if name.is_empty() {
-                                self.edit_name_error = Some("请输入名字后再保存".to_string());
-                            } else {
-                                match fs::write(data_path("me.txt"), name) {
-                                    Ok(_) => {
-                                        self.me_name = Some(name.to_string());
-                                        self.show_edit_name_dialog = false;
-                                        self.edit_name_error = None;
-
-                                        if let Some(tx) = &self.net_cmd_tx {
-                                            let _ = tx.send(NetCmd::ChangeName(
-                                                self.me_name.clone().unwrap_or_default(),
-                                            ));
-                                        }
-                                        if let Some(name) = self.me_name.clone() {
-                                            self.send_name_update_to_all(&name);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.edit_name_error = Some(format!("保存失败: {}", e));
-                                    }
-                                }
-                            }
-                        }
-                        if ui.button("取消").clicked() {
-                            self.show_edit_name_dialog = false;
-                        }
-                    });
-                });
-        }
+        self.render_name_dialogs(ctx);
 
         if !dropped_files.is_empty() {
             self.handle_dropped_files(dropped_files);
         }
 
-        // 启动后仅触发一次：主动向已知节点定向 hello，提高上线成功率
-        if !self.probed_known {
-            if let Some(tx) = &self.net_cmd_tx {
-                for u in &self.users {
-                    if let (Some(ip), Some(_port)) = (u.ip.as_ref(), u.port) {
-                        let _ = tx.send(NetCmd::ProbePeer {
-                            ip: ip.clone(),
-                            via: u.bound_interface.clone(),
-                        });
-                    }
-                }
-                self.probed_known = true;
-            }
-        }
-
-        // 检查待确认消息超时
-        let now_instant = Instant::now();
-        let mut timeouts: Vec<(String, String)> = Vec::new();
-        for (peer, list) in self.delivery.pending_acks.iter() {
-            for (msg_id, deadline) in list.iter() {
-                if now_instant > *deadline {
-                    timeouts.push((peer.clone(), msg_id.clone()));
-                }
-            }
-        }
-        if !timeouts.is_empty() {
-            for (peer, msg_id) in &timeouts {
-                let mut offline_data = None;
-
-                if let Some(msgs) = self.messages.get_mut(peer) {
-                    if let Some(m) = msgs
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.msg_id.as_deref() == Some(msg_id))
-                    {
-                        m.transfer_status = Some("等待对方上线...".to_string());
-                        m.is_pending = true;
-                        offline_data = Some((m.text.clone(), m.send_ts.clone()));
-                    }
-                }
-
-                if let Some((text, send_ts)) = offline_data {
-                    let queue = self.delivery.offline_msgs.entry(peer.clone()).or_default();
-                    let exists = queue
-                        .iter()
-                        .any(|q| q.msg_id.as_deref() == Some(msg_id.as_str()));
-                    if !exists {
-                        queue.push(QueuedMsg {
-                            text,
-                            send_ts,
-                            msg_id: Some(msg_id.clone()),
-                            file_path: None,
-                            transfer_id: None,
-                            is_dir: false,
-                        });
-                    }
-                    self.update_history_pending(peer, msg_id, true);
-                }
-
-                self.mark_offline(peer);
-            }
-            for (peer, msg_id) in timeouts {
-                if let Some(list) = self.delivery.pending_acks.get_mut(&peer) {
-                    list.retain(|(mid, _)| mid != &msg_id);
-                }
-            }
-            self.persist_runtime_state();
-        }
-
-        // 检查计划的重试任务（用于在对方上线后一段短时间再重试）
-        let now_instant = Instant::now();
-        let mut due_resend: Vec<String> = Vec::new();
-        for (peer, due) in self.pending_resend.iter() {
-            if *due <= now_instant {
-                due_resend.push(peer.clone());
-            }
-        }
-        for peer in due_resend.iter() {
-            // Clone ip/port to avoid holding an immutable borrow while calling mutable method
-            if let Some((ip_clone, port_clone)) = self
-                .users
-                .iter()
-                .find(|u| u.id == *peer)
-                .and_then(|u| Some((u.ip.clone(), u.port)))
-            {
-                if let (Some(ip), Some(port)) = (ip_clone.as_deref(), port_clone) {
-                    debug_println!("Scheduled resend for {}", peer);
-                    self.resend_pending_for_peer(peer, ip, port);
-                }
-            }
-            self.pending_resend.remove(peer);
-        }
+        self.process_startup_probe();
+        self.process_pending_ack_timeouts();
+        self.process_scheduled_resends();
 
         // 清理长时间离线的 peers（例如 120 秒未见）
         let timeout = Duration::from_secs(120);
@@ -3964,6 +1660,7 @@ impl eframe::App for RustleApp {
         }
 
         // 标记已读：检查可见超过 3 秒的消息
+        let now_instant = Instant::now();
         let read_threshold = Duration::from_secs(3);
         let mut to_mark_read = Vec::new();
         for ((peer_id, msg_idx), &visible_since) in &self.message_visible_since {

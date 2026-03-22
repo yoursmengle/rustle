@@ -3,7 +3,7 @@ use crate::debug_println;
 use crate::metadata::{Metadata, MetadataStore};
 use crate::model::{FileCompletionPayload, PeerEvent, TCP_DIR_PORT, TCP_FILE_PORT, UDP_MESSAGE_PORT};
 use crate::storage::{
-    default_download_dir, load_or_init_node_id, lookup_receive_map, upsert_receive_map_entry,
+    default_download_dir, load_or_init_node_id, read_receive_map, update_receive_map,
     windows_long_path,
 };
 use chrono::Local;
@@ -922,7 +922,7 @@ pub async fn handle_incoming_file(
             is_dir,
             &filename,
         );
-        lookup_receive_map(&key).map(PathBuf::from)
+        read_receive_map(|map| map.get(&key).cloned()).map(PathBuf::from)
     } else {
         None
     };
@@ -1232,10 +1232,10 @@ pub async fn handle_incoming_file(
             is_dir,
             &filename,
         );
-        upsert_receive_map_entry(
-            key,
-            final_local_path.to_string_lossy().to_string(),
-        );
+        let value = final_local_path.to_string_lossy().to_string();
+        update_receive_map(|map| {
+            map.insert(key, value);
+        });
     }
 
     let completed_size = if total_size > 0 { total_size } else { final_received };

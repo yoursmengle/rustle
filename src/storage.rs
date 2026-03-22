@@ -292,14 +292,16 @@ pub fn save_receive_map(map: &HashMap<String, String>) {
     }
 }
 
-pub fn lookup_receive_map(key: &str) -> Option<String> {
-    load_receive_map().get(key).cloned()
+pub fn read_receive_map<R>(read: impl FnOnce(&HashMap<String, String>) -> R) -> R {
+    let map = load_receive_map();
+    read(&map)
 }
 
-pub fn upsert_receive_map_entry(key: String, value: String) {
+pub fn update_receive_map<R>(update: impl FnOnce(&mut HashMap<String, String>) -> R) -> R {
     let mut map = load_receive_map();
-    map.insert(key, value);
+    let result = update(&mut map);
     save_receive_map(&map);
+    result
 }
 
 pub fn file_mtime_seconds(path: &Path) -> Option<i64> {
@@ -743,10 +745,14 @@ mod tests {
         let backup = fs::read_to_string(&path).ok();
         let _ = fs::remove_file(&path);
 
-        upsert_receive_map_entry("k1".to_string(), "v1".to_string());
-        upsert_receive_map_entry("k2".to_string(), "v2".to_string());
+        update_receive_map(|map| {
+            map.insert("k1".to_string(), "v1".to_string());
+        });
+        update_receive_map(|map| {
+            map.insert("k2".to_string(), "v2".to_string());
+        });
 
-        let map = load_receive_map();
+        let map = read_receive_map(Clone::clone);
         assert_eq!(map.get("k1").map(String::as_str), Some("v1"));
         assert_eq!(map.get("k2").map(String::as_str), Some("v2"));
 

@@ -63,6 +63,7 @@ pub struct HistoryEntry {
     pub sync_ts: Option<String>,
     pub ts: Option<String>,
     pub file_path: Option<String>,
+    pub transfer_id: Option<String>,
     pub is_pending: Option<bool>, // 是否等待确认
     pub needs_sync: Option<bool>, // 是否需要同步
     pub msg_id: Option<String>,   // 消息ID，用于追踪确认

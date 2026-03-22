@@ -19,13 +19,24 @@ pub fn log_history(
     recv_ts: Option<&str>,
     file_path: Option<&str>,
     sync_ts: Option<&str>,
+    transfer_id: Option<&str>,
     msg_id: Option<&str>,
     is_pending: bool,
     needs_sync: bool,
 ) {
     let path = peer_history_path(peer_id);
     log_history_at(
-        &path, peer_id, from_me, text, send_ts, recv_ts, file_path, sync_ts, msg_id, is_pending,
+        &path,
+        peer_id,
+        from_me,
+        text,
+        send_ts,
+        recv_ts,
+        file_path,
+        sync_ts,
+        transfer_id,
+        msg_id,
+        is_pending,
         needs_sync,
     );
 }
@@ -39,9 +50,15 @@ pub fn load_recent_history(days: i64) -> Vec<LoadedHistoryMessage> {
     load_recent_history_from_dir(&history_dir(), days)
 }
 
-pub fn update_history_sync(peer_id: &str, file_path: &str, sync_ts: &str, from_me: bool) {
+pub fn update_history_sync(
+    peer_id: &str,
+    file_path: &str,
+    transfer_id: Option<&str>,
+    sync_ts: &str,
+    from_me: bool,
+) {
     let path = peer_history_path(peer_id);
-    update_history_file_field(&path, file_path, from_me, |val| {
+    update_history_file_field(&path, file_path, transfer_id, from_me, |val| {
         val["sync_ts"] = Value::String(sync_ts.to_string());
     });
 }
@@ -54,24 +71,42 @@ pub fn update_history_ack(peer_id: &str, msg_id: &str, recv_ts: &str) {
     });
 }
 
-pub fn update_history_file_done(peer_id: &str, file_path: &str, recv_ts: &str, from_me: bool) {
+pub fn update_history_file_done(
+    peer_id: &str,
+    file_path: &str,
+    transfer_id: Option<&str>,
+    recv_ts: &str,
+    from_me: bool,
+) {
     let path = peer_history_path(peer_id);
-    update_history_file_field(&path, file_path, from_me, |val| {
+    update_history_file_field(&path, file_path, transfer_id, from_me, |val| {
         val["recv_ts"] = Value::String(recv_ts.to_string());
         val["is_pending"] = Value::Bool(false);
     });
 }
 
-pub fn update_history_needs_sync(peer_id: &str, file_path: &str, needs_sync: bool, from_me: bool) {
+pub fn update_history_needs_sync(
+    peer_id: &str,
+    file_path: &str,
+    transfer_id: Option<&str>,
+    needs_sync: bool,
+    from_me: bool,
+) {
     let path = peer_history_path(peer_id);
-    update_history_file_field(&path, file_path, from_me, |val| {
+    update_history_file_field(&path, file_path, transfer_id, from_me, |val| {
         val["needs_sync"] = Value::Bool(needs_sync);
     });
 }
 
-pub fn update_history_file_path(peer_id: &str, file_name: &str, new_path: &str, from_me: bool) {
+pub fn update_history_file_path(
+    peer_id: &str,
+    file_name: &str,
+    transfer_id: Option<&str>,
+    new_path: &str,
+    from_me: bool,
+) {
     let path = peer_history_path(peer_id);
-    update_history_file_field_exact_or_suffix(&path, file_name, from_me, |val| {
+    update_history_file_field_exact_or_suffix(&path, file_name, transfer_id, from_me, |val| {
         val["file_path"] = Value::String(new_path.to_string());
     });
 }
@@ -92,6 +127,7 @@ fn log_history_at(
     recv_ts: Option<&str>,
     file_path: Option<&str>,
     sync_ts: Option<&str>,
+    transfer_id: Option<&str>,
     msg_id: Option<&str>,
     is_pending: bool,
     needs_sync: bool,
@@ -104,6 +140,7 @@ fn log_history_at(
         "recv_ts": recv_ts,
         "file_path": file_path,
         "sync_ts": sync_ts,
+        "transfer_id": transfer_id,
         "msg_id": msg_id,
         "is_pending": is_pending,
         "needs_sync": needs_sync,
@@ -172,7 +209,7 @@ fn load_recent_history_from_dir(dir: &Path, days: i64) -> Vec<LoadedHistoryMessa
                     recv_ts: entry.recv_ts,
                     last_sync_ts: entry.sync_ts,
                     file_path: entry.file_path,
-                    transfer_id: None,
+                    transfer_id: entry.transfer_id,
                     transfer_status,
                     msg_id: entry.msg_id,
                     is_read: true,
@@ -186,18 +223,45 @@ fn load_recent_history_from_dir(dir: &Path, days: i64) -> Vec<LoadedHistoryMessa
     loaded
 }
 
-fn update_history_file_field<F>(path: &Path, file_path: &str, from_me: bool, mut update: F)
-where
+fn history_entry_matches_transfer(
+    val: &Value,
+    transfer_id: Option<&str>,
+    from_me: bool,
+    file_match: impl FnOnce(&str) -> bool,
+) -> bool {
+    if val.get("from_me").and_then(|v| v.as_bool()) != Some(from_me) {
+        return false;
+    }
+
+    if let Some(transfer_id) = transfer_id {
+        if let Some(existing_transfer_id) = val.get("transfer_id").and_then(|v| v.as_str()) {
+            return existing_transfer_id == transfer_id;
+        }
+
+        if val.get("transfer_id").is_some() {
+            return false;
+        }
+    }
+
+    val.get("file_path")
+        .and_then(|v| v.as_str())
+        .map(file_match)
+        .unwrap_or(false)
+}
+
+fn update_history_file_field<F>(
+    path: &Path,
+    file_path: &str,
+    transfer_id: Option<&str>,
+    from_me: bool,
+    mut update: F,
+) where
     F: FnMut(&mut Value),
 {
     rewrite_history(path, |val| {
-        let matches_from = val.get("from_me").and_then(|v| v.as_bool()) == Some(from_me);
-        let matches_file = val
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .map(|p| p == file_path || p.ends_with(file_path) || file_path.ends_with(p))
-            .unwrap_or(false);
-        if matches_from && matches_file {
+        if history_entry_matches_transfer(val, transfer_id, from_me, |p| {
+            p == file_path || p.ends_with(file_path) || file_path.ends_with(p)
+        }) {
             update(val);
             true
         } else {
@@ -209,19 +273,16 @@ where
 fn update_history_file_field_exact_or_suffix<F>(
     path: &Path,
     file_name: &str,
+    transfer_id: Option<&str>,
     from_me: bool,
     mut update: F,
 ) where
     F: FnMut(&mut Value),
 {
     rewrite_history(path, |val| {
-        let matches_from = val.get("from_me").and_then(|v| v.as_bool()) == Some(from_me);
-        let matches_file = val
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .map(|p| p == file_name || p.ends_with(file_name))
-            .unwrap_or(false);
-        if matches_from && matches_file {
+        if history_entry_matches_transfer(val, transfer_id, from_me, |p| {
+            p == file_name || p.ends_with(file_name)
+        }) {
             update(val);
             true
         } else {
@@ -301,6 +362,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("m1"),
             true,
             false,
@@ -310,6 +372,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].peer_id, "peer-1");
         assert_eq!(loaded[0].message.msg_id.as_deref(), Some("m1"));
+        assert_eq!(loaded[0].message.transfer_id, None);
         assert!(loaded[0].message.is_pending);
         assert_eq!(
             loaded[0].message.transfer_status.as_deref(),
@@ -330,6 +393,7 @@ mod tests {
             true,
             "hello",
             "2026-03-20 12:00:00",
+            None,
             None,
             None,
             None,
@@ -359,6 +423,88 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(!path.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_recent_history_restores_transfer_id() {
+        let dir = unique_temp_dir("transfer_id_roundtrip");
+        let path = dir.join("peer-1.jsonl");
+
+        log_history_at(
+            &path,
+            "peer-1",
+            true,
+            "📄 file.txt",
+            "2026-03-20 12:00:00",
+            None,
+            Some("C:/downloads/file.txt"),
+            None,
+            Some("transfer-a"),
+            None,
+            false,
+            false,
+        );
+
+        let loaded = load_recent_history_from_dir(&dir, 30);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].message.transfer_id.as_deref(), Some("transfer-a"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_history_file_done_prefers_transfer_id_over_filename() {
+        let dir = unique_temp_dir("transfer_id_match");
+        let path = dir.join("peer-1.jsonl");
+
+        log_history_at(
+            &path,
+            "peer-1",
+            true,
+            "📄 file.txt",
+            "2026-03-20 12:00:00",
+            None,
+            Some("C:/a/file.txt"),
+            None,
+            Some("transfer-a"),
+            None,
+            true,
+            false,
+        );
+        log_history_at(
+            &path,
+            "peer-1",
+            true,
+            "📄 file.txt",
+            "2026-03-20 12:01:00",
+            None,
+            Some("C:/b/file.txt"),
+            None,
+            Some("transfer-b"),
+            None,
+            true,
+            false,
+        );
+
+        update_history_file_field(&path, "file.txt", Some("transfer-b"), true, |val| {
+            val["recv_ts"] = Value::String("2026-03-20 12:02:00".to_string());
+            val["is_pending"] = Value::Bool(false);
+        });
+
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["transfer_id"].as_str(), Some("transfer-a"));
+        assert_eq!(lines[0]["recv_ts"].as_str(), None);
+        assert_eq!(lines[1]["transfer_id"].as_str(), Some("transfer-b"));
+        assert_eq!(lines[1]["recv_ts"].as_str(), Some("2026-03-20 12:02:00"));
+        assert_eq!(lines[1]["is_pending"].as_bool(), Some(false));
 
         let _ = std::fs::remove_dir_all(dir);
     }
